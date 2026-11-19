@@ -148,8 +148,11 @@ async fn r25_store_duplicate_final_winner_owns_only_last_exact_cid_and_version()
             (file.relative_path.clone(), exact.clone())
         })
         .collect();
-    let (request, batch, capture, guard) =
-        prepared_with_outputs(&db, &config, vec![], winners).await;
+    let tags = vec![
+        ObjectTag::new("ipfs-s3:pin", "true"),
+        ObjectTag::new("ipfs-s3:content", "decompressed"),
+    ];
+    let (request, batch, capture, guard) = prepared_with_outputs(&db, &config, tags, winners).await;
     publish(&db, &config, request, batch, &capture, guard)
         .await
         .unwrap();
@@ -175,14 +178,15 @@ async fn r25_store_duplicate_final_winner_owns_only_last_exact_cid_and_version()
     assert_eq!(versions.len(), 1);
     assert_eq!(versions[0].object_id.as_deref(), Some("second"));
     let refs = pin_rows::refs(&db).await;
-    assert_eq!(refs.len(), 1);
+    assert!(
+        refs.iter()
+            .all(|row| row.owner_object_id == "second" && row.cid == OUTPUT_CID)
+    );
     assert_eq!(
-        (
-            refs[0].source.as_str(),
-            refs[0].owner_object_id.as_str(),
-            refs[0].cid.as_str()
-        ),
-        ("automatic", "second", OUTPUT_CID)
+        refs.iter()
+            .map(|row| (row.source.as_str(), row.content_mode.as_str()))
+            .collect::<Vec<_>>(),
+        [("automatic", "object"), ("manual", "decompressed")]
     );
     let snapshot = store::zip::snapshot(&db, "batch").await.unwrap().unwrap();
     assert_eq!(snapshot.entries.len(), 1);
@@ -318,7 +322,7 @@ async fn r25_store_current_config_without_policy_publishes_without_remote_leases
 }
 
 #[tokio::test]
-async fn r25_store_manual_decompressed_retains_archive_owner_beside_output_automatic() {
+async fn r25_store_each_output_owns_manual_decompressed_and_automatic_for_shared_cid() {
     let db = setup().await;
     let config = config();
     let tags = vec![
@@ -340,8 +344,9 @@ async fn r25_store_manual_decompressed_retains_archive_owner_beside_output_autom
             .collect::<Vec<_>>(),
         [
             ("a", "automatic", "object"),
-            ("archive", "manual", "decompressed"),
-            ("b", "automatic", "object")
+            ("a", "manual", "decompressed"),
+            ("b", "automatic", "object"),
+            ("b", "manual", "decompressed")
         ]
     );
     assert!(refs.iter().all(|r| r.cid == OUTPUT_CID));

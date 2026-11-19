@@ -195,6 +195,40 @@ async fn case(mpu: bool, root: bool, auto: bool) {
         ENTRIES[0].1,
     )
     .await;
+    for (version_id, has_manual) in [
+        (version.version_id.as_deref().unwrap(), true),
+        (
+            overwrite.headers()["x-amz-version-id"].to_str().unwrap(),
+            false,
+        ),
+    ] {
+        let status = h
+            .send(
+                reqwest::Method::GET,
+                &key,
+                &[("ipfs3-pin-status", ""), ("versionId", version_id)],
+                vec![],
+                HeaderMap::new(),
+            )
+            .await;
+        assert_eq!(status.status(), StatusCode::OK);
+        assert_eq!(status.headers()["x-amz-version-id"], version_id);
+        let status: serde_json::Value =
+            serde_json::from_slice(&status.bytes().await.unwrap()).unwrap();
+        let manual = status["references"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|reference| reference["source"] == "manual");
+        assert_eq!(
+            manual.is_some(),
+            has_manual,
+            "manual reference belongs to the extracted version"
+        );
+        if let Some(manual) = manual {
+            assert_eq!(manual["cid"], original.cid);
+        }
+    }
     h.shutdown().await;
 }
 

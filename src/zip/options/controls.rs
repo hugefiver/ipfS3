@@ -142,9 +142,7 @@ impl ParsedZipControls {
         }
         if let ZipOptions::V2(v2) = &options {
             if !matches!(pin, PinControl::Absent) && !v2.publish_source {
-                return Err(invalid(
-                    "archive-owned manual pinning requires a published source",
-                ));
+                return Err(invalid("manual pin control requires a published source"));
             }
             if matches!(
                 pin,

@@ -127,32 +127,38 @@ pub fn select_zip_intents(
         warnings: Vec::new(),
     };
     for intent in capture.source_intents() {
-        let owner = source.expect("capture validation requires real source for source intents");
-        let targets = if intent.content_mode == ContentMode::Decompressed {
-            successful.to_vec()
-        } else {
-            vec![owner.clone()]
+        let owners = match intent.content_mode {
+            ContentMode::Object => {
+                vec![source.expect("capture validation requires real source for source intents")]
+            }
+            ContentMode::Decompressed => {
+                let mut outputs = successful.iter().collect::<Vec<_>>();
+                // ProviderMode::One places references in order under finite capacity.
+                outputs.sort_by(|a, b| a.cid.cmp(&b.cid));
+                outputs
+            }
         };
-        if !targets.is_empty() {
-            result.leases.push(ZipSelectedLease {
+        let providers = intent
+            .providers
+            .iter()
+            .map(|name| {
+                capture
+                    .source_provider_candidates()
+                    .iter()
+                    .find(|p| &p.selected.config_name == name)
+                    .expect("capture route evidence validated")
+                    .selected
+                    .clone()
+            })
+            .collect::<Vec<_>>();
+        result
+            .leases
+            .extend(owners.into_iter().map(|owner| ZipSelectedLease {
                 owner: owner.clone(),
                 intent: intent.clone(),
-                targets,
-                providers: intent
-                    .providers
-                    .iter()
-                    .map(|name| {
-                        capture
-                            .source_provider_candidates()
-                            .iter()
-                            .find(|p| &p.selected.config_name == name)
-                            .expect("capture route evidence validated")
-                            .selected
-                            .clone()
-                    })
-                    .collect(),
-            });
-        }
+                providers: providers.clone(),
+                targets: vec![owner.clone()],
+            }));
     }
     for (kind, output) in source
         .into_iter()

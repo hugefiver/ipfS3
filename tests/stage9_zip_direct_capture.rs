@@ -151,7 +151,14 @@ async fn assert_direct_capture(v2: bool) {
 async fn legacy_mpu_create_and_restart_complete_keep_the_original_capture() {
     run(Entry::Mpu, Outcome::Complete, |mut h| async move {
         let result = AssertUnwindSafe(async {
-            let created = request::create(&h, HeaderMap::new(), "out/").await;
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "x-amz-tagging",
+                "ipfs-s3%3Apin=true&ipfs-s3%3Acontent=decompressed"
+                    .parse()
+                    .unwrap(),
+            );
+            let created = request::create(&h, headers, "out/").await;
             assert_eq!(created.status, StatusCode::OK, "{created:?}");
             let id = created.upload_id();
             let upload = ipfs_s3_gateway::store::multipart::get_upload(h.state.store.db(), &id)
@@ -180,6 +187,22 @@ async fn legacy_mpu_create_and_restart_complete_keep_the_original_capture() {
             assert_eq!(retained.zip_intent_json, upload.zip_intent_json);
             let first = request::complete(&h, &id, &etag, HeaderMap::new()).await;
             assert_eq!(first.status, StatusCode::OK, "{first:?}");
+            let db = h.state.store.db();
+            let output =
+                ipfs_s3_gateway::store::object::get_latest(db, &upload.bucket, "out/file.txt")
+                    .await
+                    .unwrap();
+            let refs = pin_rows::refs(db).await;
+            assert!(
+                refs.iter()
+                    .all(|row| row.owner_object_id == output.id && row.cid == output.cid)
+            );
+            assert_eq!(
+                refs.iter()
+                    .map(|row| (row.source.as_str(), row.content_mode.as_str()))
+                    .collect::<Vec<_>>(),
+                [("automatic", "object"), ("manual", "decompressed")]
+            );
             let ledger = Ledger::read(&h).await;
             let adds = h.adds().await;
             h.restart(false).await;
@@ -187,6 +210,7 @@ async fn legacy_mpu_create_and_restart_complete_keep_the_original_capture() {
                 request::complete(&h, &id, &etag, HeaderMap::new()).await,
                 first
             );
+            assert_eq!(pin_rows::refs(h.state.store.db()).await, refs);
             let mut changed = HeaderMap::new();
             changed.insert("x-amz-tagging", "note=changed".parse().unwrap());
             assert_eq!(

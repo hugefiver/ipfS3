@@ -1,7 +1,4 @@
-//! Owned real-TCP fixture for legacy ZIP automatic-output pinning acceptance.
-//!
-//! No pinning worker is started: local PSA endpoints are routing fixtures, not
-//! evidence that a remote provider has pinned anything. Assertions observe durable publication.
+//! Owned real-TCP fixture for legacy ZIP publication and output pinning.
 
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
@@ -11,6 +8,7 @@ use ipfs_s3_gateway::{
     import::{
         downloader::SourceDownloader, pipeline::ImportCoordinator, worker::ImportWorkerHandle,
     },
+    pinning::worker::PinningWorkerHandle,
     state::AppState,
     store::{self, entities::import_job},
 };
@@ -52,6 +50,7 @@ pub struct Fixture {
     pub provider: String,
     server: Option<S3ServerHandle>,
     worker: Option<ImportWorkerHandle>,
+    pin_worker: Option<PinningWorkerHandle>,
     shutdown: CancellationToken,
     directory: Option<tempfile::TempDir>,
 }
@@ -150,7 +149,7 @@ endpoint_revision = 1
 secret_ref = 'env:PATH'
 api_profile = 'pinata-psa'
 strategy = 'cid'
-cleanup = 'retain'
+cleanup = 'managed'
 [[pinning_identity.providers]]
 config_name = 'filebase-primary'
 provider_id = 'stage9-filebase-primary'
@@ -190,6 +189,8 @@ secret_ref = 'env:PATH'
 api_profile = 'filebase-psa'
 strategy = 'cid'
 cleanup = 'retain'
+[pinning]
+worker_interval = '1s'
 [[pinning.providers]]
 name = 'pinata-primary'
 kind = 'pinata'
@@ -222,6 +223,15 @@ endpoint = {filebase_endpoint:?}
 priority = 4
 max_bytes = 1000000
 max_pins = 10000
+[[pinning.policies]]
+bucket = 'test-bkt'
+prefix = 'expanded/second.txt'
+trigger = 'always'
+provider_mode = 'one'
+providers = ['pinata-primary', 'filebase-primary', 'pinata-fallback', 'filebase-fallback']
+default_duration = '1h'
+max_duration = '2h'
+allow_decompressed = true
 [[pinning.policies]]
 bucket = 'test-bkt'
 prefix = ''
@@ -266,9 +276,18 @@ allow_decompressed = true
             provider,
             server: Some(server),
             worker,
+            pin_worker: None,
             shutdown,
             directory: Some(directory),
         }
+    }
+
+    pub fn start_pin_worker(&mut self) {
+        self.pin_worker = Some(
+            self.state
+                .pinning
+                .start(self.state.store.clone(), self.shutdown.clone()),
+        );
     }
 
     pub async fn enable_versioning(&self) {
@@ -304,7 +323,9 @@ allow_decompressed = true
         if manual {
             headers.insert(
                 "x-amz-tagging",
-                HeaderValue::from_static("ipfs-s3%3Apin=true&ipfs-s3%3Acontent=decompressed"),
+                HeaderValue::from_static(
+                    "label=archive&ipfs-s3%3Apin=true&ipfs-s3%3Acontent=decompressed",
+                ),
             );
         }
         match entry {
@@ -483,6 +504,9 @@ allow_decompressed = true
     pub async fn shutdown(mut self) {
         self.shutdown.cancel();
         if let Some(worker) = self.worker.take() {
+            worker.shutdown(Duration::from_secs(2)).await;
+        }
+        if let Some(worker) = self.pin_worker.take() {
             worker.shutdown(Duration::from_secs(2)).await;
         }
         self.server.take().unwrap().shutdown().await;

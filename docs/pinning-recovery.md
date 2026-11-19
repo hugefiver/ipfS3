@@ -10,6 +10,12 @@ manual demand, use `ipfs-s3:pin=false` without duration or retention controls.
 `DeleteObjectTagging` clears **all** tags and cancels manual demand. See the
 [CLI examples](../README.md#standard-s3-tag-control).
 
+For ZIPs published with `content=decompressed`, use the extracted file's key
+and version for pin status, renewal or cancellation. Renewal is subject to the
+current policy for that key. Existing references created under the archive key
+by an older release keep that owner and expiry; the gateway does not move or
+resubmit them on startup.
+
 A successful tagging request commits the local change. The worker releases a
 remote pin only after the last reference to its provider and CID ends. Other
 files or versions may therefore keep it alive. A removal acknowledgment ends

@@ -443,7 +443,7 @@ impl CapturedZipIntent {
         );
         ensure!(
             self.controls.publish_source || self.source_decision.effective_intents.is_empty(),
-            "ZIP capture needs_attention: manual owner lacks a published source"
+            "ZIP capture needs_attention: manual pin control lacks a published source"
         );
         ensure!(
             !self.controls.admission_token.is_empty()
@@ -601,7 +601,7 @@ pub fn capture_zip_intent(
     };
     ensure!(
         controls.publish_source || matches!(parsed.pin, PinControl::Absent),
-        "archive-owned manual pinning requires a published source"
+        "manual pin control requires a published source"
     );
     let mut source_decision = config.publication_decision(
         mode,
@@ -614,7 +614,7 @@ pub fn capture_zip_intent(
         control,
         origin,
     )?;
-    // The archive owns manual groups; automatic work is selected per exact output.
+    // Manual admission is captured on the source; automatic work is selected per exact output.
     source_decision
         .effective_intents
         .retain(|intent| intent.source == LeaseSource::Manual);

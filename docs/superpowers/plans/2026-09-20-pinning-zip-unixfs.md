@@ -18,4 +18,4 @@ v2 将源包发布、提取文件发布和远端 pin 选择分开。关闭源包
 
 ## 远端 pin
 
-远端 pin 不决定 S3 发布结果，也不由目录根状态推断。自动输出 pin 只针对已发布的成功提取文件，受 `[decompress_zip].auto_pin_outputs` 和服务器策略约束。v2 的 `x-ipfs3-zip-targets` 可在授权范围内选择已发布的类别。根是本地快照，不会自动发往远端，也不会因对象删除而触发物理回收。操作及状态查询见 [Remote Pinning](../../../README.md#remote-pinning)。
+`content=decompressed` 将手动 pin 引用绑定到每个成功发布的解压文件版本，目标是该文件的 CID。归档保留请求标签；文件引用可独立查询、续期、取消和到期，不依赖归档或 UnixFS 目录根。远端 pin 不决定 S3 发布结果。自动输出 pin 只针对已发布的成功提取文件，受 `[decompress_zip].auto_pin_outputs` 和服务器策略约束。v2 的 `x-ipfs3-zip-targets` 可在授权范围内选择已发布的类别。根是本地快照，不会自动发往远端，也不会因对象删除而触发物理回收。操作及状态查询见 [Remote Pinning](../../../README.md#remote-pinning)。

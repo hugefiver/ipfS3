@@ -108,7 +108,7 @@ pub async fn publication(
         .map(|entry| entry.split("</Entry>").next().unwrap())
         .collect();
     assert_eq!(xml_entries.len(), ENTRIES.len());
-    let mut owners = BTreeSet::new();
+    let mut owners = BTreeMap::new();
     for (name, bytes) in ENTRIES {
         let key = format!("{PREFIX}{name}");
         let output = store::object::get_latest(db, BUCKET, &key).await.unwrap();
@@ -143,7 +143,7 @@ pub async fn publication(
             bytes,
         )
         .await;
-        owners.insert(output.id);
+        owners.insert(output.id, (output.cid, output.created_at));
         if root {
             let root_cid = batch.root_cid.as_deref().unwrap();
             assert_eq!(headers["x-ipfs-s3-zip-root-cid"], root_cid);
@@ -177,18 +177,21 @@ pub async fn publication(
     let refs = crate::pin_rows::refs(db).await;
     let manual: Vec<_> = refs.iter().filter(|r| r.source == "manual").collect();
     assert_eq!(manual.len(), ENTRIES.len());
+    assert_eq!(
+        manual
+            .iter()
+            .map(|r| &r.owner_object_id)
+            .collect::<BTreeSet<_>>(),
+        owners.keys().collect()
+    );
     for reference in manual {
-        assert_eq!(reference.owner_object_id, archive.id);
+        let (output_cid, created_at) = &owners[&reference.owner_object_id];
+        assert_eq!(&reference.cid, output_cid);
         assert_eq!(reference.provider, h.provider);
         assert_eq!(reference.content_mode, "decompressed");
         assert_eq!(
-            reference.expires_at - archive.created_at.timestamp_micros(),
+            reference.expires_at - created_at.timestamp_micros(),
             86_400_000_000
-        );
-        assert!(
-            ENTRIES
-                .iter()
-                .any(|(_, bytes)| content_cid(0x55, bytes) == reference.cid)
         );
     }
     let automatic: Vec<_> = refs.iter().filter(|r| r.source == "automatic").collect();
@@ -197,7 +200,11 @@ pub async fn publication(
             .iter()
             .map(|r| r.owner_object_id.clone())
             .collect::<BTreeSet<_>>(),
-        if auto { owners } else { BTreeSet::new() }
+        if auto {
+            owners.into_keys().collect()
+        } else {
+            BTreeSet::new()
+        }
     );
     for reference in automatic {
         assert_eq!(reference.content_mode, "object");

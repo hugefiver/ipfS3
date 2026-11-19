@@ -112,7 +112,7 @@ fn r25_same_policy_v1_v2_default_is_per_exact_output_and_selection_is_pure() {
         assert_eq!(selected.leases.len(), 2);
         for (lease, output) in selected.leases.iter().zip(&outputs) {
             assert_eq!(&lease.owner, output);
-            assert_eq!(lease.targets, vec![output.clone()]);
+            assert_eq!(lease.targets, std::slice::from_ref(output));
             assert_eq!(lease.intent.source, LeaseSource::Automatic);
             assert_eq!(lease.intent.duration, config.policies[0].default_duration);
         }
@@ -179,7 +179,7 @@ fn r25_no_provider_request_only_and_false_cannot_create_default_work() {
 }
 
 #[test]
-fn r25_manual_decompressed_stays_real_archive_group_and_empty_skips_lease() {
+fn manual_decompressed_uses_each_successful_owner_without_copying_source_control() {
     let config = fixture();
     let tags = [
         ObjectTag::new("ipfs-s3:pin", "true"),
@@ -190,15 +190,28 @@ fn r25_manual_decompressed_stays_real_archive_group_and_empty_skips_lease() {
         ..Default::default()
     };
     let source = bound("exports/archive.zip", "source");
-    let outputs = [bound("exports/a", "output")];
+    let outputs = [bound("exports/a", "first"), bound("exports/b", "second")];
+    let final_manifest = manifest(&outputs);
     for v2 in [false, true] {
         let captured = capture(&config, &zip, v2, &[], &tags).unwrap();
         let selected =
-            select_zip_intents(&captured, &manifest(&outputs), Some(&source), &outputs).unwrap();
-        assert_eq!(selected.leases.len(), 1);
-        assert_eq!(selected.leases[0].intent.source, LeaseSource::Manual);
-        assert_eq!(selected.leases[0].owner, source);
-        assert_eq!(selected.leases[0].targets, outputs);
+            select_zip_intents(&captured, &final_manifest, Some(&source), &outputs).unwrap();
+        assert_eq!(selected.leases.len(), outputs.len());
+        assert_eq!(
+            selected.source_decision.as_ref(),
+            Some(captured.source_decision())
+        );
+        for (lease, output) in selected.leases.iter().zip(&outputs) {
+            assert_eq!(&lease.owner, output);
+            assert_eq!(lease.targets, std::slice::from_ref(output));
+            assert_eq!(
+                lease.intent,
+                captured.source_decision().effective_intents[0]
+            );
+        }
+        for (_, decision) in selected.output_decisions {
+            assert!(decision.replay_policy(vec![]).unwrap().leases.is_empty());
+        }
         assert!(
             select_zip_intents(&captured, &FinalZipManifest::default(), Some(&source), &[])
                 .unwrap()
@@ -206,13 +219,12 @@ fn r25_manual_decompressed_stays_real_archive_group_and_empty_skips_lease() {
                 .is_empty()
         );
         let both = capture(&config, &enabled(), v2, &[], &tags).unwrap();
-        assert_eq!(
-            select_zip_intents(&both, &manifest(&outputs), Some(&source), &outputs)
-                .unwrap()
-                .leases
-                .len(),
-            2
-        );
+        let selected = select_zip_intents(&both, &final_manifest, Some(&source), &outputs).unwrap();
+        assert_eq!(selected.leases.len(), 2 * outputs.len());
+        assert!(selected.output_decisions.iter().all(|(_, decision)| {
+            let intents = &decision.effective_intents;
+            intents.len() == 1 && intents[0].source == LeaseSource::Automatic
+        }));
     }
 }
 
@@ -507,7 +519,7 @@ fn current_config_edits_change_execution_without_rewriting_capture_receipts() {
 }
 
 #[test]
-fn legacy_v1_receipt_keeps_original_evidence_and_resolves_current_manual_owner() {
+fn legacy_v1_receipt_keeps_original_evidence_while_new_outputs_own_manual_leases() {
     let config = fixture();
     let tags = [
         ObjectTag::new("ipfs-s3:pin", "true"),
@@ -546,7 +558,7 @@ fn legacy_v1_receipt_keeps_original_evidence_and_resolves_current_manual_owner()
     let selected =
         select_zip_intents(&current, &manifest(&outputs), Some(&source), &outputs).unwrap();
     assert_eq!(selected.leases.len(), 1);
-    assert_eq!(selected.leases[0].owner, source);
+    assert_eq!(selected.leases[0].owner, outputs[0]);
     assert_eq!(selected.leases[0].intent.source, LeaseSource::Manual);
     assert_eq!(selected.leases[0].targets, outputs);
     assert_eq!(
@@ -712,6 +724,8 @@ fn accepted_manual_control_resolves_current_scope_duration_and_provider_order() 
         .iter()
         .find(|lease| lease.intent.source == LeaseSource::Manual)
         .unwrap();
+    assert_eq!(manual.owner, source);
+    assert_eq!(manual.targets, [source]);
     assert_eq!(manual.intent.providers, config.policies[0].providers);
     assert_eq!(manual.intent.duration, config.policies[0].default_duration);
     assert_eq!(

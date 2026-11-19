@@ -11,6 +11,8 @@ mod support {
 
 #[path = "support/stage9_zip_http.rs"]
 mod fixture;
+#[path = "support/stage9_zip_http_pin_lifecycle.rs"]
+mod pin_lifecycle;
 #[path = "support/stage9_zip_http_zip.rs"]
 mod zip_fixture;
 
@@ -60,8 +62,8 @@ async fn run_case(entry: EntryPoint, auto: bool, scenario: Scenario) {
         Scenario::Empty => (zip_fixture::empty_zip(), Vec::new()),
         Scenario::NonZip => (b"ordinary non-ZIP bytes".to_vec(), Vec::new()),
     };
-    let fixture = Fixture::new(entry, auto, &archive, replies).await;
-    // Drain server/worker and close the owned DB even when a RED assertion panics.
+    let mut fixture = Fixture::new(entry, auto, &archive, replies).await;
+    // Close the owned server, workers and database even when an assertion panics.
     let outcome = AssertUnwindSafe(async {
         fixture.enable_versioning().await;
         let batch_id = fixture
@@ -155,6 +157,7 @@ async fn run_case(entry: EntryPoint, auto: bool, scenario: Scenario) {
             response.bytes().await.unwrap();
         }
         let mut owners = BTreeSet::new();
+        let mut output_versions = Vec::new();
         for path in expected_paths {
             let manifest = successful.iter().find(|entry| entry.path == *path).unwrap();
             let key = format!("expanded/{path}");
@@ -189,15 +192,14 @@ async fn run_case(entry: EntryPoint, auto: bool, scenario: Scenario) {
                 owners.insert(object_id.clone()),
                 "each output owns its exact object/version"
             );
-            assert_get(
-                &fixture,
-                &key,
-                Some(version.version_id.as_deref().expect("enabled version ID")),
-                OUTPUT_BODY,
-            )
-            .await;
+            let version_id = version.version_id.expect("enabled version ID");
+            assert_get(&fixture, &key, Some(&version_id), OUTPUT_BODY).await;
+            output_versions.push((key, version_id));
         }
         assert_zip_pins(&fixture, auto, scenario, &owners).await;
+        if matches!(scenario, Scenario::Manual) {
+            pin_lifecycle::assert_file_lifecycle(&mut fixture, &output_versions).await;
+        }
     })
     .catch_unwind()
     .await;
@@ -270,19 +272,16 @@ async fn assert_zip_pins(
             .all(|row| row.content_mode == "object" && row.owner_object_id != archive.id)
     );
     if matches!(scenario, Scenario::Manual) {
+        assert_eq!(refs.len(), owners.len());
         assert_eq!(
-            refs.len(),
-            1,
-            "auto-off preserves explicit manual decompressed pin"
+            refs.iter()
+                .map(|row| row.owner_object_id.clone())
+                .collect::<BTreeSet<_>>(),
+            *owners
         );
-        assert_eq!(
-            (
-                refs[0].source.as_str(),
-                refs[0].owner_object_id.as_str(),
-                refs[0].content_mode.as_str()
-            ),
-            ("manual", archive.id.as_str(), "decompressed")
-        );
+        assert!(refs.iter().all(|row| row.source == "manual"
+            && row.content_mode == "decompressed"
+            && row.owner_object_id != archive.id));
     } else {
         assert_eq!(
             refs.len(),

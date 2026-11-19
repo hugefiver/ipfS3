@@ -4166,7 +4166,10 @@ async fn multipart_non_zip_and_zip_success_publish_and_remove_upload_parts_atomi
             .unwrap(),
         2
     );
-    assert_eq!(targets_for_object(&db, "complete-zip").await.len(), 4);
+    assert!(targets_for_object(&db, "complete-zip").await.is_empty());
+    for owner in ["zip-entry-a", "zip-entry-b"] {
+        assert_eq!(targets_for_object(&db, owner).await.len(), 2);
+    }
     assert_eq!(
         sql_count(
             &db,
@@ -4234,7 +4237,7 @@ async fn legacy_zip_uses_current_quota_without_rewriting_admission_capture() {
         vec![intent(
             LeaseSource::Manual,
             ProviderMode::One,
-            &["pinata"],
+            &["pinata", "filebase"],
             ContentMode::Decompressed,
         )],
     );
@@ -4246,25 +4249,46 @@ async fn legacy_zip_uses_current_quota_without_rewriting_admission_capture() {
         .unwrap()
         .captured_options;
     let mut current = limits();
-    current.get_mut("pinata").unwrap().max_bytes = 1;
-    current.get_mut("pinata").unwrap().priority = 100;
+    current.get_mut("pinata").unwrap().max_pins = 1;
+    let mut cids = ["bafy-zip-first", "bafy-zip-second"].map(fixture_cid);
+    cids.sort();
     admitted
         .publish(
             &db,
             ZipPublicationRequest {
                 archive,
-                entries: vec![object(
-                    "zip-frozen-entry",
-                    "out/item",
-                    "bafy-zip-frozen-entry",
-                    3,
-                )],
+                entries: vec![
+                    object("zip-quota-a", "out/a", &cids[1], 3),
+                    object("zip-quota-b", "out/b", &cids[0], 3),
+                    object("zip-quota-c", "out/c", &cids[0], 3),
+                ],
             },
             &current,
         )
         .await
         .unwrap();
-    assert_eq!(targets_for_object(&db, "zip-frozen").await.len(), 1);
+    assert!(targets_for_object(&db, "zip-frozen").await.is_empty());
+    for (owner, provider, cid) in [
+        ("zip-quota-a", "filebase", &cids[1]),
+        ("zip-quota-b", "pinata", &cids[0]),
+        ("zip-quota-c", "pinata", &cids[0]),
+    ] {
+        let refs = targets_for_object(&db, owner).await;
+        let entry = object::Entity::find_by_id(owner)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        let expiry = (entry.created_at + chrono::TimeDelta::hours(1)).timestamp_micros();
+        assert_eq!(
+            refs,
+            [(provider.into(), cid.clone(), "manual".into(), expiry)]
+        );
+    }
+    assert_eq!(
+        sql_count(&db, "SELECT COUNT(*) AS n FROM pin_resources").await,
+        2
+    );
     let row = crate::store::entities::zip_batch::Entity::find_by_id(&admitted.id)
         .one(&db)
         .await
@@ -4332,19 +4356,19 @@ async fn zip_decompressed_manual_targets_only_successful_entries_while_automatic
     .await
     .unwrap();
 
-    let refs = targets_for_object(&db, "zip").await;
-    let cids = |source| {
-        refs.iter()
-            .filter(|r| r.2 == source)
-            .map(|r| r.1.as_str())
-            .collect::<Vec<_>>()
-    };
-    assert_eq!(cids("automatic"), [fixture_cid("bafy-archive")]);
-    let mut expected = ["bafy-entry-a", "bafy-entry-b"].map(fixture_cid);
-    expected.sort();
-    assert_eq!(cids("manual"), expected);
-    assert!(targets_for_object(&db, "entry-ok-a").await.is_empty());
-    assert!(targets_for_object(&db, "entry-ok-b").await.is_empty());
+    let archive_refs = targets_for_object(&db, "zip").await;
+    assert_eq!(archive_refs.len(), 1);
+    assert_eq!(archive_refs[0].1, fixture_cid("bafy-archive"));
+    assert_eq!(archive_refs[0].2, "automatic");
+    for (owner, cid) in [
+        ("entry-ok-a", "bafy-entry-a"),
+        ("entry-ok-b", "bafy-entry-b"),
+    ] {
+        let refs = targets_for_object(&db, owner).await;
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].1, fixture_cid(cid));
+        assert_eq!(refs[0].2, "manual");
+    }
 }
 #[tokio::test]
 async fn completed_publication_reconciliation_uses_exact_attempt_and_upload_absence() {

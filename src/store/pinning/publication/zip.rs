@@ -242,21 +242,19 @@ pub(super) async fn publish_in_transaction(
     let now = crate::store::database_clock::database_now(tx).await?;
     let (results, bindings, leases) =
         objects::publish_objects(tx, request, state, now, &mut maintenance, selection).await?;
-    let mut references = Vec::new();
-    for lease in leases {
-        let targets: BTreeMap<_, _> = lease
-            .targets
-            .into_iter()
-            .map(|t| (t.cid, t.logical_size))
-            .collect();
-        for (cid, logical_size) in targets {
-            references.push((
-                lease.owner.object_id.clone(),
-                PinTargetSpec { cid, logical_size },
-                lease.intent.clone(),
-            ));
-        }
-    }
+    let references = leases
+        .into_iter()
+        .map(|lease| {
+            (
+                lease.owner.object_id,
+                PinTargetSpec {
+                    cid: lease.owner.cid,
+                    logical_size: lease.owner.logical_size,
+                },
+                lease.intent,
+            )
+        })
+        .collect::<Vec<_>>();
     super::resources::attach_many(tx, &references, current_limits, now).await?;
     maintenance.checkpoint(tx).await?;
     let terminal = execution::terminal_result(tx, request, &results).await?;

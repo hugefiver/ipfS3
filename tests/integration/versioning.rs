@@ -1683,6 +1683,55 @@ async fn assert_publication_matrix_pinning(
     }
 }
 
+async fn assert_zip_publication_matrix_pinning(
+    harness: &PinningHarness,
+    matrix_state: PublicationMatrixState,
+    before: &[PublicationMatrixBefore],
+    archive_owner: &str,
+    entry_owner: &str,
+    entry_cid: &str,
+) {
+    let db = harness.state.store.db();
+    let refs = pin_rows::refs(db).await;
+    assert!(refs.iter().all(|row| row.owner_object_id != archive_owner));
+    let entry_refs: Vec<_> = refs
+        .iter()
+        .filter(|row| row.owner_object_id == entry_owner)
+        .collect();
+    let [entry] = entry_refs.as_slice() else {
+        panic!("expected one reference for the exact new entry: {entry_refs:?}");
+    };
+    assert_eq!(
+        (
+            entry.source.as_str(),
+            entry.content_mode.as_str(),
+            entry.cid.as_str()
+        ),
+        ("manual", "decompressed", entry_cid)
+    );
+    assert!(pin_rows::resources(db).await.iter().any(|row| {
+        (
+            row.provider.as_str(),
+            row.cid.as_str(),
+            row.action.as_deref(),
+        ) == (entry.provider.as_str(), entry.cid.as_str(), Some("submit"))
+    }));
+    for (index, object) in before.iter().enumerate() {
+        for old in &object.rows {
+            let retained = index == 0
+                && matrix_state != PublicationMatrixState::Unversioned
+                && old.version_id.is_some();
+            assert_eq!(
+                refs.iter()
+                    .any(|row| Some(row.owner_object_id.as_str()) == old.object_id.as_deref()),
+                retained,
+                "existing references for {} stay with their own versions",
+                object.key
+            );
+        }
+    }
+}
+
 async fn assert_public_ids_are_external(state: &Arc<AppState>, bucket: &str) {
     let rows = store::entities::object_version::Entity::find()
         .filter(store::entities::object_version::Column::Bucket.eq(bucket))
@@ -2354,7 +2403,7 @@ async fn versioning_publication_path_direct_zip() {
         .await;
         assert_eq!(response.status(), StatusCode::OK);
         let surface = response_version_surface(&response);
-        let owner = assert_publication_matrix_object(
+        let archive_owner = assert_publication_matrix_object(
             &harness,
             &harness.state,
             matrix_state,
@@ -2366,7 +2415,7 @@ async fn versioning_publication_path_direct_zip() {
             surface,
         )
         .await;
-        assert_publication_matrix_object(
+        let entry_owner = assert_publication_matrix_object(
             &harness,
             &harness.state,
             matrix_state,
@@ -2378,7 +2427,15 @@ async fn versioning_publication_path_direct_zip() {
             PublicationVersionSurface::DiscoverOnly,
         )
         .await;
-        assert_publication_matrix_pinning(&harness, matrix_state, &before[0], &owner).await;
+        assert_zip_publication_matrix_pinning(
+            &harness,
+            matrix_state,
+            &before,
+            &archive_owner,
+            &entry_owner,
+            entry_cid,
+        )
+        .await;
     }
     assert_public_ids_are_external(&harness.state, &harness.bucket).await;
     assert_no_kubo_pin_removes(&harness).await;
@@ -2487,7 +2544,7 @@ async fn versioning_publication_path_multipart_zip() {
             signed_complete_multipart(&harness, &archive_key, &upload_id, 1, &etag).await;
         assert_eq!(response.status(), StatusCode::OK);
         let surface = response_version_surface(&response);
-        let owner = assert_publication_matrix_object(
+        let archive_owner = assert_publication_matrix_object(
             &harness,
             &harness.state,
             matrix_state,
@@ -2499,7 +2556,7 @@ async fn versioning_publication_path_multipart_zip() {
             surface,
         )
         .await;
-        assert_publication_matrix_object(
+        let entry_owner = assert_publication_matrix_object(
             &harness,
             &harness.state,
             matrix_state,
@@ -2511,7 +2568,15 @@ async fn versioning_publication_path_multipart_zip() {
             PublicationVersionSurface::DiscoverOnly,
         )
         .await;
-        assert_publication_matrix_pinning(&harness, matrix_state, &before[0], &owner).await;
+        assert_zip_publication_matrix_pinning(
+            &harness,
+            matrix_state,
+            &before,
+            &archive_owner,
+            &entry_owner,
+            entry_cid,
+        )
+        .await;
         assert!(
             store::multipart::get_upload(harness.state.store.db(), &upload_id)
                 .await

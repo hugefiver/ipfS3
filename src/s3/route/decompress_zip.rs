@@ -2781,10 +2781,13 @@ mod tests {
             .await
             .unwrap();
             assert_eq!(published.cid, ENTRY_CID_A);
-            let archive =
+            assert_eq!(
                 crate::store::object::get_latest(state.store.db(), "bucket", "archive.zip")
                     .await
-                    .unwrap();
+                    .unwrap()
+                    .cid,
+                "QmArchive"
+            );
             let mut expected = Vec::new();
             if auto_pin_outputs {
                 expected.push((
@@ -2796,7 +2799,7 @@ mod tests {
                 ));
             }
             expected.push((
-                archive.id,
+                published.id.clone(),
                 "manual".to_owned(),
                 "alpha".to_owned(),
                 published.cid,
@@ -3440,13 +3443,8 @@ mod tests {
         for source in ["automatic", "manual"] {
             for provider in ["alpha", "beta"] {
                 for entry in &entries {
-                    let owner = if source == "manual" {
-                        &archive.id
-                    } else {
-                        &entry.id
-                    };
                     expected.push((
-                        owner.clone(),
+                        entry.id.clone(),
                         source.to_owned(),
                         provider.to_owned(),
                         entry.cid.clone(),

@@ -591,8 +591,11 @@ republishes the source or extracted object versions.
 Direct PUT, multipart completion and durable ZIP import publish objects and
 their pin references atomically. Automatic output pinning selects successfully
 extracted files, not the archive, UnixFS root, failed entries, empty directories
-or prefix. A manual `content=decompressed` request addresses the archive's
-selected outputs; cancelling it does not release other files' references.
+or prefix. With `content=decompressed`, each successfully published file version
+owns a manual reference to its own CID, even when directory-root creation is disabled.
+Query, renew or cancel that reference on the extracted file. Deleting the source
+ZIP leaves the files' references intact. Deleting an extracted version releases
+only its references; another version with the same CID can keep the remote pin alive.
 
 `[decompress_zip].auto_pin_outputs` is the single ZIP automatic-output switch:
 omitted means the safe default, off; explicit `false` disables ZIP automatic

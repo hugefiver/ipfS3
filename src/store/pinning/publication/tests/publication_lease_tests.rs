@@ -167,7 +167,10 @@ async fn legacy_mpu_publication_renews_live_leases_before_objects_and_adopts_com
     assert!(snapshot.references[0].verification_receipt.is_some());
     assert_eq!(rows::<object::Entity>(&db).await, 3);
     assert_eq!(rows::<object_version::Entity>(&db).await, 3);
-    assert_eq!(targets_for_object(&db, "lease-archive").await.len(), 4);
+    assert!(targets_for_object(&db, "lease-archive").await.is_empty());
+    for owner in ["lease-a", "lease-b"] {
+        assert_eq!(targets_for_object(&db, owner).await.len(), 2);
+    }
     assert!(multipart::get_upload(&db, "lease-success").await.is_err());
     assert!(
         multipart::list_parts(&db, "lease-success")
@@ -200,7 +203,23 @@ async fn large_zip_keeps_the_original_claim_and_binds_each_version() {
             .all(|entry| entry.version_row_id.is_some())
     );
     assert_eq!(snapshot.references[0].state, "adopted");
-    assert_eq!(targets_for_object(&db, "lease-archive").await.len(), 160);
+    assert!(targets_for_object(&db, "lease-archive").await.is_empty());
+    assert_eq!(
+        sql_count(
+            &db,
+            "SELECT COUNT(DISTINCT owner_object_id) AS n FROM pin_refs"
+        )
+        .await,
+        901
+    );
+    assert_eq!(
+        sql_count(&db, "SELECT COUNT(*) AS n FROM pin_refs").await,
+        1802
+    );
+    assert_eq!(
+        sql_count(&db, "SELECT COUNT(*) AS n FROM pin_resources").await,
+        160
+    );
     assert_eq!(rows::<object::Entity>(&db).await, 902);
     assert_eq!(rows::<object_version::Entity>(&db).await, 902);
 }
@@ -217,10 +236,13 @@ async fn lost_guard_rolls_back_shared_cid_references() {
     .unwrap();
     let prior = targets_for_object(&db, "hot-owner").await;
     let (request, batch, guard, target) = fixture(&db, "shared-root", true).await;
-    db.execute_unprepared("CREATE TRIGGER lose_guard AFTER INSERT ON pin_refs WHEN NEW.owner_object_id='lease-archive' BEGIN UPDATE standard_mutation_leases SET lease_until='2000-01-01T00:00:00Z'; END").await.unwrap();
+    db.execute_unprepared("CREATE TRIGGER lose_guard AFTER INSERT ON pin_refs WHEN NEW.owner_object_id='lease-a' BEGIN UPDATE standard_mutation_leases SET lease_until='2000-01-01T00:00:00Z'; END").await.unwrap();
     assert!(publish(&db, request, batch, guard, target).await.is_err());
     assert_eq!(targets_for_object(&db, "hot-owner").await, prior);
-    assert!(targets_for_object(&db, "lease-archive").await.is_empty());
+    assert_eq!(
+        sql_count(&db, "SELECT COUNT(*) AS n FROM pin_refs").await,
+        prior.len() as u64
+    );
     assert_eq!(
         storage::snapshot(&db, "shared-root")
             .await
