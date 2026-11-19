@@ -16,6 +16,10 @@ files or versions may therefore keep it alive. A removal acknowledgment ends
 the gateway's cleanup work; the provider may still retain readable blocks. The
 gateway does not run remote garbage collection or delete the primary object.
 
+## A new PUT is slow to receive a pin acknowledgment
+
+For a new CID, enable `RUST_LOG=info,ipfs_s3_gateway::pinning=debug` on the gateway handling the PUT and on any worker that can claim its provider. Match the provider and canonical CID in the logs. The interval from the PUT commit event to dispatch shows the wait before the provider call; the provider completion and database writeback events report their own `elapsed_us`. A CID already pinned for another file may need no new call. A commit event names a candidate provider, not proof that it was selected or that a POST was sent.
+
 ## A provider did not acknowledge the request
 
 Send a signed `GET /BUCKET/KEY?ipfs3-pin-status` (add `&versionId=VERSION` for

@@ -992,6 +992,9 @@ pub async fn put_object(
                 ),
             )
             .await?;
+        state
+            .pinning
+            .notify_put_committed(&cid, &decision.effective_intents);
 
         let server_side_encryption = if enc_mode == EncryptionMode::SseS3 {
             Some(ServerSideEncryption::from_static("AES256"))

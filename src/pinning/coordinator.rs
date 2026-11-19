@@ -1,6 +1,7 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use anyhow::{Context, anyhow};
+use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{DecompressZipConfig, OptionalPinControlMode};
@@ -11,8 +12,8 @@ use crate::pinning::{
     identity::ProviderIdentity,
     noop::NoopProvider,
     pinata::build_pinata_with_options,
-    policy::PinPolicyEvaluator,
-    provider::PinningProvider,
+    policy::{LeaseIntent, PinPolicyEvaluator},
+    provider::{PinningProvider, canonical_resource_cid},
     zip_policy::{ValidatedZipOutputRules, ZipOutputRuleConfig},
 };
 use crate::store::Store;
@@ -47,6 +48,7 @@ pub struct PinningCoordinator {
     policy: PinPolicyEvaluator,
     providers: HashMap<String, Arc<dyn PinningProvider>>,
     request_intervals: HashMap<String, Duration>,
+    provider_wakes: HashMap<String, watch::Sender<()>>,
 }
 
 /// Resolve the physical allocation namespace and reject incompatible aliases.
@@ -254,6 +256,11 @@ impl PinningCoordinator {
             providers.insert(name, implementation);
         }
 
+        let provider_wakes = config
+            .provider_limits
+            .keys()
+            .map(|name| (name.clone(), watch::channel(()).0))
+            .collect();
         Ok(Arc::new(Self {
             decompress_zip_config: zip.clone(),
             zip_output_rules,
@@ -263,6 +270,7 @@ impl PinningCoordinator {
             },
             providers,
             request_intervals,
+            provider_wakes,
         }))
     }
 
@@ -312,6 +320,29 @@ impl PinningCoordinator {
 
     pub(crate) fn request_interval(&self, name: &str) -> Duration {
         self.request_intervals[name]
+    }
+
+    pub(crate) fn subscribe_provider_wake(&self, name: &str) -> watch::Receiver<()> {
+        self.provider_wakes[name].subscribe()
+    }
+
+    pub(crate) fn notify_put_committed(&self, source_cid: &str, intents: &[LeaseIntent]) {
+        let cid = (!intents.is_empty() && tracing::enabled!(tracing::Level::DEBUG))
+            .then(|| canonical_resource_cid(source_cid).ok())
+            .flatten();
+        for (index, intent) in intents.iter().enumerate() {
+            for provider in &intent.providers {
+                if !self.provider_limits()[provider].enabled
+                    || intents[..index]
+                        .iter()
+                        .any(|earlier| earlier.providers.contains(provider))
+                {
+                    continue;
+                }
+                tracing::debug!(name: "pin_put_committed", cid = cid.as_deref(), source_cid, %provider, "PUT committed with pin intent for candidate provider");
+                self.provider_wakes[provider].send_replace(());
+            }
+        }
     }
 
     pub fn start(self: &Arc<Self>, store: Store, parent: CancellationToken) -> PinningWorkerHandle {

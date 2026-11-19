@@ -120,6 +120,7 @@ async fn canonical_resource_uploads_with_original_cidv0_unixfs_profile() {
         Arc::new(Semaphore::new(1)),
         Duration::from_secs(1),
         Duration::ZERO,
+        watch::channel(()).1,
         stop.clone(),
     ));
     wait_status(&store, &canonical, "accepted").await;

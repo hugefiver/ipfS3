@@ -24,6 +24,8 @@ const HANDLE: &str = "request-1";
 pub struct PinningHarnessConfig {
     pub kubo_script: KuboScript,
     pub pinata_script: Vec<Mock>,
+    pub worker_interval: Duration,
+    pub requests_per_second: u32,
 }
 
 impl PinningHarnessConfig {
@@ -42,6 +44,8 @@ impl PinningHarnessConfig {
                 cat_bodies: HashMap::from([(TEST_CID.into(), b"body".to_vec())]),
             },
             pinata_script: vec![post],
+            worker_interval: Duration::from_secs(1),
+            requests_per_second: 1000,
         }
     }
 }
@@ -83,7 +87,7 @@ pub async fn start_pinning_harness_with_database(
     let config_text = format!(
         r#"
         [pinning]
-        worker_interval = "1s"
+        worker_interval = "{}s"
         [[pinning.providers]]
         name = "pinata-primary"
         kind = "pinata"
@@ -92,7 +96,7 @@ pub async fn start_pinning_harness_with_database(
         priority = 1
         max_bytes = 1048576
         max_pins = 100
-        requests_per_second = 1000
+        requests_per_second = {}
         [[pinning.policies]]
         bucket = "test-bkt"
         trigger = "request"
@@ -116,7 +120,9 @@ pub async fn start_pinning_harness_with_database(
         api_profile = "pinata-psa"
         strategy = "cid"
     "#,
-        pinata.uri()
+        config.worker_interval.as_secs(),
+        pinata.uri(),
+        config.requests_per_second,
     );
     let raw: Config = toml::from_str(&config_text).unwrap();
     let validated = ValidatedPinningConfig::from_config(&raw, |key| {

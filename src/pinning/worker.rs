@@ -2,7 +2,7 @@ use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use chrono::{TimeDelta, Utc};
 use tokio::{
-    sync::Semaphore,
+    sync::{Semaphore, watch},
     task::{JoinHandle, JoinSet},
     time::{Instant, sleep_until},
 };
@@ -62,6 +62,7 @@ pub(crate) fn start(
                 slots.clone(),
                 interval,
                 coordinator.request_interval(name),
+                coordinator.subscribe_provider_wake(name),
                 stop.clone(),
             ));
         }
@@ -92,6 +93,7 @@ async fn expire_references(store: Store, interval: Duration, stop: CancellationT
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_provider(
     store: Store,
     provider: Arc<dyn PinningProvider>,
@@ -99,10 +101,12 @@ async fn run_provider(
     slots: Arc<Semaphore>,
     idle: Duration,
     min_interval: Duration,
+    mut wake: watch::Receiver<()>,
     stop: CancellationToken,
 ) {
     let mut requests = JoinSet::new();
     let mut next = Instant::now();
+    let mut idle_after_empty_scan = false;
     loop {
         tokio::select! {
             biased;
@@ -112,6 +116,7 @@ async fn run_provider(
                 continue;
             }
             _ = sleep_until(next) => {}
+            Ok(()) = wake.changed(), if idle_after_empty_scan => {}
         };
         if slots.available_permits() == 0 {
             tokio::select! {
@@ -119,6 +124,8 @@ async fn run_provider(
                 permit = slots.acquire() => drop(permit.unwrap()),
             }
         }
+        // This scan covers earlier hints; keep any hint arriving during it.
+        wake.mark_unchanged();
         let now = Utc::now();
         match resources::claim(
             store.db(),
@@ -143,11 +150,21 @@ async fn run_provider(
                 let store = store.clone();
                 let provider = provider.clone();
                 requests.spawn(async move {
+                    let log_timing = tracing::enabled!(tracing::Level::DEBUG);
+                    tracing::debug!(name: "pin_dispatched", provider=%claim.provider, cid=%claim.cid, source_cid=%claim.source_cid, action=?claim.action, attempt=claim.attempt, "pin action dispatched");
+                    let provider_started = log_timing.then(Instant::now);
                     let outcome = execute(provider.as_ref(), &claim).await;
+                    let elapsed_us = provider_started.map(|start| start.elapsed().as_micros() as u64);
                     drop(slot);
+                    tracing::debug!(name: "pin_provider_complete", provider=%claim.provider, cid=%claim.cid, action=?claim.action, attempt=claim.attempt, elapsed_us, "pin provider action finished");
+                    let settle_started = log_timing.then(Instant::now);
+                    let mut settled = false;
                     for attempt in 0..3 {
                         match resources::settle(store.db(), &claim, outcome.clone(), Utc::now()).await {
-                            Ok(()) => break,
+                            Ok(()) => {
+                                settled = true;
+                                break;
+                            }
                             Err(crate::error::AppError::Database(_)) if attempt < 2 => {
                                 tokio::time::sleep(Duration::from_millis(250 << attempt)).await;
                             }
@@ -157,14 +174,21 @@ async fn run_provider(
                             }
                         }
                     }
+                    let elapsed_us = settle_started.map(|start| start.elapsed().as_micros() as u64);
+                    tracing::debug!(name: "pin_settle_complete", provider=%claim.provider, cid=%claim.cid, action=?claim.action, attempt=claim.attempt, elapsed_us, settled, "pin writeback finished");
                 });
                 next = Instant::now() + min_interval;
+                idle_after_empty_scan = false;
             }
-            result => {
-                if let Err(error) = result {
-                    tracing::warn!(%error, provider=provider.name(), "could not claim pin action");
-                }
+            Ok(None) => {
+                tracing::trace!(name: "pin_worker_idle", provider = provider.name(), "pin scan found no due action");
                 next = Instant::now() + idle;
+                idle_after_empty_scan = true;
+            }
+            Err(error) => {
+                tracing::warn!(%error, provider=provider.name(), "could not claim pin action");
+                next = Instant::now() + idle;
+                idle_after_empty_scan = false;
             }
         }
     }
