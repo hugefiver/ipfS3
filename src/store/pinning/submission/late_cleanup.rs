@@ -56,6 +56,7 @@ async fn cleanup_request(
             remote,
             Some(&request),
             Some((catalog, work)),
+            false,
         )
         .await?
         || job_authority::lookup_catalog(catalog, job, work.budget().clone())

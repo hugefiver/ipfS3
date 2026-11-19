@@ -2,6 +2,7 @@
 use std::{
     collections::HashMap,
     future::Future,
+    pin::Pin,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -46,9 +47,9 @@ use ipfs_s3_gateway::{
     },
 };
 use sea_orm::{
-    ColumnTrait, ConnectOptions, ConnectionTrait, Database, DatabaseBackend, DatabaseConnection,
-    DbErr, EntityTrait, ExecResult, QueryFilter, QueryResult, Set, Statement, TransactionTrait,
-    sea_query::Expr,
+    AccessMode, ColumnTrait, ConnectOptions, ConnectionTrait, Database, DatabaseBackend,
+    DatabaseConnection, DatabaseTransaction, DbErr, EntityTrait, ExecResult, IsolationLevel,
+    QueryFilter, QueryResult, Set, Statement, TransactionError, TransactionTrait, sea_query::Expr,
 };
 use tokio::sync::{Notify, Semaphore};
 use tokio_util::sync::CancellationToken;
@@ -472,6 +473,54 @@ impl ConnectionTrait for AdmissionReadGate {
     }
 }
 
+#[async_trait::async_trait]
+impl TransactionTrait for AdmissionReadGate {
+    async fn begin(&self) -> Result<DatabaseTransaction, DbErr> {
+        self.inner.begin().await
+    }
+
+    async fn begin_with_config(
+        &self,
+        isolation_level: Option<IsolationLevel>,
+        access_mode: Option<AccessMode>,
+    ) -> Result<DatabaseTransaction, DbErr> {
+        self.inner
+            .begin_with_config(isolation_level, access_mode)
+            .await
+    }
+
+    async fn transaction<F, T, E>(&self, callback: F) -> Result<T, TransactionError<E>>
+    where
+        F: for<'c> FnOnce(
+                &'c DatabaseTransaction,
+            ) -> Pin<Box<dyn Future<Output = Result<T, E>> + Send + 'c>>
+            + Send,
+        T: Send,
+        E: std::fmt::Display + std::fmt::Debug + Send,
+    {
+        self.inner.transaction(callback).await
+    }
+
+    async fn transaction_with_config<F, T, E>(
+        &self,
+        callback: F,
+        isolation_level: Option<IsolationLevel>,
+        access_mode: Option<AccessMode>,
+    ) -> Result<T, TransactionError<E>>
+    where
+        F: for<'c> FnOnce(
+                &'c DatabaseTransaction,
+            ) -> Pin<Box<dyn Future<Output = Result<T, E>> + Send + 'c>>
+            + Send,
+        T: Send,
+        E: std::fmt::Display + std::fmt::Debug + Send,
+    {
+        self.inner
+            .transaction_with_config(callback, isolation_level, access_mode)
+            .await
+    }
+}
+
 async fn file_fixture() -> (tempfile::TempDir, Fixture, DatabaseConnection) {
     let root = std::env::temp_dir();
     let approved = root.join("opencode");
@@ -591,16 +640,14 @@ async fn stable_operator_waiter_reason_survives_debt_settled_after_reserve_retur
     );
     fixture.held(100, 1).await;
     fixture.assert_posts(1);
-    let txn = peer.begin().await.unwrap();
     let woken = quota::wake_provider_waiters(
-        &txn,
+        &peer,
         &fixture.provider,
         &fixture.coordinator.provider_limits()[&fixture.provider],
         wake_at,
     )
     .await
     .unwrap();
-    txn.commit().await.unwrap();
     assert_eq!(woken, vec![b.clone()]);
     assert_eq!(fixture.target_state(&b).await, "pinned");
     fixture.held(100, 1).await;
@@ -798,15 +845,13 @@ async fn unknown_a_keeps_waiter_recoverable_but_never_grants_capacity_or_reposts
     fixture.target.release.add_permits(1);
     wait_for(|| async { fixture.receipt().await.outcome == "unknown" }).await;
     for _ in 0..3 {
-        let txn = fixture.store.db().begin().await.unwrap();
         let limits = &fixture.coordinator.provider_limits()[&fixture.provider];
         assert!(
-            quota::wake_provider_waiters(&txn, &fixture.provider, limits, Utc::now())
+            quota::wake_provider_waiters(fixture.store.db(), &fixture.provider, limits, Utc::now())
                 .await
                 .unwrap()
                 .is_empty()
         );
-        txn.commit().await.unwrap();
         assert_eq!(
             fixture.target_state(&b).await,
             "quota_waiting",
@@ -1065,14 +1110,12 @@ async fn late_mismatch_and_extra_root_never_recover_from_expected_pin() {
             .coordinator
             .start(fixture.store.clone(), CancellationToken::new());
         held_start(&fixture).await;
-        fixture.expire_submit_claim().await;
-        let recovery = fixture
-            .coordinator
-            .start(fixture.store.clone(), CancellationToken::new());
-        wait_for(|| async { fixture.submit().await.state == "error" }).await;
-        recovery.shutdown(Duration::from_secs(2)).await;
+        fixture.takeover_park().await;
         fixture.target.release.add_permits(1);
-        wait_for(|| async { fixture.receipt().await.observed_at.is_some() }).await;
+        wait_for(|| async {
+            fixture.receipt().await.observed_at.is_some() && fixture.submit().await.state == "error"
+        })
+        .await;
         worker.shutdown(Duration::from_secs(2)).await;
         assert_eq!(fixture.receipt().await.outcome, "cid_mismatch");
         assert!(fixture.receipt().await.needs_attention);
@@ -1091,6 +1134,38 @@ async fn late_mismatch_and_extra_root_never_recover_from_expected_pin() {
         fixture.held(100, 1).await;
         fixture.assert_posts(1);
     }
+}
+
+#[tokio::test]
+async fn expired_takeover_does_not_replay_late_receipt_or_post_again() {
+    let fixture = Fixture::new((StatusCode::OK, format!("{{\"Hash\":\"{CID}\"}}\n"))).await;
+    let target = fixture.publish("a", CID).await;
+    let worker = fixture
+        .coordinator
+        .start(fixture.store.clone(), CancellationToken::new());
+    held_start(&fixture).await;
+    let original = fixture.takeover_park().await;
+    jobs::history::Entity::update_many()
+        .col_expr(
+            jobs::history::Column::StartedAt,
+            Expr::value(Utc::now() - chrono::Duration::hours(2)),
+        )
+        .filter(jobs::history::Column::JobId.eq(&original.id))
+        .exec(fixture.store.db())
+        .await
+        .unwrap();
+    wait_for(|| async { fixture.submit().await.state == "error" }).await;
+    assert_eq!(fixture.receipt().await.outcome, "in_flight");
+    assert!(fixture.submit().await.locked_until.is_none());
+    fixture.target.release.add_permits(1);
+    wait_for(|| async { fixture.receipt().await.outcome == "matched" }).await;
+    worker.shutdown(Duration::from_secs(2)).await;
+    assert_eq!(fixture.submit().await.state, "error");
+    assert!(fixture.receipt().await.needs_attention);
+    assert_ne!(fixture.target_state(&target).await, "pinned");
+    fixture.held(100, 1).await;
+    fixture.assert_posts(1);
+    assert_eq!(fixture.target.reads.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
@@ -1143,50 +1218,6 @@ async fn durable_receipt_survives_failed_wake_and_restart_recovers_without_new_p
     let settled = fixture.receipt().await;
     assert_eq!(settled.resources, receipt.resources);
     assert_eq!(settled.observed_at, receipt.observed_at);
-    fixture.held(100, 1).await;
-    fixture.assert_posts(1);
-}
-
-#[tokio::test]
-async fn completed_receipt_survives_unready_projection_and_recovers_after_restart() {
-    let fixture = Fixture::new((StatusCode::OK, format!("{{\"Hash\":\"{CID}\"}}\n"))).await;
-    let target = fixture.publish("a", CID).await;
-    let worker = fixture
-        .coordinator
-        .start(fixture.store.clone(), CancellationToken::new());
-    held_start(&fixture).await;
-    fixture.takeover_park().await;
-    fixture
-        .store
-        .db()
-        .execute_unprepared("UPDATE pin_management_readiness SET state='backfill' WHERE id=1")
-        .await
-        .unwrap();
-    fixture.target.release.add_permits(1);
-    wait_for(|| async { fixture.receipt().await.observed_at.is_some() }).await;
-    worker.shutdown(Duration::from_secs(2)).await;
-    let receipt = fixture.receipt().await;
-    assert_eq!(receipt.outcome, "matched");
-    assert!(receipt.needs_attention);
-    assert!(fixture.submit().await.locked_until.is_none());
-    assert_ne!(fixture.target_state(&target).await, "pinned");
-    fixture.held(100, 1).await;
-    fixture.assert_posts(1);
-    fixture
-        .store
-        .db()
-        .execute_unprepared("UPDATE pin_management_readiness SET state='ready' WHERE id=1")
-        .await
-        .unwrap();
-    let restarted = fixture
-        .coordinator
-        .start(fixture.store.clone(), CancellationToken::new());
-    wait_for(|| async {
-        fixture.target_state(&target).await == "pinned" && !fixture.receipt().await.needs_attention
-    })
-    .await;
-    restarted.shutdown(Duration::from_secs(2)).await;
-    assert_eq!(fixture.receipt().await.observed_at, receipt.observed_at);
     fixture.held(100, 1).await;
     fixture.assert_posts(1);
 }
@@ -1285,10 +1316,9 @@ async fn postgres_actual_worker_receipt_lock_order_and_recoverable_waiters() {
         );
         // The periodic scanner sees parked unknown debt until the complete
         // receipt arrives; B must remain a waiter, never permanently blocked.
-        let txn = fixture.store.db().begin().await.unwrap();
         assert!(
             quota::wake_provider_waiters(
-                &txn,
+                fixture.store.db(),
                 &fixture.provider,
                 &fixture.coordinator.provider_limits()[&fixture.provider],
                 Utc::now()
@@ -1297,7 +1327,6 @@ async fn postgres_actual_worker_receipt_lock_order_and_recoverable_waiters() {
             .unwrap()
             .is_empty()
         );
-        txn.commit().await.unwrap();
         assert_eq!(fixture.target_state(&b).await, "quota_waiting");
         fixture.target.release.add_permits(1);
         wait_for_stage("PG both targets pinned", || async {

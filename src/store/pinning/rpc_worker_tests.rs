@@ -30,6 +30,8 @@ use wiremock::{
 mod cid_flow;
 #[path = "rpc_worker_tests/local_release.rs"]
 mod local_release;
+#[path = "rpc_worker_tests/stored_matched.rs"]
+mod stored_matched;
 
 const CID: &str = "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku";
 const OTHER: &str = "bafkreigh2akiscaildc6ii5zji4bq7kly5k3s7svv6q2wx2nn5rtj5xuu4";
@@ -2496,6 +2498,30 @@ async fn worker_late_receipt_records_original_epoch_but_cannot_publish_into_rele
     let evidence = fixture.evidence().await;
     assert_eq!(evidence[0].remote_epoch, captured.remote_epoch);
     assert_eq!(evidence[0].route, captured.route);
+    let original = pin_job::Entity::find_by_id(&evidence[0].job_id)
+        .one(fixture.store.db())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(original.state, "error");
+    assert!(original.locked_until.is_none());
+    let claims = jobs::claim_due_jobs(
+        fixture.store.db(),
+        Utc::now() + ChronoDuration::hours(1),
+        ChronoDuration::seconds(30),
+        10,
+    )
+    .await
+    .unwrap();
+    assert!(claims.iter().all(|claim| claim.model.id != original.id));
+    assert_ne!(
+        jobs::submission_history(fixture.store.db(), &original.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        "settled"
+    );
     assert!(evidence[0].needs_attention);
     assert!(evidence[0].resources.contains(CID));
     assert_ne!(

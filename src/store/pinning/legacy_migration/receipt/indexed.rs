@@ -56,11 +56,21 @@ async fn admission_historical_keys_with_catalog<W: Work>(
     Ok(keys)
 }
 
+const ADMISSION_RESOURCE_TABLES: [&str; 3] = [
+    "pin_submit_observations",
+    "remote_pin_ledger",
+    "pin_resource_history",
+];
+
 pub(in crate::store::pinning) async fn admission_historical_resources_with_catalog<W: Work>(
     provider: &str,
+    cids: Option<&[&str]>,
     work: &W,
     catalog: ReceiptCatalog<'_>,
 ) -> Result<Vec<(String, String, Option<String>)>, W::Error> {
+    if cids.is_some_and(|cids| cids.is_empty()) {
+        return Ok(Vec::new());
+    }
     let versions = catalog.classify().await.map_err(W::application)?;
     if !crate::store::migrations::history::has_current_pinning_layout(&versions) {
         return admission_historical_keys_with_catalog(provider, work, catalog)
@@ -84,95 +94,57 @@ pub(in crate::store::pinning) async fn admission_historical_resources_with_catal
             });
     }
 
-    let selector_keys = [
-        "pin_submit_observations",
-        "remote_pin_ledger",
-        "pin_resource_history",
-    ]
-    .map(|table| {
-        serde_json::to_string(&(table, provider, Option::<String>::None))
-            .map_err(|_| W::application(refused("invalid admission selector")))
-    })
-    .into_iter()
-    .collect::<Result<Vec<_>, _>>()?;
-    let slots = (1..=selector_keys.len())
-        .map(|slot| format!("${slot}"))
-        .collect::<Vec<_>>()
-        .join(",");
-    let selector_values = || {
-        selector_keys
-            .iter()
-            .cloned()
-            .map(sea_orm::Value::from)
-            .collect::<Vec<_>>()
+    let cids = cids.map(|cids| cids.iter().copied().collect::<BTreeSet<_>>());
+    let requested = match &cids {
+        Some(cids) => cids.iter().copied().map(Some).collect::<Vec<_>>(),
+        None => vec![None],
     };
-    let pending = catalog
-        .query_one(sea_orm::Statement::from_sql_and_values(
-            catalog.get_database_backend(),
-            format!(
-                "SELECT 1 FROM pin_management_pending_scope \
-                 WHERE (selector_kind='unknown' AND selector_key='*') \
-                 OR (selector_kind='legacy_resource' AND selector_key IN ({slots})) LIMIT 1"
-            ),
-            selector_values(),
-        ))
-        .await
-        .map_err(|error| W::application(error.into()))?;
-    if pending.is_some() {
-        return Err(W::application(admission::work_error(
-            crate::store::pinning::management::ManagementError::Changed,
-        )));
-    }
-    let roots = catalog
-        .query_all(sea_orm::Statement::from_sql_and_values(
-            catalog.get_database_backend(),
-            format!(
-                "SELECT requested.source_key,control.source_generation,\
-                 control.locator_generation,control.sealed_source,control.sealed_locator \
-                 FROM pin_management_locator requested \
-                 LEFT JOIN pin_management_source_control control \
-                 ON control.source_key=requested.source_key \
-                 WHERE requested.selector_kind='legacy_resource' \
-                 AND requested.selector_key IN ({slots})"
-            ),
-            selector_values(),
-        ))
-        .await
-        .map_err(|error| W::application(error.into()))?;
     let mut ids = BTreeSet::new();
-    for row in roots {
-        let generation = row
-            .try_get::<i64>("", "source_generation")
-            .ok()
-            .zip(row.try_get::<i64>("", "locator_generation").ok())
-            .zip(row.try_get::<i64>("", "sealed_source").ok())
-            .zip(row.try_get::<i64>("", "sealed_locator").ok());
-        let Some((((source, locator), sealed_source), sealed_locator)) = generation else {
-            return Err(W::application(admission::work_error(
-                crate::store::pinning::management::ManagementError::Changed,
-            )));
-        };
-        if source < 0 || locator < 0 || source != sealed_source || locator != sealed_locator {
-            return Err(W::application(admission::work_error(
-                crate::store::pinning::management::ManagementError::Changed,
-            )));
+    let tables: &[&str] = if cids.is_some() {
+        &[
+            "pin_submit_observations",
+            "remote_pin_ledger",
+            "pin_resource_history",
+            "remote_pins",
+            "pin_replica_observations",
+            "pin_jobs",
+            "pin_lease_targets",
+        ]
+    } else {
+        &ADMISSION_RESOURCE_TABLES
+    };
+    for batch in requested.chunks(128) {
+        let selectors = batch
+            .iter()
+            .flat_map(|cid| {
+                tables
+                    .iter()
+                    .map(move |table| admission_selector::<W>(table, provider, *cid))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        for source in admission_locator_values(selectors, false, work, catalog).await? {
+            let key = records::locator::key_from_source(&source)
+                .map_err(|error| W::application(admission::work_error(error)))?;
+            let id = match (key.table.as_str(), key.values.as_slice()) {
+                ("pin_legacy_migrations", [id]) | ("pin_legacy_migration_items", [id, ..]) => id,
+                _ => return Err(W::application(refused("invalid admission locator root"))),
+            };
+            work.copy(id)?;
+            ids.insert(id.clone());
         }
-        let source_key: String = row
-            .try_get("", "source_key")
-            .map_err(|_| W::application(refused("invalid admission locator")))?;
-        let key = records::locator::key_from_source(&source_key)
-            .map_err(|error| W::application(admission::work_error(error)))?;
-        let id = match (key.table.as_str(), key.values.as_slice()) {
-            ("pin_legacy_migrations", [id]) | ("pin_legacy_migration_items", [id, ..]) => id,
-            _ => return Err(W::application(refused("invalid admission locator root"))),
-        };
-        ids.insert(id.clone());
     }
+
     let session = records::SharedDecodeBudget::default();
     let context = work
         .decode()
         .unwrap_or(records::DecodeWork::shared(&session));
-    let active = active_for_ids(ids, work, context, catalog).await?;
+    let mut active = Vec::new();
+    let mut ids = ids.into_iter().peekable();
+    while ids.peek().is_some() {
+        active.extend(
+            active_for_ids(ids.by_ref().take(128).collect(), work, context, catalog).await?,
+        );
+    }
     let mut resources = BTreeSet::new();
     for operation in active {
         let declaration: crate::store::pinning::legacy_migration::Declaration =
@@ -189,22 +161,26 @@ pub(in crate::store::pinning) async fn admission_historical_resources_with_catal
                 .into_iter()
                 .filter(|binding| binding.provider == namespace.source)
             {
-                let original = confirmation
-                    .before
-                    .iter()
-                    .filter(|image| image.table == binding.table)
-                    .flat_map(|image| &image.rows)
-                    .find(|row| {
-                        binding.key.iter().all(|(column, value)| {
-                            native::value(*row, column) == Some(value.as_str())
-                        })
-                    });
                 let cid = binding.key.get("cid").map(String::as_str).or_else(|| {
-                    original.and_then(|row| {
-                        native::value(row, "cid").or_else(|| native::value(row, "expected_cid"))
-                    })
+                    confirmation
+                        .before
+                        .iter()
+                        .filter(|image| image.table == binding.table)
+                        .flat_map(|image| &image.rows)
+                        .find(|row| {
+                            binding.key.iter().all(|(column, value)| {
+                                native::value(*row, column) == Some(value.as_str())
+                            })
+                        })
+                        .and_then(|row| {
+                            native::value(row, "cid").or_else(|| native::value(row, "expected_cid"))
+                        })
                 });
-                if let Some(cid) = cid {
+                if let Some(cid) = cid
+                    && cids
+                        .as_ref()
+                        .is_none_or(|requested| requested.contains(cid))
+                {
                     work.copy(&(binding.table.as_str(), namespace.source.as_str(), cid))?;
                     resources.insert((binding.table, namespace.source.clone(), Some(cid.into())));
                 }
@@ -212,6 +188,98 @@ pub(in crate::store::pinning) async fn admission_historical_resources_with_catal
         }
     }
     Ok(resources.into_iter().collect())
+}
+
+/// Query names for report discovery; the caller still checks observation attribution.
+pub(in crate::store::pinning) async fn admission_report_providers_with_catalog<W: Work>(
+    provider: &str,
+    work: &W,
+    catalog: ReceiptCatalog<'_>,
+) -> Result<Vec<String>, W::Error> {
+    let table = "pin_submit_observations";
+    work.copy(provider)?;
+    let versions = catalog.classify().await.map_err(W::application)?;
+    if !crate::store::migrations::history::has_current_pinning_layout(&versions) {
+        let active = historical::active_with_work(&catalog, &versions, work).await?;
+        return resource_keys_from_active(table, provider, None, active, work);
+    }
+
+    let selector = admission_selector::<W>(table, provider, None)?;
+    let mut names = BTreeSet::from([provider.to_owned()]);
+    for key in admission_locator_values(vec![selector], true, work, catalog).await? {
+        names.insert(work.parse(&key, "invalid admission namespace selector")?);
+    }
+    Ok(names.into_iter().collect())
+}
+
+fn admission_selector<W: Work>(
+    table: &str,
+    provider: &str,
+    cid: Option<&str>,
+) -> Result<String, W::Error> {
+    serde_json::to_string(&(table, provider, cid))
+        .map_err(|_| W::application(refused("invalid admission selector")))
+}
+
+async fn admission_locator_values<W: Work>(
+    selectors: Vec<String>,
+    namespace_names: bool,
+    work: &W,
+    catalog: ReceiptCatalog<'_>,
+) -> Result<Vec<String>, W::Error> {
+    work.cells(selectors.len(), selectors.iter().map(String::len).sum())?;
+    let slots = (1..=selectors.len())
+        .map(|slot| format!("${slot}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let (value, joins) = if namespace_names {
+        (
+            "name.selector_key",
+            "LEFT JOIN pin_management_locator name ON name.source_key=requested.source_key \
+             AND name.selector_kind='legacy_namespace'",
+        )
+    } else {
+        ("requested.source_key", "")
+    };
+    // A null result marks incomplete membership in the same snapshot as the lookup.
+    let rows = catalog
+        .query_all(sea_orm::Statement::from_sql_and_values(
+            catalog.get_database_backend(),
+            format!(
+                "SELECT NULL AS locator_value WHERE EXISTS ( \
+                     SELECT 1 FROM pin_management_pending_scope \
+                     WHERE (selector_kind='unknown' AND selector_key='*') \
+                     OR (selector_kind='legacy_resource' AND selector_key IN ({slots})) \
+                 ) UNION \
+                 SELECT CASE WHEN control.source_generation>=0 AND control.locator_generation>=0 \
+                     AND control.source_generation=control.sealed_source \
+                     AND control.locator_generation=control.sealed_locator \
+                     THEN {value} END AS locator_value \
+                 FROM pin_management_locator requested \
+                 LEFT JOIN pin_management_source_control control ON control.source_key=requested.source_key \
+                 {joins} WHERE requested.selector_kind='legacy_resource' \
+                 AND requested.selector_key IN ({slots})"
+            ),
+            selectors.into_iter().map(sea_orm::Value::from),
+        ))
+        .await
+        .map_err(|error| W::application(error.into()))?;
+    let values = rows
+        .into_iter()
+        .map(|row| row.try_get::<Option<String>>("", "locator_value"))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| W::application(error.into()))?;
+    work.cells(values.len(), values.iter().flatten().map(String::len).sum())?;
+    values
+        .into_iter()
+        .map(|value| {
+            value.ok_or_else(|| {
+                W::application(admission::work_error(
+                    crate::store::pinning::management::ManagementError::Changed,
+                ))
+            })
+        })
+        .collect()
 }
 
 pub(super) async fn active_for<C: ConnectionTrait, W: Work>(

@@ -7,6 +7,7 @@ pub(super) enum WorkerContinuation {
     Done,
     RunJob(Box<ClaimedPinJob>),
     RecordSubmit(Box<SubmitDispatch>),
+    SettleSubmit(Box<MatchedSubmit>),
     RecoverSubmit(Box<ClaimedPinJob>),
     PersistObservation(Box<PendingObservation>),
     CoordinateObservation(Box<CommittedObservation>),
@@ -67,6 +68,9 @@ fn phase_future<'a>(
             ))
         }
         WorkerContinuation::RecordSubmit(observed) => record_future(store, coordinator, *observed),
+        WorkerContinuation::SettleSubmit(submit) => {
+            Box::pin(settle_submit_receipt(store, coordinator, *submit))
+        }
         WorkerContinuation::PersistObservation(pending) => {
             Box::pin(persist_observation_phase(store, coordinator, *pending))
         }

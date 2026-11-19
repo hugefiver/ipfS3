@@ -18,7 +18,8 @@ pub(crate) use catalog::ReceiptCatalog;
 #[cfg(test)]
 pub(crate) use indexed::admission_historical_keys;
 pub(in crate::store::pinning) use indexed::{
-    admission_historical_resources_with_catalog, historical_resource_keys_from_loaded_catalog,
+    admission_historical_resources_with_catalog, admission_report_providers_with_catalog,
+    historical_resource_keys_from_loaded_catalog,
 };
 mod maintenance;
 use crate::store::pinning::management::records::locator::AuthoritySelector;

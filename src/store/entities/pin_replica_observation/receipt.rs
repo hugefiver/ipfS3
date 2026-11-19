@@ -121,18 +121,44 @@ pub(crate) async fn append(
     } else {
         "Unknown"
     };
+    append_fact(
+        tx,
+        claimed,
+        observation,
+        (&capture.route, capture.remote_epoch),
+        outcome,
+        projectable,
+        now,
+    )
+    .await?;
+    Ok(ReplicaReceipt {
+        projectable,
+        complete: outcome == "Complete",
+    })
+}
+
+pub(crate) async fn append_fact(
+    tx: &crate::store::RuntimeTransaction,
+    claimed: &ClaimedPinJob,
+    observation: &PinObservation,
+    (route, epoch): (&str, i64),
+    outcome: &str,
+    projectable: bool,
+    now: DateTime<Utc>,
+) -> AppResult<()> {
+    let job = &claimed.model;
     Entity::insert(ActiveModel {
         sequence: Default::default(),
         job_id: Set(job.id.clone()),
         provider: Set(job.provider.clone()),
         expected_cid: Set(job.cid.clone()),
-        route: Set(capture.route),
-        remote_epoch: Set(capture.remote_epoch),
-        claim_until: Set(until),
+        route: Set(route.into()),
+        remote_epoch: Set(epoch),
+        claim_until: Set(job.locked_until.expect("claimed replica observation")),
         lease_id: Set(job.lease_id.clone()),
         target_id: Set(job.target_id.clone()),
         expected_generation: Set(job.expected_generation),
-        phase: Set(phase.into()),
+        phase: Set(job.operation.clone()),
         resources: Set(serde_json::to_string(&observation.resources)
             .map_err(|_| AppError::Internal("replica evidence serialization".into()))?),
         outcome: Set(outcome.into()),
@@ -144,12 +170,9 @@ pub(crate) async fn append(
         projectable: Set(projectable),
         observed_at: Set(now),
     })
-    .exec(db)
+    .exec(tx.db())
     .await?;
-    Ok(ReplicaReceipt {
-        projectable,
-        complete: outcome == "Complete",
-    })
+    Ok(())
 }
 
 async fn unreleased(

@@ -199,8 +199,12 @@ async fn prepare(
     use legacy_migration::ReceiptCatalog;
     let catalog = ReceiptCatalog::Quota(window);
     admission::check_quota_provider(window, provider, registered, work).await?;
-    match super::super::ledger::submission::admission_barriers_with_catalog(
-        provider, catalog, &work, true,
+    match super::super::ledger::submission::resource_admission_barriers_with_catalog(
+        provider,
+        &[cid],
+        catalog,
+        &work,
+        true,
     )
     .await?
     .get(cid)

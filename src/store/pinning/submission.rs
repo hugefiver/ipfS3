@@ -31,6 +31,9 @@ use crate::{
     },
 };
 
+#[path = "submission/reported.rs"]
+mod reported;
+
 #[path = "submission/bounded.rs"]
 mod bounded;
 pub(crate) use bounded::{latest_rpc, latest_rpc_with_work, rejected_non_rpc_call_with_work};
@@ -168,21 +171,20 @@ pub async fn begin<C: ConnectionTrait>(
         return Ok(None);
     }
     let relation = fact_relation(db).await?;
-    let unresolved = db.query_all(Statement::from_sql_and_values(
-        db.get_database_backend(),
-        format!("SELECT expected_cid, resources FROM {} WHERE provider=$1 AND needs_attention=$3 AND (expected_cid=$2 OR resources<>'[]')", relation.table),
-        [claimed.model.provider.clone().into(), claimed.model.cid.clone().into(), true.into()],
-    )).await?;
-    for row in unresolved {
-        if row.try_get::<String>("", "expected_cid")? == claimed.model.cid
-            || row
-                .try_get::<String>("", "resources")
-                .is_ok_and(|reports| reported_cids(&reports).any(|cid| cid == claimed.model.cid))
-        {
-            return Err(AppError::InvalidPinningRequest(
-                "RPC resource has an unresolved invocation; repeated POST is unsafe".into(),
-            ));
-        }
+    if !reported::sources(
+        db,
+        &relation.table,
+        &[&claimed.model.provider],
+        &[&claimed.model.cid],
+        true,
+        &(),
+    )
+    .await?
+    .is_empty()
+    {
+        return Err(AppError::InvalidPinningRequest(
+            "RPC resource has an unresolved invocation; repeated POST is unsafe".into(),
+        ));
     }
     let history = jobs::submission_history(db, &claimed.model.id)
         .await?
@@ -902,6 +904,10 @@ pub(crate) async fn recovery_read_allowed<C: ConnectionTrait>(
 }
 
 pub(crate) fn matching_request(row: &evidence::Model) -> Option<String> {
+    matching_resource(row).map(|(request, _)| request)
+}
+
+pub(crate) fn matching_resource(row: &evidence::Model) -> Option<(String, Ownership)> {
     if !matches!(row.outcome.as_str(), "matched" | "accepted")
         || row.effect != "observed"
         || row.observed_at.is_none()
@@ -934,7 +940,7 @@ pub(crate) fn matching_request(row: &evidence::Model) -> Option<String> {
                 && resource.resource.request_id == *request
                 && cids_equivalent(&resource.resource.cid, &row.expected_cid).unwrap_or(false)
         })
-        .then(|| request.clone())
+        .then(|| (request.clone(), resources[0].resource.ownership))
 }
 
 async fn receipt_context_core<C: ConnectionTrait>(
@@ -949,7 +955,27 @@ async fn receipt_context_core<C: ConnectionTrait>(
     )>,
 ) -> AppResult<bool> {
     Ok(jobs::check_target_job_generation(db, job).await?
-        && receipt_resource_context(db, row, job, remote, request, runtime).await?)
+        && receipt_resource_context(db, row, job, remote, request, runtime, false).await?)
+}
+
+pub(crate) async fn matched_resource_current(
+    tx: &crate::store::RuntimeTransaction,
+    row: &evidence::Model,
+    job: &pin_job::Model,
+    remote: &remote_pin::Model,
+    request: &str,
+    work: crate::store::pinning::management::records::DecodeWork<'_>,
+) -> AppResult<bool> {
+    receipt_resource_context(
+        tx.db(),
+        row,
+        job,
+        remote,
+        Some(request),
+        Some((tx.catalog(work), work)),
+        true,
+    )
+    .await
 }
 
 async fn receipt_resource_context<C: ConnectionTrait>(
@@ -962,6 +988,7 @@ async fn receipt_resource_context<C: ConnectionTrait>(
         crate::store::pinning::legacy_migration::ReceiptCatalog<'_>,
         crate::store::pinning::management::records::DecodeWork<'_>,
     )>,
+    settling: bool,
 ) -> AppResult<bool> {
     let pk = [("id".into(), row.id.clone())].into();
     let operational = match runtime {
@@ -1013,6 +1040,12 @@ async fn receipt_resource_context<C: ConnectionTrait>(
     }
     let route: ProviderRouteSnapshot = serde_json::from_str(&row.route)
         .map_err(|_| AppError::Internal("invalid RPC replay route".into()))?;
+    if settling
+        && route.resource_type() == RemoteResourceType::ClusterPin
+        && route.confirmation.is_none()
+    {
+        return Ok(false);
+    }
     let Some(history) = jobs::submission_history(db, &row.job_id).await? else {
         return Ok(false);
     };
@@ -1028,10 +1061,15 @@ async fn receipt_resource_context<C: ConnectionTrait>(
     {
         return Ok(false);
     }
-    let registered =
-        crate::store::entities::pin_provider_route::Entity::find_by_id(operational.clone())
-            .one(db)
-            .await?;
+    let registered = pin_provider_route::Entity::find_by_id(operational.clone());
+    let registered = if settling && db.get_database_backend() == sea_orm::DatabaseBackend::Postgres
+    {
+        registered.lock_shared()
+    } else {
+        registered
+    }
+    .one(db)
+    .await?;
     if !registered.is_some_and(|registered| {
         !registered.retired && registered_invocation_matches(&row.route, &registered.snapshot)
     }) || match runtime {
@@ -1126,10 +1164,16 @@ async fn wake_parked_core<C: ConnectionTrait>(
     {
         return Ok(false);
     }
-    let Some(remote) = lock_receipt_remote(db, &job.provider, &job.cid).await? else {
+    let Some(row) = latest(db, id).await? else {
         return Ok(false);
     };
-    let Some(row) = latest(db, id).await? else {
+    if matches!(
+        row.outcome.as_str(),
+        "in_flight" | "cid_mismatch" | "not_submitted"
+    ) {
+        return Ok(false);
+    }
+    let Some(remote) = lock_receipt_remote(db, &job.provider, &job.cid).await? else {
         return Ok(false);
     };
     let Some(history) = jobs::submission_history(db, id).await? else {
@@ -1210,25 +1254,38 @@ async fn wake_parked_core<C: ConnectionTrait>(
     .await
 }
 
-/// Primary-key keyset paging bounds the rows examined, not merely the number
-/// of matches returned. Cursor wrap revisits transiently unavailable receipts;
-/// no restart depends on an in-memory notification or a persisted cursor.
+pub(crate) struct ParkedReceiptPage {
+    pub next: Option<String>,
+    pub wake: Vec<String>,
+    pub cleanup: Vec<String>,
+    pub finish: Vec<String>,
+}
+
+/// Cursor wrap revisits transiently unavailable receipts; no restart depends
+/// on an in-memory notification or a persisted cursor.
 pub(crate) async fn parked_receipt_candidates<C: ConnectionTrait>(
     db: &C,
     after: &str,
     limit: u64,
-) -> AppResult<(Option<String>, Vec<String>, Vec<String>)> {
+) -> AppResult<ParkedReceiptPage> {
     let relation = fact_relation(db).await?;
-    let jobs_table = if db.get_database_backend() == sea_orm::DatabaseBackend::Sqlite {
-        "\"main\".\"pin_jobs\""
-    } else {
-        "\"pin_jobs\""
-    };
+    let (jobs_table, history_table) =
+        if db.get_database_backend() == sea_orm::DatabaseBackend::Sqlite {
+            ("\"main\".\"pin_jobs\"", "\"main\".\"pin_submit_history\"")
+        } else {
+            ("\"pin_jobs\"", "\"pin_submit_history\"")
+        };
     let rows = db.query_all(Statement::from_sql_and_values(
         db.get_database_backend(),
-        format!("SELECT id, job_id, ended, (needs_attention AND observed_at IS NOT NULL AND outcome IN ('matched','accepted','unknown')) AS ready FROM (\
+        format!("SELECT id, job_id, ended, \
+                    (expired OR (observed_at IS NOT NULL AND outcome IN ('cid_mismatch','not_submitted'))) AS finish, \
+                    (needs_attention AND observed_at IS NOT NULL AND outcome IN ('matched','accepted','unknown')) AS ready FROM (\
             SELECT e.id,e.job_id,e.needs_attention,e.outcome,e.observed_at,\
                    (j.state='running' AND j.locked_until IS NULL AND j.submit_phase='recovering') AS parked,\
+                   (e.outcome='in_flight' AND e.observed_at IS NULL AND EXISTS (\
+                       SELECT 1 FROM {history_table} h WHERE h.job_id=j.id AND h.submit_calls=e.submit_call \
+                       AND h.state='needs_attention' AND (h.started_at<=$3 OR h.recovery_queries>=$4)\
+                   )) AS expired,\
                    (e.needs_attention AND e.outcome IN ('matched','accepted') AND e.observed_at IS NOT NULL AND EXISTS (\
                        SELECT 1 FROM pin_leases l JOIN pin_lease_targets t ON t.lease_id=l.id \
                        JOIN remote_pins r ON r.provider=t.provider AND r.cid=t.cid \
@@ -1237,20 +1294,52 @@ pub(crate) async fn parked_receipt_candidates<C: ConnectionTrait>(
                        AND r.cid=e.expected_cid AND r.epoch>=e.remote_epoch AND r.request_id IS NULL AND r.status<>'absent'\
                    )) AS ended FROM {} e JOIN {jobs_table} j ON j.id=e.job_id AND j.operation='submit' WHERE e.id>$1\
         ) receipt WHERE parked OR ended ORDER BY id LIMIT $2", relation.table),
-        [after.into(), i64::try_from(limit).unwrap_or(i64::MAX).into()],
+        [after.into(), i64::try_from(limit).unwrap_or(i64::MAX).into(), (Utc::now() - chrono::Duration::hours(1)).into(), jobs::MAX_SUBMIT_RECOVERY_ATTEMPTS.into()],
     )).await?;
     let mut cursor = None;
     let mut candidates = Vec::new();
     let mut cleanup = Vec::new();
+    let mut finish = Vec::new();
     for row in rows {
         cursor = Some(row.try_get::<String>("", "id")?);
         if row.try_get::<bool>("", "ended")? {
             cleanup.push(row.try_get("", "job_id")?);
+        } else if row.try_get::<bool>("", "finish")? {
+            finish.push(row.try_get("", "job_id")?);
         } else if row.try_get::<bool>("", "ready")? {
             candidates.push(row.try_get("", "job_id")?);
         }
     }
-    Ok((cursor, candidates, cleanup))
+    Ok(ParkedReceiptPage {
+        next: cursor,
+        wake: candidates,
+        cleanup,
+        finish,
+    })
+}
+
+/// Closing an exact parked job cannot project a receipt or modify its lease.
+pub(crate) async fn finish_parked_receipt<C: ConnectionTrait>(
+    db: &C,
+    id: &str,
+    now: DateTime<Utc>,
+) -> AppResult<()> {
+    let relation = fact_relation(db).await?;
+    db.execute(Statement::from_sql_and_values(
+        db.get_database_backend(),
+        format!("UPDATE pin_jobs AS j SET state='error',updated_at=$2,last_error=CASE e.outcome \
+                    WHEN 'in_flight' THEN 'submit recovery budget exhausted' \
+                    WHEN 'not_submitted' THEN 'RPC invocation did not create a remote pin' ELSE j.last_error END \
+            FROM pin_submit_history h JOIN {} e ON e.job_id=h.job_id AND e.submit_call=h.submit_calls \
+            WHERE j.id=$1 AND j.operation='submit' AND j.state='running' AND j.locked_until IS NULL \
+              AND j.submit_phase='recovering' AND j.last_error=$5 AND h.job_id=j.id AND h.state='needs_attention' \
+              AND e.provider=j.provider AND e.expected_cid=j.cid AND (\
+                  (e.observed_at IS NOT NULL AND e.outcome IN ('cid_mismatch','not_submitted')) OR \
+                  (e.observed_at IS NULL AND e.outcome='in_flight' AND (h.started_at<=$3 OR h.recovery_queries>=$4))\
+              )", relation.table),
+        [id.into(), now.into(), (now - chrono::Duration::hours(1)).into(), jobs::MAX_SUBMIT_RECOVERY_ATTEMPTS.into(), jobs::RPC_RECOVERY_PARK_REASON.into()],
+    )).await?;
+    Ok(())
 }
 
 pub(crate) async fn missing_receipt_park_candidates<C: ConnectionTrait>(
@@ -1417,10 +1506,15 @@ pub(crate) async fn reset_runtime_missing_receipt(
     {
         return Ok(false);
     }
-    let aliases = observations_catalog(tx.catalog(work), &job.provider, work).await?;
-    if aliases
-        .iter()
-        .any(|row| row.expected_cid == job.cid && row.remote_epoch == remote.epoch)
+    if resource_receipt_epoch(
+        tx.catalog(work),
+        &job.provider,
+        &job.cid,
+        Some(remote.epoch),
+        &work,
+    )
+    .await?
+    .is_some()
     {
         return Ok(false);
     }
@@ -1528,6 +1622,36 @@ struct AdmissionSnapshot {
     leases: BTreeMap<String, pin_lease::Model>,
 }
 
+enum AdmissionScope<'a> {
+    Provider,
+    Context(&'a str),
+    Resources {
+        requested: &'a [&'a str],
+        // Receipt ID -> expected CID, for outstanding reports of another resource.
+        reports: &'a BTreeMap<String, String>,
+    },
+}
+
+fn bind_admission_keys(
+    backend: sea_orm::DatabaseBackend,
+    values: &mut Vec<sea_orm::Value>,
+    keys: &[&str],
+) -> String {
+    let slot = values.len() + 1;
+    if let [key] = keys {
+        values.push((*key).into());
+        return format!("${slot}");
+    }
+    // A ZIP batch can exceed the backend's bind-parameter limit.
+    let json = serde_json::to_string(keys).expect("string keys serialize");
+    values.push(json.into());
+    if backend == sea_orm::DatabaseBackend::Postgres {
+        format!("SELECT json_array_elements_text(CAST(${slot} AS json))")
+    } else {
+        format!("SELECT value FROM json_each(${slot})")
+    }
+}
+
 struct AdmissionTable {
     kind: &'static str,
     name: String,
@@ -1580,9 +1704,42 @@ impl AdmissionSnapshot {
         work: &W,
         include_undispatched_jobs: bool,
     ) -> AppResult<Self> {
+        Self::read_scope(
+            provider,
+            cid.map_or(AdmissionScope::Provider, AdmissionScope::Context),
+            catalog,
+            work,
+            include_undispatched_jobs,
+        )
+        .await
+    }
+
+    async fn read_scope<W: crate::store::pinning::legacy_migration::ReceiptWork>(
+        provider: &str,
+        scope: AdmissionScope<'_>,
+        catalog: crate::store::pinning::legacy_migration::ReceiptCatalog<'_>,
+        work: &W,
+        include_undispatched_jobs: bool,
+    ) -> AppResult<Self> {
+        let sources = match &scope {
+            AdmissionScope::Provider => None,
+            AdmissionScope::Context(cid) => Some(vec![*cid]),
+            AdmissionScope::Resources { requested, reports } => Some(
+                requested
+                    .iter()
+                    .copied()
+                    .chain(reports.values().map(String::as_str))
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect(),
+            ),
+        };
         let aliases =
             crate::store::pinning::legacy_migration::admission_historical_resources_with_catalog(
-                provider, work, catalog,
+                provider,
+                sources.as_deref(),
+                work,
+                catalog,
             )
             .await
             .map_err(W::into_app)?;
@@ -1649,9 +1806,28 @@ impl AdmissionSnapshot {
                  WHERE \"provider\"=$1)"
             )
         };
-        let candidate_sql = if let Some(cid) = cid {
+        let mut requested_filter = String::new();
+        let mut receipt_filter = String::new();
+        let mut unwitnessed_filter = String::new();
+        if let AdmissionScope::Resources { requested, reports } = &scope {
+            let slots = bind_admission_keys(catalog.get_database_backend(), &mut values, requested);
+            requested_filter = format!(" AND ledger.cid IN ({slots})");
+            unwitnessed_filter = format!(" AND cid IN ({slots})");
+            let mut selected = format!("expected_cid IN ({slots})");
+            if !reports.is_empty() {
+                let ids = bind_admission_keys(
+                    catalog.get_database_backend(),
+                    &mut values,
+                    &reports.keys().map(String::as_str).collect::<Vec<_>>(),
+                );
+                selected.push_str(&format!(" OR (needs_attention=TRUE AND id IN ({ids}))"));
+            }
+            receipt_filter = format!(" AND ({selected})");
+        }
+        let candidate_sql = if let AdmissionScope::Context(cid) = scope {
             let slot = values.len() + 1;
             values.push(cid.into());
+            unwitnessed_filter = format!(" AND cid=${slot}");
             format!("SELECT CAST(${slot} AS TEXT) AS \"cid\"")
         } else {
             let evidence_scope =
@@ -1694,9 +1870,9 @@ impl AdmissionSnapshot {
             format!(
                 "SELECT unresolved.\"expected_cid\" AS \"cid\" \
                  FROM \"pin_submit_observations\" unresolved \
-                 WHERE ({evidence_scope}) AND unresolved.\"needs_attention\"=TRUE \
+                 WHERE ({evidence_scope}) AND unresolved.\"needs_attention\"=TRUE{receipt_filter} \
                  UNION SELECT ledger.\"cid\" FROM \"remote_pin_ledger\" ledger \
-                 WHERE ({ledger_scope}) AND CASE \
+                 WHERE ({ledger_scope}){requested_filter} AND CASE \
                      WHEN ledger.\"effect\" IN ('cleanup_pending','reported_unknown') THEN TRUE \
                      WHEN ledger.\"effect\" IN ('reserved','retained') AND COALESCE(({}), FALSE) THEN FALSE \
                      WHEN ledger.\"effect\"='absent' THEN NOT ({absent_witness}) \
@@ -1706,12 +1882,12 @@ impl AdmissionSnapshot {
         };
         let candidate = "SELECT \"cid\" FROM candidate_cids";
         let evidence_scope = format!(
-            "({}) AND \"expected_cid\" IN ({candidate})",
+            "({}) AND \"expected_cid\" IN ({candidate}){receipt_filter}",
             resource_scope("pin_submit_observations", "", "expected_cid")
         );
         let evidence_jobs = format!(
             "SELECT evidence.\"job_id\" FROM \"pin_submit_observations\" evidence \
-             WHERE ({}) AND evidence.\"expected_cid\" IN ({candidate})",
+             WHERE ({}) AND evidence.\"expected_cid\" IN ({candidate}){receipt_filter}",
             resource_scope("pin_submit_observations", "evidence", "expected_cid")
         );
         let mut job_scope = format!(
@@ -1773,12 +1949,7 @@ impl AdmissionSnapshot {
         let unwitnessed = format!(
             "\"provider\"=$1 AND \"operation\"='submit' AND EXISTS (SELECT 1 FROM pin_submit_history h \
              WHERE h.job_id=pin_jobs.id AND h.submit_calls>0 AND h.effect='unknown' \
-             AND NOT EXISTS (SELECT 1 FROM pin_submit_observations r WHERE r.job_id=h.job_id AND r.submit_call=h.submit_calls)){}",
-            if cid.is_some() {
-                " AND cid IN (SELECT cid FROM candidate_cids)"
-            } else {
-                ""
-            }
+             AND NOT EXISTS (SELECT 1 FROM pin_submit_observations r WHERE r.job_id=h.job_id AND r.submit_call=h.submit_calls)){unwitnessed_filter}"
         );
         let tables = [
             admission_table::<pin_job::Entity>("unwitnessed", &unwitnessed),
@@ -2541,6 +2712,39 @@ pub(in crate::store::pinning) async fn undispatched_reservation<
 
 /// A reclaimed matching invocation may settle its temporary claim-loss debt
 /// only after the status projection passed the same original lifetime fence.
+pub(crate) async fn settle_projected_receipt(
+    tx: &crate::store::RuntimeTransaction,
+    row: &evidence::Model,
+) -> AppResult<()> {
+    use jobs::history;
+    history::Entity::update_many()
+        .col_expr(history::Column::State, Expr::value("settled"))
+        .col_expr(history::Column::Effect, Expr::value("created"))
+        .filter(history::Column::JobId.eq(&row.job_id))
+        .filter(history::Column::SubmitCalls.eq(row.submit_call))
+        .filter(
+            sea_orm::Condition::any()
+                .add(history::Column::State.ne("settled"))
+                .add(history::Column::Effect.ne("created")),
+        )
+        .exec(tx.db())
+        .await?;
+    if row.needs_attention {
+        let settled = evidence::Entity::update_many()
+            .col_expr(evidence::Column::NeedsAttention, Expr::value(false))
+            .filter(evidence::Column::Id.eq(&row.id))
+            .filter(evidence::Column::NeedsAttention.eq(true))
+            .exec(tx.db())
+            .await?;
+        if settled.rows_affected != 1 {
+            return Err(AppError::Database(
+                "RPC receipt changed before settlement".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub async fn settle_matching<C: ConnectionTrait>(
     db: &C,
     job: &crate::store::entities::pin_job::Model,
@@ -2825,8 +3029,9 @@ pub(crate) async fn has_resource_debt<C: ConnectionTrait>(
     provider: &str,
     cid: &str,
 ) -> AppResult<bool> {
-    if admission_barriers_with_catalog(
+    if resource_admission_barriers_with_catalog(
         provider,
+        &[cid],
         crate::store::pinning::legacy_migration::ReceiptCatalog::full(db),
         &(),
         false,
@@ -2858,19 +3063,18 @@ pub(crate) async fn has_resource_debt<C: ConnectionTrait>(
     {
         return debt_unless_undispatched.await;
     }
-    let jobs = pin_job::Entity::find()
-        .filter(pin_job::Column::Provider.eq(provider))
-        .filter(pin_job::Column::Cid.eq(cid))
-        .filter(pin_job::Column::Operation.eq("submit"))
-        .all(db)
-        .await?;
-    for job in jobs {
-        if jobs::submission_history(db, &job.id)
-            .await?
-            .is_some_and(|history| history.submit_calls > 0 && history.effect == "unknown")
-        {
-            return debt_unless_undispatched.await;
-        }
+    if db
+        .query_one(Statement::from_sql_and_values(
+            db.get_database_backend(),
+            "SELECT 1 FROM pin_jobs job JOIN pin_submit_history h ON h.job_id=job.id \
+         WHERE job.provider=$1 AND job.cid=$2 AND job.operation='submit' \
+         AND h.submit_calls>0 AND h.effect='unknown' LIMIT 1",
+            [provider.into(), cid.into()],
+        ))
+        .await?
+        .is_some()
+    {
+        return debt_unless_undispatched.await;
     }
     Ok(false)
 }
@@ -2903,6 +3107,68 @@ pub(in crate::store::pinning) async fn admission_barriers_with_catalog<
     let snapshot =
         AdmissionSnapshot::read_with_catalog(provider, None, catalog, work, false).await?;
     admission_barriers_from_snapshot(snapshot, Utc::now(), include_cleanup)
+}
+
+pub(in crate::store::pinning) async fn resource_admission_barriers_with_catalog<
+    W: crate::store::pinning::legacy_migration::ReceiptWork,
+>(
+    provider: &str,
+    cids: &[&str],
+    catalog: crate::store::pinning::legacy_migration::ReceiptCatalog<'_>,
+    work: &W,
+    include_cleanup: bool,
+) -> AppResult<BTreeMap<String, AdmissionBarrier>> {
+    if cids.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let requested = cids.iter().copied().collect::<BTreeSet<_>>();
+    let names = crate::store::pinning::legacy_migration::admission_report_providers_with_catalog(
+        provider, work, catalog,
+    )
+    .await
+    .map_err(W::into_app)?;
+    let rows = reported::sources(
+        &catalog,
+        "pin_submit_observations",
+        &names.iter().map(String::as_str).collect::<Vec<_>>(),
+        cids,
+        false,
+        work,
+    )
+    .await?;
+    let mut reports = BTreeMap::new();
+    for (id, original, source) in rows {
+        if original != provider {
+            let pk = [("id".into(), id.clone())].into();
+            let binding = crate::store::pinning::legacy_migration::resolve_with_catalog(
+                "pin_submit_observations",
+                &pk,
+                &original,
+                work,
+                catalog,
+            )
+            .await
+            .map_err(W::into_app)?;
+            if !binding.is_some_and(|binding| binding.operational_key == provider) {
+                continue;
+            }
+        }
+        reports.insert(id, source);
+    }
+    let snapshot = AdmissionSnapshot::read_scope(
+        provider,
+        AdmissionScope::Resources {
+            requested: cids,
+            reports: &reports,
+        },
+        catalog,
+        work,
+        false,
+    )
+    .await?;
+    let mut barriers = admission_barriers_from_snapshot(snapshot, Utc::now(), include_cleanup)?;
+    barriers.retain(|cid, _| requested.contains(cid.as_str()));
+    Ok(barriers)
 }
 
 fn reported_cids(resources: &str) -> impl Iterator<Item = String> {
@@ -3048,19 +3314,16 @@ pub async fn matching_pin_held<C: ConnectionTrait>(
     {
         return Ok(true);
     }
-    let rows = observations(db, provider).await?.into_iter().filter(|row| {
-        row.expected_cid == cid && matches!(row.outcome.as_str(), "matched" | "accepted")
-    });
-    for row in rows {
-        if !crate::store::pinning::legacy_migration::release_history(db, provider, cid)
+    let catalog = crate::store::pinning::legacy_migration::ReceiptCatalog::full(db);
+    let Some(epoch) = resource_receipt_epoch(catalog, provider, cid, None, &()).await? else {
+        return Ok(false);
+    };
+    Ok(
+        !crate::store::pinning::legacy_migration::release_history(db, provider, cid)
             .await?
             .iter()
-            .any(|history| history.epoch >= row.remote_epoch)
-        {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+            .any(|history| history.epoch >= epoch),
+    )
 }
 
 pub(in crate::store::pinning) async fn matching_pin_held_catalog(
@@ -3074,22 +3337,18 @@ pub(in crate::store::pinning) async fn matching_pin_held_catalog(
     {
         return Ok(true);
     }
-    let rows = observations_catalog(catalog, provider, work).await?;
-    for row in rows.into_iter().filter(|row| {
-        row.expected_cid == cid && matches!(row.outcome.as_str(), "matched" | "accepted")
-    }) {
-        if !crate::store::pinning::legacy_migration::release_history_catalog(
+    let Some(epoch) = resource_receipt_epoch(catalog, provider, cid, None, &work).await? else {
+        return Ok(false);
+    };
+    Ok(
+        !crate::store::pinning::legacy_migration::release_history_catalog(
             catalog, provider, cid, work,
         )
         .await
         .map_err(crate::store::pinning::management::admission::work_error)?
         .iter()
-        .any(|history| history.epoch >= row.remote_epoch)
-        {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+        .any(|history| history.epoch >= epoch),
+    )
 }
 
 /// Last pre-dispatch fence: a fresh claim alone cannot authorize an archived
@@ -3400,48 +3659,61 @@ pub async fn observations<C: ConnectionTrait>(
     Ok(result)
 }
 
-async fn observations_catalog(
+/// A prepared zero-call recovery checks any receipt at its epoch; a held pin
+/// needs the newest successful receipt to compare with the last release.
+async fn resource_receipt_epoch<W: crate::store::pinning::legacy_migration::ReceiptWork>(
     catalog: crate::store::pinning::legacy_migration::ReceiptCatalog<'_>,
     provider: &str,
-    work: crate::store::pinning::management::records::DecodeWork<'_>,
-) -> AppResult<Vec<evidence::Model>> {
-    if matches!(
+    cid: &str,
+    exact_epoch: Option<i64>,
+    work: &W,
+) -> AppResult<Option<i64>> {
+    let keys = crate::store::pinning::legacy_migration::historical_keys_catalog(
         catalog,
-        crate::store::pinning::legacy_migration::ReceiptCatalog::Full(_)
-    ) {
-        return observations(&catalog, provider).await;
-    }
-    let keys = crate::store::pinning::legacy_migration::historical_keys_with_catalog(
         "pin_submit_observations",
         provider,
-        None,
+        Some(cid),
         work,
-        catalog,
     )
     .await
-    .map_err(crate::store::pinning::management::admission::work_error)?;
+    .map_err(W::into_app)?;
     let rows = evidence::Entity::find()
+        .select_only()
+        .columns([
+            evidence::Column::Id,
+            evidence::Column::Provider,
+            evidence::Column::RemoteEpoch,
+        ])
         .filter(evidence::Column::Provider.is_in(keys))
-        .order_by_asc(evidence::Column::StartedAt)
+        .filter(evidence::Column::ExpectedCid.eq(cid))
+        .filter(match exact_epoch {
+            Some(epoch) => evidence::Column::RemoteEpoch.eq(epoch),
+            None => evidence::Column::Outcome.is_in(["matched", "accepted"]),
+        })
+        .order_by_desc(evidence::Column::RemoteEpoch)
+        .into_tuple::<(String, String, i64)>()
         .all(&catalog)
         .await?;
-    let mut result = Vec::new();
-    for row in rows {
-        let pk = [("id".into(), row.id.clone())].into();
-        let mapped = crate::store::pinning::legacy_migration::resolve_with_catalog(
+    for (id, original, epoch) in rows {
+        if original == provider {
+            return Ok(Some(epoch));
+        }
+        let pk = [("id".into(), id)].into();
+        if crate::store::pinning::legacy_migration::resolve_with_catalog(
             "pin_submit_observations",
             &pk,
-            &row.provider,
-            &work,
+            &original,
+            work,
             catalog,
         )
         .await
-        .map_err(crate::store::pinning::management::admission::work_error)?;
-        if row.provider == provider || mapped.is_some_and(|m| m.operational_key == provider) {
-            result.push(row);
+        .map_err(W::into_app)?
+        .is_some_and(|m| m.operational_key == provider)
+        {
+            return Ok(Some(epoch));
         }
     }
-    Ok(result)
+    Ok(None)
 }
 
 /// Lookup by the recorded historical scope, not current provider registration.

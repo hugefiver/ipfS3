@@ -568,16 +568,25 @@ impl LockedPins {
         {
             return Err(invalid());
         }
+        let mut allocation_cids: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+        for (provider, cid) in &keys.pairs {
+            allocation_cids.entry(provider).or_default().push(cid);
+        }
         let mut barriers = BTreeMap::new();
+        for (provider, cids) in allocation_cids {
+            let provider_barriers = ledger::submission::resource_admission_barriers_with_catalog(
+                provider, &cids, catalog, &work, true,
+            )
+            .await?;
+            barriers.extend(
+                provider_barriers
+                    .into_iter()
+                    .map(|(cid, barrier)| ((provider.to_owned(), cid), barrier)),
+            );
+        }
         let mut retired_sources = BTreeSet::new();
         let mut unconfirmed_sources = BTreeSet::new();
         for provider in &providers {
-            for (cid, barrier) in
-                ledger::submission::admission_barriers_with_catalog(provider, catalog, &work, true)
-                    .await?
-            {
-                barriers.insert((provider.clone(), cid), barrier);
-            }
             let provider_pairs = remotes
                 .keys()
                 .filter(|(candidate, _)| candidate == provider)

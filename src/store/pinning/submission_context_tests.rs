@@ -1,4 +1,5 @@
 use super::*;
+use crate::store::pinning::legacy_migration::ReceiptCatalog;
 use crate::{
     pinning::{
         config::{LeaseDuration, ProviderLimitMap, ProviderLimits, ProviderMode},
@@ -11,11 +12,27 @@ use crate::{
         pinning::publication::{self, PinTargetSpec, PublicationObject, PublicationRequest},
     },
 };
-use sea_orm::{ActiveModelTrait, DatabaseConnection, IntoActiveModel};
+use sea_orm::{
+    ActiveModelTrait, DatabaseBackend, DatabaseConnection, DatabaseTransaction, DbErr, ExecResult,
+    IntoActiveModel, QueryResult,
+};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 const CID: &str = "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku";
 const OTHER: &str = "bafkreigh2akiscaildc6ii5zji4bq7kly5k3s7svv6q2wx2nn5rtj5xuu4";
 const FOREIGN: &str = "foreign-resource";
+const REPORTED: &str = "QmYwAPJzv5CZsnAzt8auVTL7VYhESWDFoCPTqCkiP6fKGE";
+
+fn reported_pin(cid: &str) -> ObservedResource {
+    ObservedResource {
+        resource_type: RemoteResourceType::RpcPin,
+        cid: cid.into(),
+        request_id: format!("rpc-pin:kubo:{cid}"),
+        status: ObservedResourceStatus::PinAccepted,
+        ownership: Ownership::Unknown,
+        replica_evidence: None,
+    }
+}
 
 struct Fixture {
     db: DatabaseConnection,
@@ -431,6 +448,119 @@ async fn migrated_settled_alias(
 }
 
 #[tokio::test]
+async fn resource_admission_blocks_the_expected_cid_and_both_forms_of_a_reported_cid() {
+    let canonical = canonical_resource_cid(REPORTED).unwrap();
+    assert_ne!(REPORTED, canonical);
+    let fixture = fixture().await;
+    publish(&fixture.db, &fixture.provider, "waiting-object", OTHER).await;
+    let resource = reported_pin(REPORTED);
+    record(
+        &fixture.db,
+        &fixture.claim,
+        &fixture.receipt,
+        &SubmitObservation {
+            effect: SubmitEffect::Observed,
+            result: Ok(RemotePin {
+                request_id: resource.request_id.clone(),
+                cid: resource.cid.clone(),
+                status: RemotePinStatus::Pinned,
+                raw_status: "recursive".into(),
+                failure_reason: None,
+            }),
+            resources: vec![resource],
+        },
+        Utc::now(),
+    )
+    .await
+    .unwrap();
+
+    let catalog = ReceiptCatalog::full(&fixture.db);
+    assert_eq!(
+        resource_admission_barriers_with_catalog(
+            &fixture.provider,
+            &[CID, REPORTED, &canonical, OTHER],
+            catalog,
+            &(),
+            false,
+        )
+        .await
+        .unwrap(),
+        BTreeMap::from([
+            (CID.to_owned(), AdmissionBarrier::Operator),
+            (REPORTED.to_owned(), AdmissionBarrier::Operator),
+            (canonical.clone(), AdmissionBarrier::Operator),
+        ])
+    );
+    for reported in [REPORTED, canonical.as_str()] {
+        assert_eq!(
+            resource_admission_barriers_with_catalog(
+                &fixture.provider,
+                &[reported, OTHER],
+                catalog,
+                &(),
+                false,
+            )
+            .await
+            .unwrap(),
+            BTreeMap::from([(reported.to_owned(), AdmissionBarrier::Operator)])
+        );
+    }
+    let historical = cid::Cid::try_from(canonical.as_str())
+        .unwrap()
+        .to_string_of_base(cid::multibase::Base::Base36Lower)
+        .unwrap();
+    evidence::Entity::update_many()
+        .col_expr(
+            evidence::Column::Resources,
+            Expr::value(serde_json::json!([{"resource":{"cid":historical}}]).to_string()),
+        )
+        .filter(evidence::Column::Id.eq(&fixture.receipt))
+        .exec(&fixture.db)
+        .await
+        .unwrap();
+    assert_eq!(
+        resource_admission_barriers_with_catalog(
+            &fixture.provider,
+            &[&canonical, OTHER],
+            catalog,
+            &(),
+            false,
+        )
+        .await
+        .unwrap(),
+        BTreeMap::from([(canonical, AdmissionBarrier::Operator)])
+    );
+}
+
+#[tokio::test]
+async fn resource_admission_blocks_a_legacy_submit_without_ledger_or_receipt() {
+    let fixture = fixture().await;
+    let tx = fixture.db.begin().await.unwrap();
+    remote_pin_ledger::Entity::delete_by_id((fixture.provider.clone(), CID.to_owned()))
+        .exec(&tx)
+        .await
+        .unwrap();
+    evidence::Entity::delete_by_id(fixture.receipt.clone())
+        .exec(&tx)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resource_admission_barriers_with_catalog(
+            &fixture.provider,
+            &[CID, OTHER],
+            ReceiptCatalog::full(&tx),
+            &(),
+            false,
+        )
+        .await
+        .unwrap(),
+        BTreeMap::from([(CID.to_owned(), AdmissionBarrier::Operator)])
+    );
+    tx.rollback().await.unwrap();
+}
+
+#[tokio::test]
 async fn admission_context_refreshes_own_writes_and_preserves_reserved_rpc_exception() {
     let fixture = fixture().await;
     let tx = fixture.db.begin().await.unwrap();
@@ -824,12 +954,62 @@ async fn admission_context_projects_settled_alias_witnesses_jobs_and_releases() 
     );
     tx.rollback().await.unwrap();
 
+    let tx = db.begin().await.unwrap();
+    let historical = evidence::Entity::find_by_id(&receipt)
+        .one(&tx)
+        .await
+        .unwrap()
+        .unwrap();
+    let route = context_identity().route_snapshot();
+    let resources = |cid| {
+        serde_json::to_string(&[resource_evidence_for_route(&route, reported_pin(cid))]).unwrap()
+    };
+    let mut attributed = historical.into_active_model();
+    attributed.needs_attention = Set(true);
+    attributed.outcome = Set("cid_mismatch".into());
+    attributed.effect = Set("observed".into());
+    attributed.resources = Set(resources(CID));
+    let mut unbound = attributed.clone();
+    attributed.update(&tx).await.unwrap();
+
+    unbound.id = Set("unbound-legacy-receipt".into());
+    unbound.job_id = Set("unbound-legacy-job".into());
+    unbound.resources = Set(resources(REPORTED));
+    unbound.insert(&tx).await.unwrap();
+
+    assert_eq!(
+        resource_admission_barriers_with_catalog(
+            &provider,
+            &[CID, REPORTED],
+            ReceiptCatalog::full(&tx),
+            &(),
+            false,
+        )
+        .await
+        .unwrap(),
+        BTreeMap::from([(CID.to_owned(), AdmissionBarrier::Operator)])
+    );
+    tx.rollback().await.unwrap();
+
     let (released_db, released_provider, _, _) = migrated_settled_alias(true, false).await;
     assert_eq!(
         admission_barrier(&released_db, &released_provider)
             .await
             .unwrap(),
         AdmissionBarrier::Operator
+    );
+
+    assert_eq!(
+        resource_admission_barriers_with_catalog(
+            &released_provider,
+            &[CID, OTHER, FOREIGN],
+            ReceiptCatalog::full(&released_db),
+            &(),
+            true,
+        )
+        .await
+        .unwrap(),
+        BTreeMap::from([(OTHER.to_owned(), AdmissionBarrier::Operator)])
     );
 
     let (rolled_back_db, rolled_back_provider, _, _) = migrated_settled_alias(false, true).await;
@@ -903,5 +1083,134 @@ async fn admission_context_reads_only_unsettled_resource_candidates() {
         admission_barrier(&tx, &fixture.provider).await.unwrap(),
         AdmissionBarrier::Operator
     );
+    tx.rollback().await.unwrap();
+}
+
+struct CountReturnedRows<'a> {
+    db: &'a DatabaseTransaction,
+    rows: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl ConnectionTrait for CountReturnedRows<'_> {
+    fn get_database_backend(&self) -> DatabaseBackend {
+        self.db.get_database_backend()
+    }
+
+    async fn execute(&self, stmt: Statement) -> Result<ExecResult, DbErr> {
+        self.db.execute(stmt).await
+    }
+
+    async fn execute_unprepared(&self, sql: &str) -> Result<ExecResult, DbErr> {
+        self.db.execute_unprepared(sql).await
+    }
+
+    async fn query_one(&self, stmt: Statement) -> Result<Option<QueryResult>, DbErr> {
+        let row = self.db.query_one(stmt).await?;
+        self.rows
+            .fetch_add(usize::from(row.is_some()), Ordering::Relaxed);
+        Ok(row)
+    }
+
+    async fn query_all(&self, stmt: Statement) -> Result<Vec<QueryResult>, DbErr> {
+        let rows = self.db.query_all(stmt).await?;
+        self.rows.fetch_add(rows.len(), Ordering::Relaxed);
+        Ok(rows)
+    }
+}
+
+#[tokio::test]
+async fn resource_admission_does_not_fetch_unrelated_context_rows() {
+    let fixture = fixture().await;
+    let tx = fixture.db.begin().await.unwrap();
+    let ledger = remote_pin_ledger::Entity::find_by_id((fixture.provider.clone(), CID.to_owned()))
+        .one(&tx)
+        .await
+        .unwrap()
+        .unwrap();
+    let receipt = evidence::Entity::find_by_id(&fixture.receipt)
+        .one(&tx)
+        .await
+        .unwrap()
+        .unwrap();
+    let history = jobs::submission_history(&tx, &fixture.job)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut job = fixture.claim.model.into_active_model();
+    job.state = Set("done".into());
+    job.locked_until = Set(None);
+    let job = job.update(&tx).await.unwrap();
+
+    let counted = CountReturnedRows {
+        db: &tx,
+        rows: AtomicUsize::new(0),
+    };
+    let lookup = async || {
+        let barriers = resource_admission_barriers_with_catalog(
+            &fixture.provider,
+            &[CID, OTHER],
+            ReceiptCatalog::full(&counted),
+            &(),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            barriers,
+            BTreeMap::from([(CID.to_owned(), AdmissionBarrier::Operator)])
+        );
+        counted.rows.swap(0, Ordering::Relaxed)
+    };
+    let baseline = lookup().await;
+    assert!(baseline > 0);
+
+    for index in 0..64 {
+        let mut normal = ledger.clone().into_active_model();
+        normal.cid = Set(format!("reserved-{index}"));
+        normal.effect = Set("reserved".into());
+        normal.insert(&tx).await.unwrap();
+
+        let hash = cid::multihash::Multihash::wrap(0x12, &[index as u8; 32]).unwrap();
+        let cid = match index % 3 {
+            0 => cid::Cid::new_v0(hash).unwrap(),
+            1 => cid::Cid::new_v1(0x55, hash),
+            _ => cid::Cid::new_v1(0x70, hash),
+        }
+        .to_string();
+        let id = format!("unresolved-job-{index}");
+        let mut pending = ledger.clone().into_active_model();
+        pending.cid = Set(cid.clone());
+        pending.insert(&tx).await.unwrap();
+        let mut unrelated_job = job.clone().into_active_model();
+        unrelated_job.id = Set(id.clone());
+        unrelated_job.cid = Set(cid.clone());
+        unrelated_job.insert(&tx).await.unwrap();
+        let mut unrelated_receipt = receipt.clone().into_active_model();
+        unrelated_receipt.id = Set(format!("{id}:call:1"));
+        unrelated_receipt.job_id = Set(id.clone());
+        unrelated_receipt.expected_cid = Set(cid.clone());
+        unrelated_receipt.outcome = Set(if index % 2 == 0 { "matched" } else { "unknown" }.into());
+        unrelated_receipt.resources = Set(if index == 0 {
+            "{bad JSON".into()
+        } else {
+            serde_json::json!([null, "old entry", {"resource":{"cid":cid}}]).to_string()
+        });
+        unrelated_receipt.insert(&tx).await.unwrap();
+        let mut unrelated_history = history.clone().into_active_model();
+        unrelated_history.job_id = Set(id);
+        unrelated_history.insert(&tx).await.unwrap();
+        pin_resource_history::Entity::insert(pin_resource_history::ActiveModel {
+            provider: Set(fixture.provider.clone()),
+            cid: Set(cid),
+            epoch: Set(1),
+            ledger: Set("{}".into()),
+        })
+        .exec(&tx)
+        .await
+        .unwrap();
+    }
+
+    assert_eq!(lookup().await, baseline);
     tx.rollback().await.unwrap();
 }

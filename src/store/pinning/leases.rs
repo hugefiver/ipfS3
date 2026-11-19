@@ -12,8 +12,8 @@ use super::management::{
 use chrono::{Duration as ChronoDuration, Utc};
 use sea_orm::{
     ActiveValue::Set, ColumnTrait, Condition, ConnectionTrait, DatabaseBackend,
-    DatabaseTransaction, EntityTrait, QueryFilter, QueryOrder, QuerySelect, QueryTrait,
-    sea_query::Expr,
+    DatabaseTransaction, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect,
+    QueryTrait, sea_query::Expr,
 };
 use sha2::{Digest, Sha256};
 
@@ -745,9 +745,8 @@ struct OrderedDesiredLifecycleSnapshot {
     /// Desired targets for the observed remote only. These are the only targets a status update
     /// may project.
     desired: Vec<DesiredTarget>,
-    /// Every target of every lease affected by `desired`, including cross-provider and terminal
-    /// siblings. Keeping this complete frontier in memory makes availability a snapshot
-    /// computation rather than a post-remote sibling query.
+    /// The full snapshot includes all targets of the affected leases for availability.
+    /// Receipt projections compute availability without a sibling lock frontier.
     frontier: Vec<DesiredTarget>,
     remote: remote_pin::Model,
 }
@@ -1472,148 +1471,159 @@ pub async fn project_target_from_remote_with_limits<C: ConnectionTrait>(
     })
 }
 
-/// Reserves and projects at most four eligible provider waiters per call in durable FIFO order.
-///
-/// The caller must own transaction scope. This function acquires every candidate lease and target
-/// before remote/usage work so multiple grants share the normal lifecycle lock order.
-pub(crate) async fn wake_quota_waiting_targets<C: ConnectionTrait>(
-    db: &C,
+pub(crate) async fn discover_quota_wake_candidates(
     provider: &str,
     limits: &ProviderLimits,
     now: DateTimeUtc,
-) -> AppResult<Vec<String>> {
-    match wake_quota_waiting_targets_impl(db, provider, limits, now, None, None).await? {
-        quota::WaiterWakeOutcome::Woken(woken) => Ok(woken),
-        quota::WaiterWakeOutcome::Invalid(_) => Err(invalid("quota waiter is not eligible")),
-    }
-}
-
-pub(crate) async fn wake_runtime_quota_waiting_targets(
-    tx: &crate::store::RuntimeTransaction,
-    provider: &str,
-    limits: &ProviderLimits,
-    now: DateTimeUtc,
+    catalog: ReceiptCatalog<'_>,
     work: DecodeWork<'_>,
-    policy: Option<&crate::pinning::policy::PinPolicyEvaluator>,
-) -> AppResult<quota::WaiterWakeOutcome> {
-    wake_quota_waiting_targets_impl(tx.db(), provider, limits, now, Some((tx, work)), policy).await
+) -> AppResult<Vec<quota::QuotaWaiterCandidate>> {
+    discover_quota_waiters(provider, Some(limits.max_bytes), now, catalog, work).await
 }
 
-async fn wake_quota_waiting_targets_impl<C: ConnectionTrait>(
-    db: &C,
+pub(crate) async fn find_quota_waiter_for_eviction(
+    provider: &str,
+    now: DateTimeUtc,
+    catalog: ReceiptCatalog<'_>,
+    work: DecodeWork<'_>,
+) -> AppResult<Option<quota::QuotaWaiterCandidate>> {
+    Ok(discover_quota_waiters(provider, None, now, catalog, work)
+        .await?
+        .into_iter()
+        .next())
+}
+
+async fn discover_quota_waiters(
+    provider: &str,
+    blocked_max_bytes: Option<i64>,
+    now: DateTimeUtc,
+    catalog: ReceiptCatalog<'_>,
+    work: DecodeWork<'_>,
+) -> AppResult<Vec<quota::QuotaWaiterCandidate>> {
+    let mut states = Condition::any().add(pin_lease_target::Column::State.eq(TARGET_QUOTA_WAITING));
+    if let Some(max_bytes) = blocked_max_bytes {
+        states = states.add(
+            Condition::all()
+                .add(pin_lease_target::Column::State.eq(TARGET_QUOTA_BLOCKED))
+                .add(pin_lease_target::Column::LogicalSize.lte(max_bytes)),
+        );
+    }
+    let limit = if blocked_max_bytes.is_some() {
+        QUOTA_WAKE_BATCH_SIZE as usize
+    } else {
+        1
+    };
+    let mut candidates = Vec::with_capacity(limit);
+    let mut after: Option<(DateTimeUtc, String)> = None;
+    loop {
+        work.with(|session| session.check()).map_err(work_error)?;
+        let mut query = pin_lease_target::Entity::find()
+            .find_also_related(pin_lease::Entity)
+            .filter(pin_lease_target::Column::Provider.eq(provider))
+            .filter(states.clone())
+            .filter(pin_lease_target::Column::LastTouchedAt.lte(now))
+            .filter(pin_lease::Column::State.eq(LEASE_ACTIVE))
+            .filter(pin_lease::Column::ExpiresAt.gt(now))
+            .order_by_asc(pin_lease_target::Column::CreatedAt)
+            .order_by_asc(pin_lease_target::Column::Id);
+        if let Some((created, id)) = after {
+            query = query.filter(
+                Condition::any()
+                    .add(pin_lease_target::Column::CreatedAt.gt(created))
+                    .add(
+                        Condition::all()
+                            .add(pin_lease_target::Column::CreatedAt.eq(created))
+                            .add(pin_lease_target::Column::Id.gt(id)),
+                    ),
+            );
+        }
+        let page = query.limit(QUOTA_WAKE_BATCH_SIZE).all(&catalog).await?;
+        let Some((last, _)) = page.last() else { break };
+        // Advance by the raw page so unresolved resources cannot park the cursor.
+        after = Some((last.created_at, last.id.clone()));
+        let cids = page
+            .iter()
+            .map(|(target, _)| target.cid.as_str())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let barriers = ledger::submission::resource_admission_barriers_with_catalog(
+            provider, &cids, catalog, &work, true,
+        )
+        .await?;
+        let last_page = page.len() < QUOTA_WAKE_BATCH_SIZE as usize;
+        for (target, lease) in page {
+            if !barriers.contains_key(&target.cid)
+                && let Some(lease) = lease
+            {
+                candidates.push(quota::QuotaWaiterCandidate { target, lease });
+                if candidates.len() == limit {
+                    return Ok(candidates);
+                }
+            }
+        }
+        if last_page {
+            break;
+        }
+    }
+    Ok(candidates)
+}
+
+/// Locks the selected lifecycle frontier in order before authoritative resource admission.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn apply_quota_wake_candidates(
+    db: &DatabaseTransaction,
     provider: &str,
     limits: &ProviderLimits,
     now: DateTimeUtc,
+    candidates: Vec<quota::QuotaWaiterCandidate>,
     runtime: Option<(&crate::store::RuntimeTransaction, DecodeWork<'_>)>,
     policy: Option<&crate::pinning::policy::PinPolicyEvaluator>,
 ) -> AppResult<quota::WaiterWakeOutcome> {
     super::management::admission::lock_sqlite_writer_in_caller_transaction(db).await?;
-    if let Some((_, work)) = runtime {
-        work.with(|session| session.check())
-            .map_err(super::management::admission::work_error)?;
-    }
-    let session = SharedDecodeBudget::default();
-    let (catalog, work) = runtime.map_or_else(
-        || {
-            (
-                super::legacy_migration::ReceiptCatalog::full(db),
-                DecodeWork::shared(&session),
-            )
-        },
-        |(tx, work)| (tx.catalog(work), work),
-    );
-    let barriers =
-        super::ledger::submission::admission_barriers_with_catalog(provider, catalog, &work, true)
-            .await?;
-    // Exclude unresolved resources before the FIFO limit; a full page of debt
-    // must not hide an unrelated waiter. Reservation rechecks after prelocking.
-    let waiting = pin_lease_target::Entity::find()
-        .filter(pin_lease_target::Column::Cid.is_not_in(barriers.into_keys()))
-        .filter(pin_lease_target::Column::Provider.eq(provider))
-        .filter(
-            Condition::any()
-                .add(pin_lease_target::Column::State.eq(TARGET_QUOTA_WAITING))
-                .add(
-                    Condition::all()
-                        .add(pin_lease_target::Column::State.eq(TARGET_QUOTA_BLOCKED))
-                        .add(pin_lease_target::Column::LogicalSize.lte(limits.max_bytes)),
-                ),
-        )
-        .filter(pin_lease_target::Column::LastTouchedAt.lte(now))
-        .filter(
-            pin_lease_target::Column::LeaseId.in_subquery(
-                pin_lease::Entity::find()
-                    .select_only()
-                    .column(pin_lease::Column::Id)
-                    .filter(pin_lease::Column::State.eq(LEASE_ACTIVE))
-                    .into_query(),
-            ),
-        )
-        .order_by_asc(pin_lease_target::Column::CreatedAt)
-        .order_by_asc(pin_lease_target::Column::Id)
-        .limit(QUOTA_WAKE_BATCH_SIZE)
-        .all(db)
-        .await?;
-    let mut candidates = Vec::with_capacity(waiting.len());
-    let mut leases = BTreeMap::new();
-    for target in waiting {
-        let Some(lease) = pin_lease::Entity::find_by_id(target.lease_id.clone())
-            .one(db)
-            .await?
-        else {
-            continue;
-        };
-        if lease.state == LEASE_ACTIVE {
-            leases.entry(lease.id.clone()).or_insert(lease.clone());
-            candidates.push((target, lease));
-        }
-    }
-    if candidates.is_empty() {
-        return Ok(quota::WaiterWakeOutcome::Woken(Vec::new()));
-    }
-
-    let pairs = candidates
+    let mut leases = candidates
         .iter()
-        .map(|(target, _)| (target.provider.clone(), target.cid.clone()))
+        .map(|candidate| (candidate.lease.id.clone(), candidate.lease.clone()))
+        .collect::<BTreeMap<_, _>>();
+
+    let cids = candidates
+        .iter()
+        .map(|candidate| candidate.target.cid.as_str())
         .collect::<BTreeSet<_>>();
-    for (provider, cid) in &pairs {
+    let mut targets = candidates
+        .iter()
+        .map(|candidate| (candidate.target.id.clone(), candidate.target.clone()))
+        .collect::<BTreeMap<_, _>>();
+    for cid in &cids {
         for desired in desired_targets(db, provider, cid).await? {
             leases
                 .entry(desired.lease.id.clone())
                 .or_insert(desired.lease);
+            targets
+                .entry(desired.target.id.clone())
+                .or_insert(desired.target);
         }
     }
-
-    let mut target_frontier = Vec::new();
-    for lease_id in leases.keys() {
-        target_frontier.extend(lease_targets(db, lease_id).await?);
-    }
+    let mut target_frontier = targets.into_values().collect::<Vec<_>>();
     target_frontier.sort_by(compare_target_order);
-    target_frontier.dedup_by(|left, right| left.id == right.id);
 
     for lease in leases.values() {
-        let locked = lock_lifecycle_lease(db, lease, true)
-            .await?
-            .ok_or_else(|| stale_lifecycle_error("quota waiter lease prelock"))?;
-        if locked != *lease {
-            return Err(stale_lifecycle_error("quota waiter lease frontier"));
+        if lock_lifecycle_lease(db, lease, true).await?.as_ref() != Some(lease) {
+            return Ok(quota::WaiterWakeOutcome::Woken(Vec::new()));
         }
     }
     for target in &target_frontier {
-        let locked = lock_lifecycle_target(db, target, true)
-            .await?
-            .ok_or_else(|| stale_lifecycle_error("quota waiter target prelock"))?;
-        if locked != *target {
-            return Err(stale_lifecycle_error("quota waiter target frontier"));
+        if lock_lifecycle_target(db, target, true).await?.as_ref() != Some(target) {
+            return Ok(quota::WaiterWakeOutcome::Woken(Vec::new()));
         }
     }
-    for (provider, cid) in &pairs {
+    for cid in cids {
         lock_remote_after_lifecycle(db, provider, cid).await?;
     }
 
     let limit_map = ProviderLimitMap::from([(provider.to_owned(), limits.clone())]);
     let mut woken = Vec::new();
-    for (target, lease) in candidates {
+    for quota::QuotaWaiterCandidate { target, lease } in candidates {
         if let Some(policy) = policy {
             let owner = object::Entity::find_by_id(&lease.owner_object_id)
                 .one(db)
@@ -1676,7 +1686,8 @@ async fn wake_quota_waiting_targets_impl<C: ConnectionTrait>(
             }
         };
         let reservation = match reservation {
-            Ok(reservation) => reservation,
+            Ok(Some(reservation)) => reservation,
+            Ok(None) => continue,
             Err(AppError::InvalidPinningRequest(_)) => {
                 return Ok(quota::WaiterWakeOutcome::Invalid(Box::new(
                     quota::QuotaWaiterCandidate { lease, target },
@@ -1692,8 +1703,6 @@ async fn wake_quota_waiting_targets_impl<C: ConnectionTrait>(
                 break;
             }
             ReservationOutcome::QuotaBlocked => {
-                // This is a stable non-debt budget decision: waiter reservation
-                // maps operator debt to waiting, without rereading mutable debt.
                 set_prelocked_target_state(db, &target, TARGET_QUOTA_BLOCKED).await?;
             }
             ReservationOutcome::Reserved | ReservationOutcome::Reused => {
@@ -1885,14 +1894,22 @@ async fn apply_remote_status_inner<C: ConnectionTrait>(
     expected_remote_epoch: Option<i64>,
     observation_job: Option<&pin_job::Model>,
     mut prelocked: Option<OrderedDesiredLifecycleSnapshotOutcome>,
-    authority: Option<&super::management::actions::job_authority::CompletionReader<'_>>,
+    projection: Option<LockedObservationProjection<'_, '_>>,
 ) -> AppResult<RemoteStatusApplyResult> {
     let holds_snapshot = prelocked.is_some();
     let session = SharedDecodeBudget::default();
-    let runtime = authority.and_then(|authority| authority.runtime_context());
+    let receipt_projection = matches!(
+        projection,
+        Some(LockedObservationProjection::Receipt { .. })
+    );
+    let runtime = match projection {
+        Some(LockedObservationProjection::Checked(authority)) => authority.runtime_context(),
+        Some(LockedObservationProjection::Receipt { tx, work }) => Some((tx, work)),
+        None => None,
+    };
     let work = runtime.map_or(DecodeWork::shared(&session), |(_, work)| work);
     for attempt in 0..REMOTE_STATUS_WRITE_RETRY_LIMIT {
-        let snapshot = match match prelocked.take() {
+        let mut snapshot = match match prelocked.take() {
             Some(snapshot) => Ok(snapshot),
             None => ordered_desired_lifecycle_snapshot(db, update.provider, update.cid).await,
         } {
@@ -1925,59 +1942,44 @@ async fn apply_remote_status_inner<C: ConnectionTrait>(
         if snapshot.remote.status == REMOTE_FAILED {
             pause_duplicate_projection(update.cid, true).await;
         }
-        if let Some(job) = observation_job {
-            let allowed = match authority {
-                Some(reader) => {
-                    reader
-                        .submission_projection_allowed(&snapshot.remote)
-                        .await?
-                }
-                None => {
-                    super::ledger::submission::projection_allowed(db, job, &snapshot.remote).await?
-                }
-            };
-            if !allowed {
-                return Ok(RemoteStatusApplyResult::StaleRequest);
-            }
-        }
-        if let Some(job) = observation_job {
-            let allowed = match authority {
-                Some(reader) => reader.projection_allowed().await?,
-                None => {
-                    super::management::actions::job_authority::projection_allowed(db, job).await?
-                }
-            };
-            if !allowed {
-                return Ok(RemoteStatusApplyResult::StaleRequest);
-            }
+        if let Some(LockedObservationProjection::Checked(authority)) = projection
+            && (!authority
+                .submission_projection_allowed(&snapshot.remote)
+                .await?
+                || !authority.projection_allowed().await?)
+        {
+            return Ok(RemoteStatusApplyResult::StaleRequest);
         }
 
+        if receipt_projection {
+            snapshot
+                .desired
+                .retain(|desired| desired.lease.expires_at > update.now);
+        }
         #[cfg(test)]
         if attempt == 0 {
             pause_after_remote_status_read(update.provider, update.cid).await;
         }
 
+        let cluster = enforce_monotonic_status
+            && retained_cluster_with_work(
+                db,
+                update.provider,
+                update.cid,
+                work,
+                runtime.map(|(tx, _)| tx),
+            )
+            .await?;
         let write_outcome = apply_remote_status_write(
             db,
             &update,
             &snapshot.remote,
-            enforce_monotonic_status
-                && !{
-                    retained_cluster_with_work(
-                        db,
-                        update.provider,
-                        update.cid,
-                        work,
-                        runtime.map(|(tx, _)| tx),
-                    )
-                    .await?
-                },
-            {
-                snapshot
-                    .desired
-                    .iter()
-                    .any(|desired| desired.lease.provider_mode == "all")
-            },
+            enforce_monotonic_status && !cluster,
+            snapshot
+                .desired
+                .iter()
+                .any(|desired| desired.lease.provider_mode == "all"),
+            receipt_projection,
         )
         .await?;
         let (failure, remote) = match write_outcome {
@@ -2006,14 +2008,8 @@ async fn apply_remote_status_inner<C: ConnectionTrait>(
                 Some(job)
                     if job.operation != "submit" || update.origin == RemoteStatusOrigin::Adopt =>
                 {
-                    historical_poll_followup_allowed(
-                        db,
-                        job,
-                        &snapshot.desired,
-                        &remote,
-                        authority.and_then(|reader| reader.runtime_context()),
-                    )
-                    .await?
+                    historical_poll_followup_allowed(db, job, &snapshot.desired, &remote, runtime)
+                        .await?
                 }
                 _ => false,
             }
@@ -2030,8 +2026,12 @@ async fn apply_remote_status_inner<C: ConnectionTrait>(
 
         // The snapshot was locked in lease → target → remote order. Projection deliberately uses
         // only those rows, so it never reacquires a target after the remote status CAS.
+        let access = ProjectionAccess::Observation {
+            historical_poll,
+            receipt_cluster: receipt_projection.then_some(cluster),
+        };
         for desired in &snapshot.desired {
-            if let Some((owner, work)) = authority.and_then(|reader| reader.runtime_context()) {
+            if let Some((owner, work)) = runtime {
                 project_prelocked_target_core(
                     owner.db(),
                     PrelockedProjection {
@@ -2039,7 +2039,7 @@ async fn apply_remote_status_inner<C: ConnectionTrait>(
                         all_desired: &snapshot.desired,
                         remote: &remote,
                     },
-                    ProjectionAccess::Observation { historical_poll },
+                    access,
                     update.now,
                     work,
                     Some(owner),
@@ -2051,7 +2051,7 @@ async fn apply_remote_status_inner<C: ConnectionTrait>(
                     desired,
                     &snapshot.desired,
                     &remote,
-                    ProjectionAccess::Observation { historical_poll },
+                    access,
                     update.now,
                 )
                 .await?;
@@ -2060,39 +2060,66 @@ async fn apply_remote_status_inner<C: ConnectionTrait>(
 
         let projected_target_state = target_state_from_remote(&remote.status)
             .ok_or_else(|| invalid("remote status cannot be projected to a target state"))?;
-        let observed_target_ids: BTreeSet<_> = snapshot
-            .desired
-            .iter()
-            .map(|desired| desired.target.id.as_str())
-            .collect();
-        let availability: BTreeMap<_, _> =
+        let ordinary_pinned_receipt = receipt_projection && projected_target_state == TARGET_PINNED;
+        let available_leases: BTreeSet<String> = if receipt_projection {
+            if ordinary_pinned_receipt || snapshot.desired.is_empty() {
+                BTreeSet::new()
+            } else {
+                pin_lease_target::Entity::find()
+                    .select_only()
+                    .column(pin_lease_target::Column::LeaseId)
+                    .distinct()
+                    .filter(
+                        pin_lease_target::Column::LeaseId.is_in(
+                            snapshot
+                                .desired
+                                .iter()
+                                .map(|desired| desired.lease.id.clone()),
+                        ),
+                    )
+                    .filter(pin_lease_target::Column::State.eq(TARGET_PINNED))
+                    .into_tuple::<String>()
+                    .all(db)
+                    .await?
+                    .into_iter()
+                    .collect()
+            }
+        } else {
+            let observed_target_ids: BTreeSet<_> = snapshot
+                .desired
+                .iter()
+                .map(|desired| desired.target.id.as_str())
+                .collect();
             snapshot
                 .frontier
                 .iter()
-                .fold(BTreeMap::new(), |mut availability, sibling| {
+                .filter(|sibling| {
                     let state = if observed_target_ids.contains(sibling.target.id.as_str()) {
                         projected_target_state
                     } else {
                         sibling.target.state.as_str()
                     };
-                    availability
-                        .entry(sibling.lease.id.clone())
-                        .and_modify(|available| *available |= state == TARGET_PINNED)
-                        .or_insert(state == TARGET_PINNED);
-                    availability
-                });
+                    state == TARGET_PINNED
+                })
+                .map(|sibling| sibling.lease.id.clone())
+                .collect()
+        };
 
         let mut affected = Vec::with_capacity(snapshot.desired.len());
         for desired in snapshot.desired {
-            let birth = if retained_cluster_with_work(
-                db,
-                update.provider,
-                update.cid,
-                work,
-                runtime.map(|(tx, _)| tx),
-            )
-            .await?
-            {
+            let cluster = if receipt_projection {
+                cluster
+            } else {
+                retained_cluster_with_work(
+                    db,
+                    update.provider,
+                    update.cid,
+                    work,
+                    runtime.map(|(tx, _)| tx),
+                )
+                .await?
+            };
+            let birth = if cluster {
                 crate::store::entities::pin_lease_requirement::contract::completion_current_catalog(
                     runtime.map_or_else(|| ReceiptCatalog::full(db), |(tx, _)| tx.catalog(work)),
                     &desired.lease.id,
@@ -2108,10 +2135,7 @@ async fn apply_remote_status_inner<C: ConnectionTrait>(
                 target_id: desired.target.id,
                 provider_mode: provider_mode(&desired.lease.provider_mode)?,
                 available: birth.map(|status| status.0).unwrap_or_else(|| {
-                    availability
-                        .get(&desired.lease.id)
-                        .copied()
-                        .unwrap_or(false)
+                    ordinary_pinned_receipt || available_leases.contains(&desired.lease.id)
                 }),
             });
         }
@@ -2253,6 +2277,7 @@ async fn apply_remote_status_write<C: ConnectionTrait>(
     remote: &remote_pin::Model,
     enforce_monotonic_status: bool,
     count_failed_request: bool,
+    receipt_projection: bool,
 ) -> AppResult<RemoteStatusWriteOutcome> {
     let accepted_request_id = match update.origin {
         RemoteStatusOrigin::ExistingRequest
@@ -2319,15 +2344,28 @@ async fn apply_remote_status_write<C: ConnectionTrait>(
         }
     }
 
+    let status = remote_status_name(update.status);
+    if receipt_projection
+        && remote.request_id == accepted_request_id
+        && remote.status == status
+        && remote.failure_attempts == attempts
+        && remote.next_retry_at == next_retry_at
+        && remote.last_failed_request_id == last_failed_request_id
+        && remote.last_error_class == last_error_class
+        && remote.last_error_text == last_error_text
+    {
+        return Ok(RemoteStatusWriteOutcome::Applied {
+            failure,
+            remote: remote.clone(),
+        });
+    }
+
     let mut persisted = remote_pin::Entity::update_many()
         .col_expr(
             remote_pin::Column::RequestId,
             Expr::value(accepted_request_id.clone()),
         )
-        .col_expr(
-            remote_pin::Column::Status,
-            Expr::value(remote_status_name(update.status).to_owned()),
-        )
+        .col_expr(remote_pin::Column::Status, Expr::value(status.to_owned()))
         .col_expr(remote_pin::Column::FailureAttempts, Expr::value(attempts))
         .col_expr(remote_pin::Column::NextRetryAt, Expr::value(next_retry_at))
         .col_expr(
@@ -2346,30 +2384,35 @@ async fn apply_remote_status_write<C: ConnectionTrait>(
         .filter(remote_pin::Column::Provider.eq(update.provider))
         .filter(remote_pin::Column::Cid.eq(update.cid))
         .filter(remote_pin::Column::Epoch.eq(remote.epoch))
-        .filter(remote_pin::Column::Status.eq(&remote.status))
-        .filter(remote_pin::Column::FailureAttempts.eq(remote.failure_attempts));
+        .filter(remote_pin::Column::Status.eq(&remote.status));
     persisted = match remote.request_id.as_deref() {
         Some(request_id) => persisted.filter(remote_pin::Column::RequestId.eq(request_id)),
         None => persisted.filter(remote_pin::Column::RequestId.is_null()),
     };
-    persisted = match remote.last_failed_request_id.as_deref() {
-        Some(request_id) => {
-            persisted.filter(remote_pin::Column::LastFailedRequestId.eq(request_id))
-        }
-        None => persisted.filter(remote_pin::Column::LastFailedRequestId.is_null()),
-    };
-    persisted = match remote.next_retry_at {
-        Some(due) => persisted.filter(remote_pin::Column::NextRetryAt.eq(due)),
-        None => persisted.filter(remote_pin::Column::NextRetryAt.is_null()),
-    };
-    persisted = match remote.last_error_class.as_deref() {
-        Some(error_class) => persisted.filter(remote_pin::Column::LastErrorClass.eq(error_class)),
-        None => persisted.filter(remote_pin::Column::LastErrorClass.is_null()),
-    };
-    persisted = match remote.last_error_text.as_deref() {
-        Some(error_text) => persisted.filter(remote_pin::Column::LastErrorText.eq(error_text)),
-        None => persisted.filter(remote_pin::Column::LastErrorText.is_null()),
-    };
+    if !receipt_projection {
+        persisted =
+            persisted.filter(remote_pin::Column::FailureAttempts.eq(remote.failure_attempts));
+        persisted = match remote.last_failed_request_id.as_deref() {
+            Some(request_id) => {
+                persisted.filter(remote_pin::Column::LastFailedRequestId.eq(request_id))
+            }
+            None => persisted.filter(remote_pin::Column::LastFailedRequestId.is_null()),
+        };
+        persisted = match remote.next_retry_at {
+            Some(due) => persisted.filter(remote_pin::Column::NextRetryAt.eq(due)),
+            None => persisted.filter(remote_pin::Column::NextRetryAt.is_null()),
+        };
+        persisted = match remote.last_error_class.as_deref() {
+            Some(error_class) => {
+                persisted.filter(remote_pin::Column::LastErrorClass.eq(error_class))
+            }
+            None => persisted.filter(remote_pin::Column::LastErrorClass.is_null()),
+        };
+        persisted = match remote.last_error_text.as_deref() {
+            Some(error_text) => persisted.filter(remote_pin::Column::LastErrorText.eq(error_text)),
+            None => persisted.filter(remote_pin::Column::LastErrorText.is_null()),
+        };
+    }
     #[cfg(test)]
     record_remote_status_write(update.provider, update.cid).await;
 
@@ -4934,170 +4977,256 @@ pub async fn evict_provider_cids<C: ConnectionTrait>(
     pairs: &[(String, String)],
     now: DateTimeUtc,
 ) -> AppResult<Vec<QuotaEvictedTarget>> {
-    evict_provider_cids_core(db, pairs, now, None).await
+    let frontier = eviction_frontier(db, pairs).await?;
+    if frontier.targets.is_empty() {
+        return Ok(Vec::new());
+    }
+    if !frontier.lock_lifecycle(db, None).await? {
+        return Err(stale_lifecycle_error("quota eviction frontier"));
+    }
+    frontier.apply(db, now, None).await
 }
 
-pub(in crate::store::pinning) async fn evict_provider_cids_core<C: ConnectionTrait>(
+pub(super) struct EvictionFrontier {
+    pairs: BTreeSet<(String, String)>,
+    targets: Vec<DesiredTarget>,
+    leases: BTreeMap<String, pin_lease::Model>,
+    siblings: Vec<pin_lease_target::Model>,
+}
+
+pub(super) async fn eviction_frontier<C: ConnectionTrait>(
     db: &C,
     pairs: &[(String, String)],
-    now: DateTimeUtc,
-    runtime: Option<&crate::store::RuntimeTransaction>,
-) -> AppResult<Vec<QuotaEvictedTarget>> {
-    let mut pairs = pairs.to_vec();
-    pairs.sort();
-    pairs.dedup();
+) -> AppResult<EvictionFrontier> {
+    let pairs = pairs.iter().cloned().collect();
+    let targets = eviction_desired_targets(db, &pairs).await?;
+    let leases = targets
+        .iter()
+        .map(|desired| (desired.lease.id.clone(), desired.lease.clone()))
+        .collect();
+    let siblings = eviction_siblings(db, &leases, &targets).await?;
+    Ok(EvictionFrontier {
+        pairs,
+        targets,
+        leases,
+        siblings,
+    })
+}
 
+async fn eviction_desired_targets<C: ConnectionTrait>(
+    db: &C,
+    pairs: &BTreeSet<(String, String)>,
+) -> AppResult<Vec<DesiredTarget>> {
     let mut targets = Vec::new();
-    for (provider, cid) in &pairs {
+    for (provider, cid) in pairs {
         targets.extend(desired_targets(db, provider, cid).await?);
     }
     targets.sort_by(|left, right| compare_target_order(&left.target, &right.target));
-    targets.dedup_by(|left, right| left.target.id == right.target.id);
-    if targets.is_empty() {
-        return Ok(Vec::new());
-    }
+    Ok(targets)
+}
 
-    let mut leases = BTreeMap::new();
-    let mut original_targets = BTreeMap::new();
-    for desired in &targets {
-        let lease_id = desired.lease.id.clone();
-        leases.insert(lease_id.clone(), desired.lease.clone());
-    }
-    for lease_id in leases.keys() {
-        original_targets.insert(lease_id.clone(), lease_targets(db, lease_id).await?);
-    }
-
-    // Acquire the complete lifecycle frontier before any selected remote row.
-    for (lease_id, lease) in &leases {
-        let locked = lock_lifecycle_lease(db, lease, true)
-            .await?
-            .ok_or_else(|| stale_lifecycle_error("quota eviction lease prelock"))?;
-        if locked != *lease || locked.id != *lease_id {
-            return Err(stale_lifecycle_error("quota eviction lease frontier"));
-        }
-    }
-    let mut target_frontier = original_targets
-        .values()
-        .flatten()
-        .cloned()
-        .collect::<Vec<_>>();
-    target_frontier.sort_by(compare_target_order);
-    for target in &target_frontier {
-        let locked = lock_lifecycle_target(db, target, true)
-            .await?
-            .ok_or_else(|| stale_lifecycle_error("quota eviction target prelock"))?;
-        if locked != *target {
-            return Err(stale_lifecycle_error("quota eviction target frontier"));
-        }
-    }
-    let remote_frontier = target_frontier
+async fn eviction_siblings<C: ConnectionTrait>(
+    db: &C,
+    leases: &BTreeMap<String, pin_lease::Model>,
+    targets: &[DesiredTarget],
+) -> AppResult<Vec<pin_lease_target::Model>> {
+    let victim_ids = targets
         .iter()
-        .filter(|target| is_desired_target_state(&target.state))
-        .map(|target| (target.provider.clone(), target.cid.clone()))
+        .map(|desired| desired.target.id.as_str())
         .collect::<BTreeSet<_>>();
-    for (provider, cid) in &remote_frontier {
-        lock_remote_after_lifecycle(db, provider, cid).await?;
+    let mut siblings = Vec::new();
+    for lease_id in leases.keys() {
+        siblings.extend(
+            pin_lease_target::Entity::find()
+                .filter(pin_lease_target::Column::LeaseId.eq(lease_id))
+                .filter(pin_lease_target::Column::State.is_in(active_target_states()))
+                .all(db)
+                .await?
+                .into_iter()
+                .filter(|target| !victim_ids.contains(target.id.as_str())),
+        );
+    }
+    siblings.sort_by(compare_target_order);
+    Ok(siblings)
+}
+
+impl EvictionFrontier {
+    /// Locks the captured rows in the caller's transaction; remote version checks belong to it.
+    pub(super) async fn lock<C: ConnectionTrait>(
+        &self,
+        db: &C,
+        demand: &quota::QuotaWaiterCandidate,
+    ) -> AppResult<bool> {
+        self.lock_lifecycle(db, Some(demand)).await
     }
 
-    // Phase 1: all lease CAS operations complete in stable ID order.
-    for lease in leases.values() {
-        #[cfg(test)]
-        stage_eviction_lease_generation(db, &lease.id).await?;
-
-        let generation = increment_epoch(lease.generation)?;
-        // Quota eviction is a temporary placement decision. Keep both one/all parent leases
-        // active so one-mode can fail over and all-mode can retry after confirmed release.
-        let state = LEASE_ACTIVE;
-
-        #[cfg(test)]
-        record_lease_cas(&lease.id).await;
-
-        let updated = pin_lease::Entity::update_many()
-            .col_expr(pin_lease::Column::Generation, Expr::value(generation))
-            .col_expr(pin_lease::Column::State, Expr::value(state.to_owned()))
-            .col_expr(pin_lease::Column::LastTouchedAt, Expr::value(now))
-            .filter(pin_lease::Column::Id.eq(&lease.id))
-            .filter(pin_lease::Column::Generation.eq(lease.generation))
-            .filter(pin_lease::Column::State.eq(&lease.state))
-            .exec(db)
-            .await?;
-        if updated.rows_affected != 1 {
-            return Err(stale_lifecycle_error("eviction lease"));
+    async fn lock_lifecycle<C: ConnectionTrait>(
+        &self,
+        db: &C,
+        demand: Option<&quota::QuotaWaiterCandidate>,
+    ) -> AppResult<bool> {
+        let mut leases = self
+            .leases
+            .values()
+            .chain(demand.map(|candidate| &candidate.lease))
+            .collect::<Vec<_>>();
+        leases.sort_by(|left, right| left.id.cmp(&right.id));
+        leases.dedup();
+        for lease in leases {
+            if lock_lifecycle_lease(db, lease, true).await?.as_ref() != Some(lease) {
+                return Ok(false);
+            }
         }
-    }
 
-    // Phase 2: target transitions use the original snapshot in stable `(created_at, id)` order.
-    // The caller-provided transaction must roll back if a target CAS is stale after a lease CAS.
-    let mut evicted_pairs = BTreeSet::new();
-    for desired in &targets {
-        let target = &desired.target;
+        let mut targets = self
+            .targets
+            .iter()
+            .map(|desired| &desired.target)
+            .chain(&self.siblings)
+            .chain(demand.map(|candidate| &candidate.target))
+            .collect::<Vec<_>>();
+        targets.sort_by(|left, right| compare_target_order(left, right));
+        targets.dedup();
+        for target in targets {
+            if lock_lifecycle_target(db, target, true).await?.as_ref() != Some(target) {
+                return Ok(false);
+            }
+        }
 
-        #[cfg(test)]
-        record_target_cas(&target.id).await;
-
-        let updated = pin_lease_target::Entity::update_many()
-            .col_expr(
-                pin_lease_target::Column::State,
-                Expr::value(TARGET_EVICTED.to_owned()),
+        let remotes = self
+            .pairs
+            .iter()
+            .map(|(provider, cid)| (provider.as_str(), cid.as_str()))
+            .chain(
+                self.siblings
+                    .iter()
+                    .chain(demand.map(|candidate| &candidate.target))
+                    .map(|target| (target.provider.as_str(), target.cid.as_str())),
             )
-            .filter(pin_lease_target::Column::Id.eq(&target.id))
-            .filter(pin_lease_target::Column::LeaseId.eq(&target.lease_id))
-            .filter(pin_lease_target::Column::Provider.eq(&target.provider))
-            .filter(pin_lease_target::Column::Cid.eq(&target.cid))
-            .filter(pin_lease_target::Column::LogicalSize.eq(target.logical_size))
-            .filter(pin_lease_target::Column::CreatedAt.eq(target.created_at))
-            .filter(pin_lease_target::Column::State.eq(&target.state))
-            .exec(db)
-            .await?;
-        if updated.rows_affected != 1 {
-            return Err(stale_lifecycle_error("eviction target"));
+            .collect::<BTreeSet<_>>();
+        for (provider, cid) in remotes {
+            lock_remote_after_lifecycle(db, provider, cid).await?;
         }
-        evicted_pairs.insert((target.provider.as_str(), target.cid.as_str()));
+
+        // Re-read membership without locks: a new member invalidates this frontier rather
+        // than introducing a lifecycle lock after the remote locks.
+        let targets = eviction_desired_targets(db, &self.pairs).await?;
+        if targets.len() != self.targets.len()
+            || !targets
+                .iter()
+                .zip(&self.targets)
+                .all(|(current, expected)| {
+                    current.target == expected.target && current.lease == expected.lease
+                })
+        {
+            return Ok(false);
+        }
+        Ok(eviction_siblings(db, &self.leases, &self.targets).await? == self.siblings)
     }
-    // A lease-generation bump must not strand a non-evicted all-mode sibling behind an old
-    // target-scoped Submit/Poll generation. Reproject every sibling while its complete frontier
-    // remains locked; selected remotes still advance only once below.
-    for target in target_frontier.iter().filter(|target| {
-        is_desired_target_state(&target.state)
-            && !targets.iter().any(|evicted| evicted.target.id == target.id)
-    }) {
-        project_inserted_target_from_prelocked_remote(
-            db,
-            &target.id,
-            &target.provider,
-            &target.cid,
-            now,
-            None,
-        )
-        .await?;
-    }
-    for (provider, cid) in evicted_pairs {
-        if let Some(epoch) = bump_remote_epoch(db, provider, cid, now).await? {
-            let session = SharedDecodeBudget::default();
-            schedule_after_desired_change_core(
+
+    /// Applies only the captured mutations after a successful lock in the same transaction.
+    pub(super) async fn apply<C: ConnectionTrait>(
+        &self,
+        db: &C,
+        now: DateTimeUtc,
+        runtime: Option<&crate::store::RuntimeTransaction>,
+    ) -> AppResult<Vec<QuotaEvictedTarget>> {
+        // Phase 1: all lease CAS operations complete in stable ID order.
+        for lease in self.leases.values() {
+            #[cfg(test)]
+            stage_eviction_lease_generation(db, &lease.id).await?;
+
+            let generation = increment_epoch(lease.generation)?;
+            // Quota eviction is a temporary placement decision. Keep both one/all parent leases
+            // active so one-mode can fail over and all-mode can retry after confirmed release.
+            let state = LEASE_ACTIVE;
+
+            #[cfg(test)]
+            record_lease_cas(&lease.id).await;
+
+            let updated = pin_lease::Entity::update_many()
+                .col_expr(pin_lease::Column::Generation, Expr::value(generation))
+                .col_expr(pin_lease::Column::State, Expr::value(state.to_owned()))
+                .col_expr(pin_lease::Column::LastTouchedAt, Expr::value(now))
+                .filter(pin_lease::Column::Id.eq(&lease.id))
+                .filter(pin_lease::Column::Generation.eq(lease.generation))
+                .filter(pin_lease::Column::State.eq(&lease.state))
+                .exec(db)
+                .await?;
+            if updated.rows_affected != 1 {
+                return Err(stale_lifecycle_error("eviction lease"));
+            }
+        }
+
+        // Phase 2: target transitions use the original snapshot in stable `(created_at, id)` order.
+        // The caller-provided transaction must roll back if a target CAS is stale after a lease CAS.
+        let mut evicted_pairs = BTreeSet::new();
+        for desired in &self.targets {
+            let target = &desired.target;
+
+            #[cfg(test)]
+            record_target_cas(&target.id).await;
+
+            let updated = pin_lease_target::Entity::update_many()
+                .col_expr(
+                    pin_lease_target::Column::State,
+                    Expr::value(TARGET_EVICTED.to_owned()),
+                )
+                .filter(pin_lease_target::Column::Id.eq(&target.id))
+                .filter(pin_lease_target::Column::LeaseId.eq(&target.lease_id))
+                .filter(pin_lease_target::Column::Provider.eq(&target.provider))
+                .filter(pin_lease_target::Column::Cid.eq(&target.cid))
+                .filter(pin_lease_target::Column::LogicalSize.eq(target.logical_size))
+                .filter(pin_lease_target::Column::CreatedAt.eq(target.created_at))
+                .filter(pin_lease_target::Column::State.eq(&target.state))
+                .exec(db)
+                .await?;
+            if updated.rows_affected != 1 {
+                return Err(stale_lifecycle_error("eviction target"));
+            }
+            evicted_pairs.insert((target.provider.as_str(), target.cid.as_str()));
+        }
+        // Reproject active siblings so the lease bump does not strand target-scoped jobs at the
+        // old generation. Selected remotes still advance only once below.
+        for target in &self.siblings {
+            project_inserted_target_from_prelocked_remote(
                 db,
-                (provider, cid),
-                epoch,
+                &target.id,
+                &target.provider,
+                &target.cid,
                 now,
-                DecodeWork::shared(&session),
-                runtime,
+                None,
             )
             .await?;
         }
-    }
+        for (provider, cid) in evicted_pairs {
+            if let Some(epoch) = bump_remote_epoch(db, provider, cid, now).await? {
+                let session = SharedDecodeBudget::default();
+                schedule_after_desired_change_core(
+                    db,
+                    (provider, cid),
+                    epoch,
+                    now,
+                    DecodeWork::shared(&session),
+                    runtime,
+                )
+                .await?;
+            }
+        }
 
-    targets
-        .into_iter()
-        .map(|desired| {
-            Ok(QuotaEvictedTarget {
-                lease_id: desired.lease.id,
-                target_id: desired.target.id,
-                provider: desired.target.provider,
-                cid: desired.target.cid,
-                provider_mode: provider_mode(&desired.lease.provider_mode)?,
+        self.targets
+            .iter()
+            .map(|desired| {
+                Ok(QuotaEvictedTarget {
+                    lease_id: desired.lease.id.clone(),
+                    target_id: desired.target.id.clone(),
+                    provider: desired.target.provider.clone(),
+                    cid: desired.target.cid.clone(),
+                    provider_mode: provider_mode(&desired.lease.provider_mode)?,
+                })
             })
-        })
-        .collect()
+            .collect()
+    }
 }
 
 /// Retires one one-mode target in favor of an already-reserved sibling target of the same lease.
@@ -5691,11 +5820,16 @@ async fn fail_one_target_at_generation<C: ConnectionTrait>(
             }
         }
         let reservation = match runtime {
-            Some((tx, work)) if quota_waiter => {
-                let Some(original) = quota_allocation_routes.get(&provider) else {
-                    continue;
+            Some((tx, work)) => {
+                let original = if quota_waiter {
+                    let Some(route) = quota_allocation_routes.get(&provider) else {
+                        continue;
+                    };
+                    Some(route)
+                } else {
+                    None
                 };
-                quota::reserve_runtime_unique_with_route(
+                quota::reserve_runtime_publication(
                     tx,
                     &provider,
                     cid,
@@ -5707,20 +5841,19 @@ async fn fail_one_target_at_generation<C: ConnectionTrait>(
                 )
                 .await?
             }
-            Some((tx, work)) => {
-                quota::reserve_runtime_unique(
-                    tx,
+            None => {
+                let budget = SharedDecodeBudget::default();
+                quota::reserve_unique_with_work(
+                    db,
                     &provider,
                     cid,
                     failed.logical_size,
                     limits,
                     now,
-                    work,
+                    DecodeWork::shared(&budget),
+                    None,
                 )
                 .await?
-            }
-            None => {
-                quota::reserve_unique(db, &provider, cid, failed.logical_size, limits, now).await?
             }
         };
         if matches!(
@@ -5858,18 +5991,28 @@ async fn converge_one_after_replacement_inner<C: ConnectionTrait>(
     if lease.state != LEASE_ACTIVE || lease.provider_mode != "one" {
         return Ok(Vec::new());
     }
-    let mut targets = lease_targets(db, lease_id).await?;
+    let mut targets = pin_lease_target::Entity::find()
+        .filter(pin_lease_target::Column::LeaseId.eq(lease_id))
+        .filter(pin_lease_target::Column::State.is_in(active_target_states()))
+        .all(db)
+        .await?;
     targets.sort_by(compare_target_order);
-    let Some(winner) = targets
-        .iter()
-        .find(|target| target.id == winning_target_id)
-        .cloned()
-    else {
+    let Some(winner) = targets.iter().find(|target| target.id == winning_target_id) else {
         return Ok(Vec::new());
     };
     if winner.state != TARGET_PINNED {
         return Ok(Vec::new());
     }
+    let assignments: Vec<_> = targets
+        .iter()
+        .filter(|target| same_content_cid(&target.cid, &winner.cid))
+        .collect();
+    if assignments.len() < 2
+        || assignments.last().map(|target| target.id.as_str()) != Some(winning_target_id)
+    {
+        return Ok(Vec::new());
+    }
+    let retiring = &assignments[..assignments.len() - 1];
     let cluster = match runtime {
         Some((tx, work)) => {
             retained_cluster_with_work(db, &winner.provider, &winner.cid, work, Some(tx)).await?
@@ -5914,35 +6057,35 @@ async fn converge_one_after_replacement_inner<C: ConnectionTrait>(
     if !confirmed {
         return Ok(Vec::new());
     }
-    let current_assignment = targets.iter().rfind(|target| {
-        same_content_cid(&target.cid, &winner.cid) && is_desired_target_state(&target.state)
-    });
-    if current_assignment.map(|target| target.id.as_str()) != Some(winning_target_id) {
-        return Ok(Vec::new());
-    }
-    let retiring = targets
-        .iter()
-        .filter(|target| {
-            same_content_cid(&target.cid, &winner.cid)
-                && target.id != winner.id
-                && is_desired_target_state(&target.state)
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    if retiring.is_empty() {
-        return Ok(Vec::new());
-    }
-
     if !lifecycle_prelocked {
         lock_lifecycle_lease(db, &lease, true)
             .await?
             .ok_or_else(|| stale_lifecycle_error("one convergence lease prelock"))?;
-        for target in &targets {
-            lock_lifecycle_target(db, target, true)
+        for target in &assignments {
+            lock_lifecycle_target(db, target, false)
                 .await?
                 .ok_or_else(|| stale_lifecycle_error("one convergence target prelock"))?;
         }
-        if lease_targets(db, lease_id).await? != targets {
+        // A quota waiter may have become a desired assignment before the lease lock.
+        let current = pin_lease_target::Entity::find()
+            .select_only()
+            .column(pin_lease_target::Column::Id)
+            .column(pin_lease_target::Column::Cid)
+            .filter(pin_lease_target::Column::LeaseId.eq(lease_id))
+            .filter(pin_lease_target::Column::State.is_in(active_target_states()))
+            .into_tuple::<(String, String)>()
+            .all(db)
+            .await?;
+        let current: BTreeSet<_> = current
+            .iter()
+            .filter(|(_, cid)| same_content_cid(cid, &winner.cid))
+            .map(|(id, _)| id.as_str())
+            .collect();
+        let expected: BTreeSet<_> = assignments
+            .iter()
+            .map(|target| target.id.as_str())
+            .collect();
+        if current != expected {
             return Err(stale_lifecycle_error("one convergence frontier"));
         }
     }
@@ -5971,7 +6114,7 @@ async fn converge_one_after_replacement_inner<C: ConnectionTrait>(
     if updated.rows_affected != 1 {
         return Err(stale_lifecycle_error("one convergence lease"));
     }
-    for target in &retiring {
+    for target in retiring {
         #[cfg(test)]
         record_target_cas(&target.id).await;
         let updated = pin_lease_target::Entity::update_many()
@@ -6456,7 +6599,10 @@ fn same_desired_lifecycle_snapshot(left: &[DesiredTarget], right: &[DesiredTarge
 #[derive(Clone, Copy)]
 enum ProjectionAccess {
     Admission,
-    Observation { historical_poll: bool },
+    Observation {
+        historical_poll: bool,
+        receipt_cluster: Option<bool>,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -6586,7 +6732,9 @@ async fn projection_schedule_work<C: ConnectionTrait>(
             true
         }
         ProjectionAccess::Observation { .. } if remote.status == REMOTE_PINNED => false,
-        ProjectionAccess::Observation { historical_poll } => {
+        ProjectionAccess::Observation {
+            historical_poll, ..
+        } => {
             let reusable = projection_reusable(db, desired, work, runtime).await;
             match reusable {
                 Ok(()) => true,
@@ -6642,11 +6790,21 @@ async fn project_prelocked_target_state<C: ConnectionTrait>(
             .first()
             .ok_or_else(|| invalid("remote has no active desired target"))
     };
+    let receipt_cluster = match access {
+        ProjectionAccess::Observation {
+            receipt_cluster, ..
+        } => receipt_cluster,
+        ProjectionAccess::Admission => None,
+    };
     match remote.status.as_str() {
         REMOTE_PINNED => {
-            let cluster =
-                retained_cluster_with_work(db, &remote.provider, &remote.cid, work, runtime)
-                    .await?;
+            let cluster = match receipt_cluster {
+                Some(cluster) => cluster,
+                None => {
+                    retained_cluster_with_work(db, &remote.provider, &remote.cid, work, runtime)
+                        .await?
+                }
+            };
             let confirmed = !cluster
                 || crate::store::entities::pin_lease_requirement::contract::target_confirmed_catalog(
                     catalog,
@@ -6657,7 +6815,7 @@ async fn project_prelocked_target_state<C: ConnectionTrait>(
                     work.budget().clone(),
                 )
                 .await.map_err(super::management::admission::work_error)?;
-            set_prelocked_target_state(
+            write_projected_target_state(
                 db,
                 &desired.target,
                 if confirmed {
@@ -6665,6 +6823,7 @@ async fn project_prelocked_target_state<C: ConnectionTrait>(
                 } else {
                     TARGET_SUBMITTED
                 },
+                receipt_cluster.is_some(),
             )
             .await?;
             if cluster && let Some(request) = remote.request_id.as_deref() {
@@ -6693,9 +6852,13 @@ async fn project_prelocked_target_state<C: ConnectionTrait>(
             Ok(TargetProjection::Pinned)
         }
         REMOTE_QUEUED | REMOTE_PINNING if remote.request_id.is_some() => {
-            let cluster =
-                retained_cluster_with_work(db, &remote.provider, &remote.cid, work, runtime)
-                    .await?;
+            let cluster = match receipt_cluster {
+                Some(cluster) => cluster,
+                None => {
+                    retained_cluster_with_work(db, &remote.provider, &remote.cid, work, runtime)
+                        .await?
+                }
+            };
             let confirmed = cluster
                 && crate::store::entities::pin_lease_requirement::contract::target_confirmed_catalog(
                     catalog,
@@ -6706,7 +6869,7 @@ async fn project_prelocked_target_state<C: ConnectionTrait>(
                     work.budget().clone(),
                 )
                 .await.map_err(super::management::admission::work_error)?;
-            set_prelocked_target_state(
+            write_projected_target_state(
                 db,
                 &desired.target,
                 if confirmed {
@@ -6714,6 +6877,7 @@ async fn project_prelocked_target_state<C: ConnectionTrait>(
                 } else {
                     TARGET_SUBMITTED
                 },
+                receipt_cluster.is_some(),
             )
             .await?;
             let canonical = canonical()?;
@@ -6819,10 +6983,22 @@ async fn project_failed_target<C: ConnectionTrait>(
         all_desired,
         remote,
     } = projection;
-    if matches!(access, ProjectionAccess::Observation { .. }) {
-        set_failed_observation_target(db, desired, remote, now).await?;
-    } else {
-        set_prelocked_target_state(db, &desired.target, TARGET_DEGRADED).await?;
+    match access {
+        ProjectionAccess::Observation {
+            receipt_cluster: None,
+            ..
+        } => {
+            set_failed_observation_target(db, desired, remote, now).await?;
+        }
+        ProjectionAccess::Observation {
+            receipt_cluster: Some(_),
+            ..
+        } => {
+            write_projected_target_state(db, &desired.target, TARGET_DEGRADED, true).await?;
+        }
+        ProjectionAccess::Admission => {
+            set_prelocked_target_state(db, &desired.target, TARGET_DEGRADED).await?;
+        }
     }
     work.copy(&(&desired.target.provider, &desired.target.cid, remote.epoch))
         .map_err(work_error)?;
@@ -6851,7 +7027,16 @@ async fn project_failed_target<C: ConnectionTrait>(
     Ok(TargetProjection::Degraded { reconcile_job_id })
 }
 
-/// One claimed observation's complete lifecycle frontier, bound to its caller's transaction.
+#[derive(Clone, Copy)]
+enum LockedObservationProjection<'a, 'tx> {
+    Checked(&'a super::management::actions::job_authority::CompletionReader<'tx>),
+    Receipt {
+        tx: &'a crate::store::RuntimeTransaction,
+        work: DecodeWork<'a>,
+    },
+}
+
+/// One claimed observation's lifecycle frontier, bound to its caller's transaction.
 pub(crate) struct LockedWorkerObservation<'a> {
     db: &'a sea_orm::DatabaseTransaction,
     job: &'a pin_job::Model,
@@ -6859,15 +7044,60 @@ pub(crate) struct LockedWorkerObservation<'a> {
 }
 
 impl LockedWorkerObservation<'_> {
+    pub(crate) fn receipt_remote(&self, now: DateTimeUtc) -> Option<&remote_pin::Model> {
+        let OrderedDesiredLifecycleSnapshotOutcome::Current(snapshot) = &self.snapshot else {
+            return None;
+        };
+        let job = self.job;
+        let (Some(lease_id), Some(target_id), Some(generation)) = (
+            job.lease_id.as_deref(),
+            job.target_id.as_deref(),
+            job.expected_generation,
+        ) else {
+            return None;
+        };
+        (job.operation == "submit"
+            && job.expected_remote_epoch.is_none()
+            && snapshot.desired.iter().any(|desired| {
+                desired.target.id == target_id
+                    && desired.lease.id == lease_id
+                    && desired.lease.generation == generation
+                    && desired.lease.expires_at > now
+            }))
+        .then_some(&snapshot.remote)
+    }
+
+    pub(crate) async fn apply_receipt(
+        self,
+        update: RemoteStatusUpdate<'_>,
+        tx: &crate::store::RuntimeTransaction,
+        work: DecodeWork<'_>,
+    ) -> AppResult<RemoteStatusApplyResult> {
+        if !std::ptr::eq(self.db, tx.db()) {
+            return Err(invalid("locked observation transaction mismatch"));
+        }
+        self.apply_status(update, LockedObservationProjection::Receipt { tx, work })
+            .await
+    }
+
     pub(crate) async fn apply(
         self,
         update: RemoteStatusUpdate<'_>,
         authority: &super::management::actions::job_authority::CompletionReader<'_>,
     ) -> AppResult<RemoteStatusApplyResult> {
-        if !authority.is_bound(self.db, self.job)
-            || self.job.provider != update.provider
-            || self.job.cid != update.cid
-        {
+        if !authority.is_bound(self.db, self.job) {
+            return Err(invalid("locked observation resource mismatch"));
+        }
+        self.apply_status(update, LockedObservationProjection::Checked(authority))
+            .await
+    }
+
+    async fn apply_status(
+        self,
+        update: RemoteStatusUpdate<'_>,
+        projection: LockedObservationProjection<'_, '_>,
+    ) -> AppResult<RemoteStatusApplyResult> {
+        if self.job.provider != update.provider || self.job.cid != update.cid {
             return Err(invalid("locked observation resource mismatch"));
         }
         let epoch = if self.job.operation == "reconcile" {
@@ -6885,7 +7115,7 @@ impl LockedWorkerObservation<'_> {
             epoch,
             Some(self.job),
             Some(self.snapshot),
-            Some(authority),
+            Some(projection),
         )
         .await
     }
@@ -6900,6 +7130,101 @@ pub(crate) async fn lock_worker_observation_lifecycle<'a>(
         return Err(stale_lifecycle_error("replica lifecycle frontier"));
     }
     Ok(LockedWorkerObservation { db, job, snapshot })
+}
+
+/// Locks only the leases and desired targets sharing the receipt's remote.
+pub(crate) async fn lock_worker_receipt_lifecycle<'a>(
+    db: &'a sea_orm::DatabaseTransaction,
+    job: &'a pin_job::Model,
+) -> AppResult<LockedWorkerObservation<'a>> {
+    super::management::admission::lock_sqlite_writer_in_caller_transaction(db).await?;
+    let postgres = db.get_database_backend() == DatabaseBackend::Postgres;
+    let resource_targets = pin_lease_target::Entity::find()
+        .filter(pin_lease_target::Column::Provider.eq(&job.provider))
+        .filter(pin_lease_target::Column::Cid.eq(&job.cid))
+        .filter(pin_lease_target::Column::State.is_in(active_target_states()));
+    let active_leases = pin_lease::Entity::find().filter(pin_lease::Column::State.eq(LEASE_ACTIVE));
+    let lease_query = active_leases
+        .clone()
+        .filter(
+            pin_lease::Column::Id.in_subquery(
+                resource_targets
+                    .clone()
+                    .select_only()
+                    .column(pin_lease_target::Column::LeaseId)
+                    .into_query(),
+            ),
+        )
+        .order_by_asc(pin_lease::Column::Id);
+    let leases = if postgres {
+        lease_query.lock_exclusive().all(db).await?
+    } else {
+        lease_query.all(db).await?
+    };
+    let leases: BTreeMap<_, _> = leases
+        .into_iter()
+        .map(|lease| (lease.id.clone(), lease))
+        .collect();
+
+    let targets = if leases.is_empty() {
+        Vec::new()
+    } else {
+        let target_query = resource_targets
+            .clone()
+            .filter(pin_lease_target::Column::LeaseId.is_in(leases.keys().cloned()))
+            .order_by_asc(pin_lease_target::Column::CreatedAt)
+            .order_by_asc(pin_lease_target::Column::Id);
+        if postgres {
+            target_query.lock_exclusive().all(db).await?
+        } else {
+            target_query.all(db).await?
+        }
+    };
+    let Some(remote) = lock_remote_after_lifecycle(db, &job.provider, &job.cid).await? else {
+        return Ok(LockedWorkerObservation {
+            db,
+            job,
+            snapshot: OrderedDesiredLifecycleSnapshotOutcome::MissingRemote,
+        });
+    };
+
+    // Publication serializes on this remote. A reference committed before its lock must
+    // already be in the frontier; restart rather than take a new lease lock after the remote.
+    if postgres
+        && resource_targets
+            .filter(
+                pin_lease_target::Column::LeaseId.in_subquery(
+                    active_leases
+                        .select_only()
+                        .column(pin_lease::Column::Id)
+                        .into_query(),
+                ),
+            )
+            .count(db)
+            .await?
+            != targets.len() as u64
+    {
+        return Err(stale_lifecycle_error("receipt lifecycle frontier"));
+    }
+
+    let desired = targets
+        .into_iter()
+        .map(|target| DesiredTarget {
+            lease: leases[&target.lease_id].clone(),
+            target,
+        })
+        .collect();
+    Ok(LockedWorkerObservation {
+        db,
+        job,
+        snapshot: OrderedDesiredLifecycleSnapshotOutcome::Current(
+            OrderedDesiredLifecycleSnapshot {
+                desired,
+                frontier: Vec::new(),
+                remote,
+            },
+        ),
+    })
 }
 
 /// Persists work from a complete lifecycle snapshot without re-querying canonical siblings
@@ -7047,7 +7372,19 @@ async fn set_prelocked_target_state<C: ConnectionTrait>(
     target: &pin_lease_target::Model,
     state: &str,
 ) -> AppResult<()> {
-    let updated = pin_lease_target::Entity::update_many()
+    write_projected_target_state(db, target, state, false).await
+}
+
+async fn write_projected_target_state<C: ConnectionTrait>(
+    db: &C,
+    target: &pin_lease_target::Model,
+    state: &str,
+    receipt_projection: bool,
+) -> AppResult<()> {
+    if receipt_projection && target.state == state {
+        return Ok(());
+    }
+    let mut update = pin_lease_target::Entity::update_many()
         .col_expr(
             pin_lease_target::Column::State,
             Expr::value(state.to_owned()),
@@ -7056,12 +7393,13 @@ async fn set_prelocked_target_state<C: ConnectionTrait>(
         .filter(pin_lease_target::Column::LeaseId.eq(&target.lease_id))
         .filter(pin_lease_target::Column::Provider.eq(&target.provider))
         .filter(pin_lease_target::Column::Cid.eq(&target.cid))
-        .filter(pin_lease_target::Column::LogicalSize.eq(target.logical_size))
-        .filter(pin_lease_target::Column::CreatedAt.eq(target.created_at))
-        .filter(pin_lease_target::Column::State.eq(&target.state))
-        .exec(db)
-        .await?;
-    if updated.rows_affected != 1 {
+        .filter(pin_lease_target::Column::State.eq(&target.state));
+    if !receipt_projection {
+        update = update
+            .filter(pin_lease_target::Column::LogicalSize.eq(target.logical_size))
+            .filter(pin_lease_target::Column::CreatedAt.eq(target.created_at));
+    }
+    if update.exec(db).await?.rows_affected != 1 {
         return Err(stale_lifecycle_error("prelocked target projection"));
     }
     Ok(())
@@ -10450,6 +10788,7 @@ mod tests {
 
     #[tokio::test]
     async fn one_failover_is_sticky_until_replacement_pins_then_returns_exact_old_cleanup() {
+        let _order_test_guard = test_gates::LIFECYCLE_ORDER_TEST_LOCK.lock().await;
         let db = setup().await;
         seed_remote(
             &db,
@@ -10550,14 +10889,51 @@ mod tests {
         db.execute_unprepared(
             "UPDATE remote_pins SET request_id = 'replacement-pinned', status = 'pinned' \
              WHERE provider = 'filebase' AND cid = 'bafy-sticky-failover'; \
-             UPDATE pin_lease_targets SET state = 'pinned' WHERE id = 'target-sticky-primary' OR provider = 'filebase'",
+             UPDATE pin_lease_targets SET state = 'pinned' WHERE id = 'target-sticky-primary' OR provider = 'filebase'; \
+             INSERT INTO pin_lease_targets \
+                 (id, lease_id, cid, logical_size, provider, state, created_at, last_touched_at) \
+             SELECT 'target-other-cid', lease_id, 'bafy-other-cid', logical_size, provider, \
+                 'waiting', created_at, last_touched_at \
+             FROM pin_lease_targets WHERE id = 'target-sticky-primary' \
+             UNION ALL \
+             SELECT 'target-already-released', lease_id, cid, logical_size, 'third', \
+                 'released', created_at, last_touched_at \
+             FROM pin_lease_targets WHERE id = 'target-sticky-primary'",
         )
         .await
         .unwrap();
+        start_lifecycle_order_recording(
+            &["lease-sticky-failover"],
+            &[
+                "target-sticky-primary",
+                &replacement.id,
+                "target-other-cid",
+                "target-already-released",
+            ],
+            &[("pinata", "bafy-sticky-failover")],
+        )
+        .await;
         let cleanup =
             converge_one_after_replacement(&db, "lease-sticky-failover", &replacement.id, time(3))
                 .await
                 .unwrap();
+        let target_locks: Vec<_> = finish_lifecycle_order_recording()
+            .await
+            .into_iter()
+            .filter_map(|event| match event {
+                test_gates::LifecycleOrderEvent::TargetLock(id) => Some(id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            target_locks,
+            ["target-sticky-primary", replacement.id.as_str()]
+        );
+        assert_eq!(target_state(&db, "target-other-cid").await, "waiting");
+        assert_eq!(
+            target_state(&db, "target-already-released").await,
+            "released"
+        );
 
         assert_eq!(cleanup.len(), 1);
         let NewPinJob::Remote(cleanup) = &cleanup[0] else {
@@ -11642,13 +12018,13 @@ mod tests {
                 .unwrap(),
             RemoteDeleteCompletion::Released
         );
+        tx.commit().await.unwrap();
         assert_eq!(
-            wake_quota_waiting_targets(&tx, "pinata", &limits(100, 1)["pinata"], time(4))
+            quota::wake_provider_waiters(&db, "pinata", &limits(100, 1)["pinata"], time(4))
                 .await
                 .unwrap(),
             ["target"]
         );
-        tx.commit().await.unwrap();
         assert_eq!(target_state(&db, "target").await, "waiting");
         assert!(remote(&db, "pinata", cid).await.request_id.is_none());
         assert_eq!(usage(&db, "pinata").await, (100, 1));
@@ -12515,6 +12891,92 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn pinned_receipt_projects_shared_targets_and_replay_writes_nothing() {
+        let db = setup().await;
+        let cid = "bafy-shared-receipt";
+        seed_remote(&db, "pinata", cid, "queued", Some("receipt"), 4).await;
+        for (lease, target, source, mode) in [
+            ("lease-original", "target-original", "manual", "one"),
+            ("lease-shared", "target-shared", "copy", "all"),
+        ] {
+            seed_lease_target(
+                &db,
+                lease,
+                source,
+                mode,
+                "active",
+                1,
+                target,
+                "pinata",
+                cid,
+                "submitted",
+                time(10),
+            )
+            .await;
+        }
+        jobs::enqueue_job(
+            &db,
+            jobs::submit_job(
+                "pinata",
+                cid,
+                "lease-original",
+                "target-original",
+                1,
+                time(0),
+            ),
+        )
+        .await
+        .unwrap();
+        let job = pin_job::Entity::find().one(&db).await.unwrap().unwrap();
+        let store = crate::store::Store::new(db.clone());
+
+        for now in [time(1), time(2)] {
+            let budget = SharedDecodeBudget::default();
+            let work = DecodeWork::shared(&budget);
+            let tx = store.begin_runtime(work).await.unwrap();
+            let frontier = lock_worker_receipt_lifecycle(&tx, &job).await.unwrap();
+            assert_eq!(frontier.receipt_remote(now).unwrap().epoch, 4);
+            assert!(frontier.receipt_remote(time(10)).is_none());
+            let result = frontier
+                .apply_receipt(
+                    RemoteStatusUpdate {
+                        provider: "pinata",
+                        cid,
+                        request_id: "receipt",
+                        origin: RemoteStatusOrigin::ExistingRequest,
+                        status: RemotePinStatus::Pinned,
+                        error_class: None,
+                        error_text: None,
+                        now,
+                    },
+                    &tx,
+                    work,
+                )
+                .await
+                .unwrap();
+            assert!(
+                matches!(result, RemoteStatusApplyResult::Applied { affected, .. }
+                if affected.len() == 2 && affected.iter().all(|outcome| outcome.available))
+            );
+            tx.commit().await.unwrap();
+            assert_eq!(target_state(&db, "target-original").await, TARGET_PINNED);
+            assert_eq!(target_state(&db, "target-shared").await, TARGET_PINNED);
+            assert_eq!(remote(&db, "pinata", cid).await.last_touched_at, time(1));
+
+            if now == time(1) {
+                db.execute_unprepared(
+                    "CREATE TRIGGER reject_remote_replay BEFORE UPDATE ON remote_pins \
+                     BEGIN SELECT RAISE(ABORT, 'remote receipt replay rewrote the row'); END; \
+                     CREATE TRIGGER reject_target_replay BEFORE UPDATE ON pin_lease_targets \
+                     BEGIN SELECT RAISE(ABORT, 'target receipt replay rewrote the row'); END;",
+                )
+                .await
+                .unwrap();
+            }
+        }
     }
 
     #[tokio::test]

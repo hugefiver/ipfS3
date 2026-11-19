@@ -51,41 +51,34 @@ async fn fixture(registered: bool) -> Store {
 #[tokio::test]
 async fn runtime_release_usage_resolution_consumes_the_partially_used_operation_budget() {
     let store = fixture(false).await;
-    // Measure the other qualified release reads, leaving only usage resolution
-    // outside this allowance. The limit is relative to real work, not SQL text.
+    let now = Utc::now();
+    // A wrong request ID exercises the same release reads up to the request guard,
+    // leaving the correct request's usage lookup outside the allowance.
     let baseline = SharedDecodeBudget::default();
     let work = DecodeWork::shared(&baseline);
     let tx = store.begin_runtime(work).await.unwrap();
-    super::super::ledger::submission::admission_barriers_with_catalog(
-        "pinata",
-        tx.catalog(work),
-        &work,
-        false,
-    )
-    .await
-    .unwrap();
-    super::super::ledger::get_catalog(tx.catalog(work), "pinata", "bafy-release", work)
+    assert_eq!(
+        confirmed_runtime_release_for_request(
+            &tx,
+            "pinata",
+            "bafy-release",
+            1,
+            Some("other-request"),
+            now,
+            work,
+        )
         .await
-        .unwrap();
-    let remote = remote_pin::Entity::find_by_id(("pinata".to_owned(), "bafy-release".to_owned()))
-        .one(tx.db())
-        .await
-        .unwrap()
-        .unwrap();
-    super::super::ledger::archive_runtime_confirmed_release(&tx, &remote, work, false)
-        .await
-        .unwrap();
-    super::super::ledger::mark_runtime_effect(&tx, "pinata", "bafy-release", "absent", work)
-        .await
-        .unwrap();
-    let other_bytes = baseline.lock().unwrap().task_usage().unwrap().raw_bytes;
+        .unwrap(),
+        ConfirmedReleaseOutcome::Stale
+    );
+    let prefix_bytes = baseline.lock().unwrap().task_usage().unwrap().raw_bytes;
     tx.rollback().await.unwrap();
 
     let prior_work = 4096;
     let session = std::sync::Arc::new(std::sync::Mutex::new(ReadSession::for_task(
         Budget::default(),
         u64::MAX,
-        other_bytes + prior_work + 64,
+        prefix_bytes + prior_work,
         CancellationToken::new(),
     )));
     let work = DecodeWork::shared(&session);
@@ -98,7 +91,7 @@ async fn runtime_release_usage_resolution_consumes_the_partially_used_operation_
         "bafy-release",
         1,
         Some("exact-request"),
-        Utc::now(),
+        now,
         work,
     )
     .await;
@@ -106,16 +99,16 @@ async fn runtime_release_usage_resolution_consumes_the_partially_used_operation_
         matches!(result, Err(AppError::ManagementBudget)),
         "{result:?}"
     );
-    tx.rollback().await.unwrap();
-    let usage = read_usage(store.db(), "pinata").await.unwrap().unwrap();
-    assert_eq!((usage.reserved_bytes, usage.reserved_pins), (7, 1));
     let remote = remote_pin::Entity::find_by_id(("pinata".to_owned(), "bafy-release".to_owned()))
-        .one(store.db())
+        .one(tx.db())
         .await
         .unwrap()
         .unwrap();
     assert_eq!(remote.status, "reserved");
     assert_eq!(remote.request_id.as_deref(), Some("exact-request"));
+    tx.rollback().await.unwrap();
+    let usage = read_usage(store.db(), "pinata").await.unwrap().unwrap();
+    assert_eq!((usage.reserved_bytes, usage.reserved_pins), (7, 1));
     assert_eq!(
         pin_resource_history::Entity::find()
             .count(store.db())
@@ -186,12 +179,106 @@ async fn runtime_release_confirmed_rpc_delete_unblocks_new_allocation() {
 
 #[tokio::test]
 async fn runtime_release_keeps_exact_request_epoch_usage_and_history_atomic() {
+    use super::super::ledger;
+    use crate::{
+        pinning::{
+            identity::Ownership,
+            provider::{ObservedResource, ObservedResourceStatus},
+        },
+        store::entities::pin_submit_observation,
+    };
+    use sea_orm::Statement;
+
     let store = fixture(true).await;
-    store.db().execute_unprepared("INSERT INTO pin_submit_observations(id,job_id,submit_call,provider,expected_cid,route,remote_epoch,claim_until,effect,resources,outcome,needs_attention,started_at) SELECT 'unresolved','earlier',1,provider,'other-cid',route,1,CURRENT_TIMESTAMP,'unknown','[]','unknown',TRUE,CURRENT_TIMESTAMP FROM remote_pin_ledger").await.unwrap();
-    for (epoch, request, expected) in [
-        (2, "exact-request", ConfirmedReleaseOutcome::Stale),
-        (1, "other-request", ConfirmedReleaseOutcome::Stale),
-        (1, "exact-request", ConfirmedReleaseOutcome::Released),
+    let db = store.db();
+    let now = Utc::now();
+    let expected_cid = "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku";
+    let reported_cid = "bafkreigh2akiscaildc6ii5zji4bq7kly5k3s7svv6q2wx2nn5rtj5xuu4";
+    let limits = [(
+        "pinata".into(),
+        ProviderLimits {
+            priority: 1,
+            max_bytes: 14,
+            max_pins: 2,
+            enabled: true,
+        },
+    )]
+    .into();
+    assert_eq!(
+        reserve_unique(db, "pinata", reported_cid, 7, &limits, now)
+            .await
+            .unwrap(),
+        ReservationOutcome::Reserved
+    );
+    db.execute(Statement::from_sql_and_values(
+        db.get_database_backend(),
+        "UPDATE remote_pins SET request_id='reported-request' WHERE provider='pinata' AND cid=$1",
+        [reported_cid.into()],
+    ))
+    .await
+    .unwrap();
+    let row = ledger::get(db, "pinata", reported_cid)
+        .await
+        .unwrap()
+        .unwrap();
+    let route = ledger::decode_route(&row).unwrap();
+    let reported = ledger::submission::resource_evidence_for_route(
+        &route,
+        ObservedResource {
+            resource_type: route.resource_type(),
+            cid: reported_cid.into(),
+            request_id: "reported-request".into(),
+            status: ObservedResourceStatus::Reported,
+            ownership: Ownership::Unknown,
+            replica_evidence: None,
+        },
+    );
+    pin_submit_observation::Entity::insert(pin_submit_observation::ActiveModel {
+        id: Set("unresolved".into()),
+        job_id: Set("earlier".into()),
+        submit_call: Set(1),
+        provider: Set("pinata".into()),
+        expected_cid: Set(expected_cid.into()),
+        route: Set(row.route.unwrap()),
+        remote_epoch: Set(1),
+        claim_until: Set(now),
+        effect: Set("unknown".into()),
+        resources: Set(serde_json::to_string(&[reported]).unwrap()),
+        outcome: Set("cid_mismatch".into()),
+        needs_attention: Set(true),
+        started_at: Set(now),
+        observed_at: Set(Some(now)),
+        ..Default::default()
+    })
+    .exec(db)
+    .await
+    .unwrap();
+
+    for (cid, epoch, request, expected) in [
+        (
+            reported_cid,
+            1,
+            "reported-request",
+            ConfirmedReleaseOutcome::Stale,
+        ),
+        (
+            "bafy-release",
+            2,
+            "exact-request",
+            ConfirmedReleaseOutcome::Stale,
+        ),
+        (
+            "bafy-release",
+            1,
+            "other-request",
+            ConfirmedReleaseOutcome::Stale,
+        ),
+        (
+            "bafy-release",
+            1,
+            "exact-request",
+            ConfirmedReleaseOutcome::Released,
+        ),
     ] {
         let session = SharedDecodeBudget::default();
         let work = DecodeWork::shared(&session);
@@ -201,10 +288,10 @@ async fn runtime_release_keeps_exact_request_epoch_usage_and_history_atomic() {
             confirmed_runtime_release_for_request(
                 &tx,
                 "pinata",
-                "bafy-release",
+                cid,
                 epoch,
                 Some(request),
-                Utc::now(),
+                now,
                 work
             )
             .await
@@ -213,14 +300,8 @@ async fn runtime_release_keeps_exact_request_epoch_usage_and_history_atomic() {
         );
         if expected == ConfirmedReleaseOutcome::Released {
             tx.rollback().await.unwrap();
-            assert_eq!(
-                read_usage(store.db(), "pinata")
-                    .await
-                    .unwrap()
-                    .unwrap()
-                    .reserved_bytes,
-                7
-            );
+            let usage = read_usage(db, "pinata").await.unwrap().unwrap();
+            assert_eq!((usage.reserved_bytes, usage.reserved_pins), (14, 2));
             assert_eq!(
                 pin_resource_history::Entity::find()
                     .count(store.db())
@@ -242,7 +323,7 @@ async fn runtime_release_keeps_exact_request_epoch_usage_and_history_atomic() {
             "bafy-release",
             1,
             Some("exact-request"),
-            Utc::now(),
+            now,
             work
         )
         .await
@@ -250,11 +331,18 @@ async fn runtime_release_keeps_exact_request_epoch_usage_and_history_atomic() {
         ConfirmedReleaseOutcome::Released
     );
     tx.commit().await.unwrap();
-    let usage = read_usage(store.db(), "pinata").await.unwrap().unwrap();
-    assert_eq!((usage.reserved_bytes, usage.reserved_pins), (0, 0));
+    let usage = read_usage(db, "pinata").await.unwrap().unwrap();
+    assert_eq!((usage.reserved_bytes, usage.reserved_pins), (7, 1));
+    let reported = remote_pin::Entity::find_by_id(("pinata".to_owned(), reported_cid.to_owned()))
+        .one(db)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(reported.status, "reserved");
+    assert_eq!(reported.request_id.as_deref(), Some("reported-request"));
     assert_eq!(
         pin_resource_history::Entity::find()
-            .count(store.db())
+            .count(db)
             .await
             .unwrap(),
         1

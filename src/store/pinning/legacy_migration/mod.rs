@@ -64,7 +64,8 @@ pub(crate) use receipt::source_is_migrated_with_work;
 pub(in crate::store::pinning) use receipt::work::Work as ReceiptWork;
 pub use receipt::{LegacyBinding, historical_keys, resolve_legacy_binding, source_is_migrated};
 pub(in crate::store::pinning) use receipt::{
-    admission_historical_resources_with_catalog, historical_resource_keys_from_loaded_catalog,
+    admission_historical_resources_with_catalog, admission_report_providers_with_catalog,
+    historical_resource_keys_from_loaded_catalog,
 };
 pub(crate) use receipt::{historical_keys_catalog, resolve_with_catalog};
 pub(crate) async fn historical_keys_budgeted<C: sea_orm::ConnectionTrait>(

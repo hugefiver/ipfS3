@@ -1073,8 +1073,11 @@ async fn bounded_candidate_pages_progress_past_inflight_and_unwakeable_history()
         .exec(store.db())
         .await
         .unwrap();
-    let (cursor, found, _) = parked_receipt_candidates(store.db(), "", 1).await.unwrap();
-    let cursor = cursor.expect("the first page must reach runnable parked work");
+    let page = parked_receipt_candidates(store.db(), "", 1).await.unwrap();
+    let cursor = page
+        .next
+        .expect("the first page must reach runnable parked work");
+    let found = page.wake;
     assert_eq!(found.len(), 1);
     assert!(
         evidence::Entity::find_by_id("!terminal:call:1")
@@ -1115,7 +1118,7 @@ async fn bounded_candidate_pages_progress_past_inflight_and_unwakeable_history()
         parked_receipt_candidates(store.db(), &cursor, 1)
             .await
             .unwrap()
-            .0
+            .next
             .is_none()
     );
 }

@@ -772,21 +772,28 @@ async fn recover_parked_receipts(
     store: &Store,
     cursor: &mut String,
 ) -> AppResult<()> {
-    let (next, candidates, cleanup) = ledger::submission::parked_receipt_candidates(
+    let page = ledger::submission::parked_receipt_candidates(
         store.db(),
         cursor,
         coordinator.settings().claim_limit,
     )
     .await?;
-    recover_receipt_page(coordinator, store, candidates, ReceiptRecovery::Wake).await;
-    for id in cleanup {
+    for id in page.finish {
+        if let Err(error) =
+            ledger::submission::finish_parked_receipt(store.db(), &id, Utc::now()).await
+        {
+            tracing::error!(job_id = %id, %error, "pinning receipt recovery finalization failed");
+        }
+    }
+    recover_receipt_page(coordinator, store, page.wake, ReceiptRecovery::Wake).await;
+    for id in page.cleanup {
         if let Err(error) =
             Box::pin(ledger::submission::late_cleanup::recover_wake(store, &id)).await
         {
             tracing::error!(job_id = %id, %error, "late Submit cleanup wake failed");
         }
     }
-    *cursor = next.unwrap_or_default();
+    *cursor = page.next.unwrap_or_default();
     Ok(())
 }
 
@@ -1130,6 +1137,22 @@ async fn admit_claimed_job(
         {
             return Ok(WorkerContinuation::Done);
         }
+    }
+    if claimed.reclaimed
+        && claimed.model.operation == "submit"
+        && jobs::submit_projection_committed(store.db(), &claimed.model).await?
+    {
+        let now = Utc::now();
+        recover_durable_observation_coordination(
+            store,
+            coordinator,
+            &claimed.model.provider,
+            &claimed.model.cid,
+            now,
+        )
+        .await?;
+        jobs::complete_settled_submit(store.db(), &claimed, now).await?;
+        return Ok(WorkerContinuation::Done);
     }
     if matches!(claimed.model.operation.as_str(), "submit" | "poll")
         && !current_job_policy(store.db(), coordinator, &claimed.model).await?
@@ -2003,6 +2026,31 @@ async fn record_submit_phase(
         capture.append_submit(&tx, &result, Utc::now()).await?;
         tx.commit().await?;
     }
+    let rpc_evidence = match rpc_evidence {
+        Some(receipt) if matches!(receipt.outcome.as_str(), "matched" | "accepted") => {
+            let remote = result
+                .result
+                .expect("matching receipt has a successful response");
+            let ownership = result
+                .resources
+                .iter()
+                .find(|resource| {
+                    resource.request_id == remote.request_id && resource.cid == claimed.model.cid
+                })
+                .map_or(ledger::Ownership::Unknown, |resource| resource.ownership);
+            return Ok(WorkerContinuation::SettleSubmit(Box::new(MatchedSubmit {
+                claimed,
+                receipt,
+                request_id: remote.request_id.clone(),
+                ownership,
+                observation: Some(crate::pinning::provider::PinObservation {
+                    result: Ok(remote),
+                    resources: result.resources,
+                }),
+            })));
+        }
+        other => other,
+    };
     let can_project_source = current_projection_allowed(store, coordinator, &claimed.model).await?;
     let definitely_not_submitted = result.effect
         == crate::pinning::provider::SubmitEffect::NotSubmitted
@@ -2035,31 +2083,16 @@ async fn record_submit_phase(
         .await?;
         if !can_project && source_allowed {
             let now = Utc::now();
-            if !ledger::submission::wake_runtime_parked(
+            ledger::submission::wake_runtime_parked(
                 &txn,
                 &claimed.model.id,
                 now,
                 DecodeWork::shared(&work),
             )
-            .await?
-                && matches!(evidence.outcome.as_str(), "matched" | "accepted")
-            {
-                Box::pin(ledger::submission::late_cleanup::wake(
-                    &txn,
-                    evidence,
-                    &claimed.model,
-                    now,
-                    DecodeWork::shared(&work),
-                ))
-                .await?;
-            }
+            .await?;
         }
         txn.commit().await?;
-        if can_project
-            && can_project_source
-            && !definitely_not_submitted
-            && !matches!(evidence.outcome.as_str(), "matched" | "accepted")
-        {
+        if can_project && can_project_source && !definitely_not_submitted {
             #[cfg(test)]
             if let Ok((committed, resume)) = RPC_RECEIPT_COMMITTED.try_with(Clone::clone) {
                 committed.notify_one();
@@ -2124,10 +2157,7 @@ async fn record_submit_phase(
             .await?;
             txn.commit().await?;
         }
-        if !can_project
-            || (!definitely_not_submitted
-                && !matches!(evidence.outcome.as_str(), "matched" | "accepted"))
-        {
+        if !can_project || !definitely_not_submitted {
             return Ok(WorkerContinuation::Done);
         }
     }
@@ -2169,6 +2199,9 @@ async fn record_submit_phase(
         Err(error) => {
             if definitely_not_submitted {
                 let now = Utc::now();
+                let eviction =
+                    discover_quota_eviction(store, coordinator, &claimed.model, &error, now)
+                        .await?;
                 let work = SharedDecodeBudget::default();
                 let source_context = read_context_for_job_with_work(
                     store,
@@ -2178,6 +2211,13 @@ async fn record_submit_phase(
                 )
                 .await?;
                 let txn = store.begin_runtime(DecodeWork::shared(&work)).await?;
+                if eviction.is_some()
+                    && !jobs::fence_job_claim(&txn, &claimed.model.id, claimed_lock(&claimed)?)
+                        .await?
+                {
+                    txn.rollback().await?;
+                    return Ok(WorkerContinuation::Done);
+                }
                 if let Some(evidence) = rpc_evidence.as_ref()
                     && (!ledger::submission::project_runtime_receipt(
                         &txn,
@@ -2208,8 +2248,8 @@ async fn record_submit_phase(
                     safe_error.as_deref().expect("error evidence exists"),
                 )
                 .await?;
-                let evicted = if error.class == ProviderErrorClass::Quota {
-                    quota_coordination_hook(&txn, coordinator, &claimed.model, now).await?
+                let evicted = if let Some(snapshot) = eviction {
+                    store_quota::apply_eviction(txn.db(), &snapshot, now, Some(&txn)).await?
                 } else {
                     Vec::new()
                 };
@@ -2264,6 +2304,175 @@ async fn record_submit_phase(
             }
         }
     }
+}
+
+struct MatchedSubmit {
+    claimed: ClaimedPinJob,
+    receipt: ledger::submission_entity::Model,
+    request_id: String,
+    ownership: ledger::Ownership,
+    observation: Option<crate::pinning::provider::PinObservation>,
+}
+
+async fn settle_submit_receipt(
+    store: &Store,
+    coordinator: &PinningCoordinator,
+    submit: MatchedSubmit,
+) -> AppResult<WorkerContinuation> {
+    let MatchedSubmit {
+        claimed,
+        receipt,
+        request_id,
+        ownership,
+        observation,
+    } = submit;
+    let job = &claimed.model;
+    let budget = SharedDecodeBudget::default();
+    let work = DecodeWork::shared(&budget);
+    let context = read_context_for_job_with_work(store, coordinator, job, budget.clone()).await?;
+    let tx = store.begin_runtime(work).await?;
+    if context.is_some() {
+        job_authority::lock_runtime_source(&tx, job, budget.clone()).await?;
+    }
+    let frontier = leases::lock_worker_receipt_lifecycle(&tx, job).await?;
+    let live = jobs::fence_submit_claim_nowait(&tx, &claimed).await?;
+    let now = Utc::now();
+    let authority = if job_authority::lookup_catalog(tx.catalog(work), job, budget.clone())
+        .await
+        .map_err(job_authority::safe)?
+        .is_some()
+    {
+        Some(job_authority::fence_runtime_authority(&tx, job, budget.clone()).await?)
+    } else {
+        None
+    };
+    if let Some(reader) = &authority
+        && !reader
+            .projection_and_source_allowed(
+                context.as_ref().map(CurrentReadContext::config),
+                context.as_ref().map(|c| c.idle_timeout_millis),
+            )
+            .await?
+    {
+        jobs::finish_nonprojecting_job(&tx, &claimed, true, now).await?;
+        tx.commit().await?;
+        return Ok(WorkerContinuation::Done);
+    }
+    let current = if live && let Some(remote) = frontier.receipt_remote(now) {
+        ledger::submission::matched_resource_current(&tx, &receipt, job, remote, &request_id, work)
+            .await?
+    } else {
+        false
+    };
+    if !current {
+        // A superseded invocation can wake its parked owner or exact cleanup, never publish.
+        if live {
+            jobs::finish_nonprojecting_job(&tx, &claimed, true, now).await?;
+            tx.commit().await?;
+        } else {
+            tx.rollback().await?;
+        }
+        if receipt.needs_attention && (live || observation.is_some()) {
+            let tx = store.begin_runtime(work).await?;
+            if live || !ledger::submission::wake_runtime_parked(&tx, &job.id, now, work).await? {
+                Box::pin(ledger::submission::late_cleanup::wake(
+                    &tx, &receipt, job, now, work,
+                ))
+                .await?;
+            }
+            tx.commit().await?;
+        }
+        return Ok(WorkerContinuation::Done);
+    }
+    let cluster = receipt.outcome == "accepted";
+    if cluster && let Some(observed) = observation.as_ref() {
+        // Acceptance records the typed Submit resources. Only a Poll can confirm replicas.
+        crate::store::entities::pin_replica_observation::receipt::append_fact(
+            &tx,
+            &claimed,
+            observed,
+            (&receipt.route, receipt.remote_epoch),
+            "Unknown",
+            true,
+            now,
+        )
+        .await?;
+    }
+    let status = if cluster {
+        RemotePinStatus::Pinning
+    } else {
+        RemotePinStatus::Pinned
+    };
+    let result = frontier
+        .apply_receipt(
+            RemoteStatusUpdate {
+                provider: &job.provider,
+                cid: &job.cid,
+                request_id: &request_id,
+                origin: RemoteStatusOrigin::Adopt,
+                status,
+                error_class: None,
+                error_text: None,
+                now,
+            },
+            &tx,
+            work,
+        )
+        .await?;
+    let RemoteStatusApplyResult::Applied {
+        previous_status,
+        current_status,
+        affected,
+        ..
+    } = result
+    else {
+        tx.rollback().await?;
+        jobs::finish_nonprojecting_job(store.db(), &claimed, true, now).await?;
+        return Ok(WorkerContinuation::Done);
+    };
+    if receipt.needs_attention || previous_status != current_status {
+        ledger::observe_runtime_claimed(
+            &tx,
+            job,
+            &request_id,
+            true,
+            (status, ownership, None),
+            receipt
+                .observed_at
+                .expect("matching receipt has an observation time"),
+            work,
+        )
+        .await?;
+    }
+    if let Some(reader) = authority
+        && !reader
+            .fresh_source_allowed(
+                context.as_ref().map(CurrentReadContext::config),
+                context.as_ref().map(|c| c.idle_timeout_millis),
+            )
+            .await?
+    {
+        tx.rollback().await?;
+        jobs::finish_nonprojecting_job(store.db(), &claimed, true, now).await?;
+        return Ok(WorkerContinuation::Done);
+    }
+    ledger::submission::settle_projected_receipt(&tx, &receipt).await?;
+    let coordinate = affected
+        .iter()
+        .any(|target| target.provider_mode == ProviderMode::One && target.available);
+    if !coordinate {
+        jobs::complete_settled_submit(&tx, &claimed, now).await?;
+    }
+    tx.commit().await?;
+    if coordinate {
+        converge_pinned_one_outcomes(store, &affected, now).await?;
+        jobs::complete_settled_submit(store.db(), &claimed, now).await?;
+    }
+    if previous_status != current_status {
+        audit_status_projection(&claimed, &previous_status, &current_status, &request_id);
+    }
+    transition(&claimed, "running", "done", Some(&request_id));
+    Ok(WorkerContinuation::Done)
 }
 
 async fn record_rpc_not_dispatched(
@@ -2342,37 +2551,25 @@ async fn recover_submit(
     // returned root. Only a captured, complete matching receipt can be replayed.
     if let Some(evidence) = ledger::submission::latest_rpc(store.db(), &claimed.model.id).await? {
         if matches!(evidence.outcome.as_str(), "matched" | "accepted") {
-            let resources: Vec<ledger::submission::ResourceEvidence> =
-                serde_json::from_str(&evidence.resources)
-                    .map_err(|_| AppError::Internal("invalid durable RPC receipt".into()))?;
-            let resource = resources
-                .first()
-                .ok_or_else(|| AppError::Internal("empty matching RPC receipt".into()))?;
-            let remote = RemotePin {
-                request_id: resource.resource.request_id.clone(),
-                cid: resource.resource.cid.clone(),
-                status: if evidence.outcome == "accepted" {
-                    RemotePinStatus::Pinning
-                } else {
-                    RemotePinStatus::Pinned
-                },
-                raw_status: if evidence.outcome == "accepted" {
-                    "pinning"
-                } else {
-                    "pinned"
-                }
-                .into(),
-                failure_reason: None,
+            let Some((request_id, ownership)) = ledger::submission::matching_resource(&evidence)
+            else {
+                return jobs::park_submit_store(
+                    store,
+                    &claimed,
+                    "needs_attention",
+                    jobs::RPC_RECOVERY_PARK_REASON,
+                    Utc::now(),
+                )
+                .await
+                .map(|_| WorkerContinuation::Done);
             };
-            return Ok(WorkerContinuation::PersistObservation(Box::new(
-                PendingObservation {
-                    claimed,
-                    remote,
-                    origin: RemoteStatusOrigin::Adopt,
-                    source: ObservationSource::ProviderObserved,
-                    typed: None,
-                },
-            )));
+            return Ok(WorkerContinuation::SettleSubmit(Box::new(MatchedSubmit {
+                claimed,
+                receipt: evidence,
+                request_id,
+                ownership,
+                observation: None,
+            })));
         }
         if evidence.outcome == "not_submitted" {
             let work = SharedDecodeBudget::default();
@@ -2767,6 +2964,7 @@ async fn retry_submit_recovery_with_reason(
         coordinator.settings().max_backoff,
     );
     let now = Utc::now();
+    let eviction = discover_quota_eviction(store, coordinator, &claimed.model, error, now).await?;
     let work = SharedDecodeBudget::default();
     let txn = store.begin_runtime(DecodeWork::shared(&work)).await?;
     if !jobs::fence_job_claim(&txn, &claimed.model.id, claimed_lock(claimed)?).await? {
@@ -2774,10 +2972,12 @@ async fn retry_submit_recovery_with_reason(
         transition(claimed, "recovering", "stale_claim_discarded", None);
         return Ok(());
     }
-    let evicted = if error.class == ProviderErrorClass::Quota {
-        quota_coordination_hook(&txn, coordinator, &claimed.model, now).await?
+    let evicted = if let Some(snapshot) = eviction {
+        store_quota::apply_eviction(txn.db(), &snapshot, now, Some(&txn)).await?
     } else {
-        leases::mark_all_mode_target_degraded_for_retry(&txn, &claimed.model, now).await?;
+        if error.class != ProviderErrorClass::Quota {
+            leases::mark_all_mode_target_degraded_for_retry(&txn, &claimed.model, now).await?;
+        }
         Vec::new()
     };
     jobs::record_submit_error(&txn, claimed, "unknown", &error.safe_evidence("find")).await?;
@@ -5783,27 +5983,28 @@ async fn coordinate_claimed_one_target(
     }
 }
 
-async fn quota_coordination_hook(
-    db: &crate::store::RuntimeTransaction,
+async fn discover_quota_eviction(
+    store: &Store,
     coordinator: &PinningCoordinator,
     job: &pin_job::Model,
+    error: &ProviderError,
     now: DateTime<Utc>,
-) -> AppResult<Vec<leases::QuotaEvictedTarget>> {
-    if job.operation != "submit" {
-        return Ok(Vec::new());
+) -> AppResult<Option<store_quota::EvictionSnapshot>> {
+    if job.operation != "submit" || error.class != ProviderErrorClass::Quota {
+        return Ok(None);
     }
-    let Some(limits) = coordinator.provider_limits().get(&job.provider).cloned() else {
-        return Ok(Vec::new());
+    let Some(limits) = coordinator.provider_limits().get(&job.provider) else {
+        return Ok(None);
     };
     let (Some(lease_id), Some(target_id), Some(expected_generation)) = (
         job.lease_id.as_deref(),
         job.target_id.as_deref(),
         job.expected_generation,
     ) else {
-        return Ok(Vec::new());
+        return Ok(None);
     };
-    store_quota::evict_runtime_provider_quota(
-        db,
+    store_quota::discover_provider_quota_eviction(
+        store.db(),
         &job.provider,
         store_quota::ProviderQuotaWork {
             cid: &job.cid,
@@ -5831,29 +6032,20 @@ async fn wake_provider_waiters_after_release(
     };
     let session = SharedDecodeBudget::default();
     let work = DecodeWork::shared(&session);
-    let txn = store.begin_runtime(work).await?;
-    let woken = store_quota::wake_runtime_provider_waiters(
-        &txn,
+    let woken = match store_quota::wake_runtime_provider_waiters(
+        store,
         provider,
         limits,
         now,
         work,
         Some(coordinator.policy()),
     )
-    .await;
-    let woken = match woken {
-        Ok(store_quota::WaiterWakeOutcome::Woken(woken)) => {
-            txn.commit().await?;
-            woken
-        }
-        Ok(store_quota::WaiterWakeOutcome::Invalid(candidate)) => {
-            txn.rollback().await?;
+    .await?
+    {
+        store_quota::WaiterWakeOutcome::Woken(woken) => woken,
+        store_quota::WaiterWakeOutcome::Invalid(candidate) => {
             quota_waiter::terminate_candidate(store, &candidate, now).await?;
             return Ok(Vec::new());
-        }
-        Err(error) => {
-            txn.rollback().await?;
-            return Err(error);
         }
     };
     let retry_delay = chrono_duration(coordinator.settings().interval)?;
@@ -5909,38 +6101,22 @@ async fn coordinate_quota_waiters(
         leases::requeue_released_all_quota_targets(&txn, &provider, retry_delay, now).await?;
         txn.commit().await?;
 
-        let woken = {
-            let budget = SharedDecodeBudget::default();
-            let work = DecodeWork::shared(&budget);
-            let txn = store.begin_runtime(work).await?;
-            let result = store_quota::wake_runtime_provider_waiters(
-                &txn,
-                &provider,
-                &limits,
-                now,
-                work,
-                Some(coordinator.policy()),
-            )
-            .await
-            .and_then(|woken| {
-                work.with(|session| session.check())
-                    .map_err(admission::work_error)?;
-                Ok(woken)
-            });
-            match result {
-                Ok(store_quota::WaiterWakeOutcome::Woken(woken)) => {
-                    txn.commit().await?;
-                    woken
-                }
-                Ok(store_quota::WaiterWakeOutcome::Invalid(candidate)) => {
-                    txn.rollback().await?;
-                    quota_waiter::terminate_candidate(store, &candidate, now).await?;
-                    continue;
-                }
-                Err(error) => {
-                    txn.rollback().await?;
-                    return Err(error);
-                }
+        let budget = SharedDecodeBudget::default();
+        let work = DecodeWork::shared(&budget);
+        let woken = match store_quota::wake_runtime_provider_waiters(
+            store,
+            &provider,
+            &limits,
+            now,
+            work,
+            Some(coordinator.policy()),
+        )
+        .await?
+        {
+            store_quota::WaiterWakeOutcome::Woken(woken) => woken,
+            store_quota::WaiterWakeOutcome::Invalid(candidate) => {
+                quota_waiter::terminate_candidate(store, &candidate, now).await?;
+                continue;
             }
         };
         if !woken.is_empty() {
@@ -5954,23 +6130,35 @@ async fn coordinate_quota_waiters(
             continue;
         }
 
+        let snapshot = match store_quota::discover_waiter_eviction(
+            store.db(),
+            &provider,
+            &limits,
+            now,
+        )
+        .await
+        {
+            Ok(Some(snapshot)) => snapshot,
+            Ok(None) | Err(AppError::InvalidPinningRequest(_)) => continue,
+            Err(error) => return Err(error),
+        };
         let session = SharedDecodeBudget::default();
         let txn = store.begin_runtime(DecodeWork::shared(&session)).await?;
-        let evicted =
-            match store_quota::evict_runtime_provider_waiter(&txn, &provider, &limits, now).await {
-                Ok(evicted) => {
-                    txn.commit().await?;
-                    evicted
-                }
-                Err(AppError::InvalidPinningRequest(_)) => {
-                    txn.rollback().await?;
-                    continue;
-                }
-                Err(error) => {
-                    txn.rollback().await?;
-                    return Err(error);
-                }
-            };
+        let evicted = match store_quota::apply_eviction(txn.db(), &snapshot, now, Some(&txn)).await
+        {
+            Ok(evicted) => {
+                txn.commit().await?;
+                evicted
+            }
+            Err(AppError::InvalidPinningRequest(_)) => {
+                txn.rollback().await?;
+                continue;
+            }
+            Err(error) => {
+                txn.rollback().await?;
+                return Err(error);
+            }
+        };
         coordinate_quota_evicted_one_targets(store, coordinator, &evicted, now).await?;
     }
     #[cfg(test)]

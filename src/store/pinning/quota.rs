@@ -2,7 +2,7 @@ use super::management::{
     admission,
     records::{self, DecodeWork, SharedDecodeBudget},
 };
-use std::{cmp, collections::BTreeSet};
+use std::cmp;
 
 use chrono::{DateTime, Utc};
 use sea_orm::{
@@ -29,6 +29,13 @@ use crate::{
 };
 
 pub type DateTimeUtc = DateTime<Utc>;
+mod eviction;
+pub(crate) use eviction::{
+    EvictionSnapshot, ProviderQuotaWork, apply_eviction, discover_provider_quota_eviction,
+    discover_waiter_eviction,
+};
+#[cfg(test)]
+mod eviction_postgres_tests;
 pub(in crate::store::pinning) mod production;
 #[cfg(test)]
 mod runtime_release_tests;
@@ -372,12 +379,22 @@ pub async fn reserve_unique<C: ConnectionTrait>(
     limits: &ProviderLimitMap,
     now: DateTimeUtc,
 ) -> AppResult<ReservationOutcome> {
-    reserve_unique_for_intent(db, provider, cid, cid_size, limits, now, false).await
+    let budget = SharedDecodeBudget::default();
+    reserve_unique_for_intent_with_work(
+        db,
+        (provider, cid, cid_size),
+        limits,
+        now,
+        ReservationIntent::Standalone,
+        DecodeWork::shared(&budget),
+        None,
+    )
+    .await
 }
 
 #[derive(Clone, Copy)]
 enum ReservationIntent<'a> {
-    Admission(Option<&'a crate::pinning::identity::ProviderRouteSnapshot>),
+    Standalone,
     Publication(Option<&'a crate::pinning::identity::ProviderRouteSnapshot>),
     Waiter,
 }
@@ -405,8 +422,8 @@ pub(crate) async fn reserve_unique_with_work<C: ConnectionTrait>(
     .await
 }
 
-/// An existing waiter retains the *original* admission decision. Operator debt
-/// denies allocation, but cannot permanently erase this already queued target.
+/// A waiter facing resource debt is left unchanged (`None`). Capacity waiting
+/// still returns an outcome so it can stop the FIFO batch at the current head.
 pub(crate) async fn reserve_unique_for_waiter<C: ConnectionTrait>(
     db: &C,
     provider: &str,
@@ -414,36 +431,37 @@ pub(crate) async fn reserve_unique_for_waiter<C: ConnectionTrait>(
     cid_size: i64,
     limits: &ProviderLimitMap,
     now: DateTimeUtc,
-) -> AppResult<ReservationOutcome> {
-    reserve_unique_for_intent(db, provider, cid, cid_size, limits, now, true).await
-}
-
-async fn reserve_unique_for_intent<C: ConnectionTrait>(
-    db: &C,
-    provider: &str,
-    cid: &str,
-    cid_size: i64,
-    limits: &ProviderLimitMap,
-    now: DateTimeUtc,
-    waiter: bool,
-) -> AppResult<ReservationOutcome> {
-    let work = SharedDecodeBudget::default();
-    reserve_unique_for_intent_with_work(
+) -> AppResult<Option<ReservationOutcome>> {
+    let budget = SharedDecodeBudget::default();
+    reserve_intent_with_work(
         db,
         (provider, cid, cid_size),
         limits,
         now,
-        if waiter {
-            ReservationIntent::Waiter
-        } else {
-            ReservationIntent::Admission(None)
-        },
-        DecodeWork::shared(&work),
+        ReservationIntent::Waiter,
+        DecodeWork::shared(&budget),
         None,
     )
     .await
 }
+
 async fn reserve_unique_for_intent_with_work<C: ConnectionTrait>(
+    db: &C,
+    resource: (&str, &str, i64),
+    limits: &ProviderLimitMap,
+    now: DateTimeUtc,
+    intent: ReservationIntent<'_>,
+    work: DecodeWork<'_>,
+    runtime: Option<&crate::store::RuntimeTransaction>,
+) -> AppResult<ReservationOutcome> {
+    Ok(
+        reserve_intent_with_work(db, resource, limits, now, intent, work, runtime)
+            .await?
+            .unwrap_or(ReservationOutcome::QuotaWaiting { evict: Vec::new() }),
+    )
+}
+
+async fn reserve_intent_with_work<C: ConnectionTrait>(
     db: &C,
     (provider, cid, cid_size): (&str, &str, i64),
     limits: &ProviderLimitMap,
@@ -451,7 +469,7 @@ async fn reserve_unique_for_intent_with_work<C: ConnectionTrait>(
     intent: ReservationIntent<'_>,
     work: DecodeWork<'_>,
     runtime: Option<&crate::store::RuntimeTransaction>,
-) -> AppResult<ReservationOutcome> {
+) -> AppResult<Option<ReservationOutcome>> {
     let waiter = matches!(intent, ReservationIntent::Waiter);
     super::management::admission::lock_sqlite_writer_in_caller_transaction(db).await?;
     let migrated = match runtime {
@@ -477,17 +495,20 @@ async fn reserve_unique_for_intent_with_work<C: ConnectionTrait>(
             work,
             runtime,
             match intent {
-                ReservationIntent::Publication(route) | ReservationIntent::Admission(route) => {
-                    route
-                }
+                ReservationIntent::Publication(route) => route,
                 _ => None,
             },
         )
         .await
         {
+            // Barrier denials are settled outcomes; actual capacity pressure
+            // uses Waiting and must keep the FIFO head in place.
+            Ok(ReserveAttempt::Outcome(ReservationOutcome::QuotaWaiting { .. })) if waiter => {
+                return Ok(None);
+            }
             Ok(ReserveAttempt::Outcome(outcome)) => Ok(Some(outcome)),
             Ok(ReserveAttempt::Waiting(usage)) => {
-                let evict = if matches!(intent, ReservationIntent::Admission(_)) {
+                let evict = if matches!(intent, ReservationIntent::Standalone) {
                     eviction_candidates(
                         db,
                         provider,
@@ -505,7 +526,7 @@ async fn reserve_unique_for_intent_with_work<C: ConnectionTrait>(
             Err(error) => Err(error),
         };
         match outcome {
-            Ok(Some(outcome)) => return Ok(outcome),
+            Ok(Some(outcome)) => return Ok(Some(outcome)),
             Ok(None) => retry_delay(attempt).await,
             Err(AppError::Database(message)) if is_sqlite_contention(&message) => {
                 retry_delay(attempt).await;
@@ -516,50 +537,6 @@ async fn reserve_unique_for_intent_with_work<C: ConnectionTrait>(
     Err(AppError::Database(
         "quota reservation exhausted retrying a concurrent SQLite write".to_owned(),
     ))
-}
-
-pub(in crate::store::pinning) async fn reserve_runtime_unique(
-    tx: &crate::store::RuntimeTransaction,
-    provider: &str,
-    cid: &str,
-    cid_size: i64,
-    limits: &ProviderLimitMap,
-    now: DateTimeUtc,
-    work: DecodeWork<'_>,
-) -> AppResult<ReservationOutcome> {
-    reserve_unique_for_intent_with_work(
-        tx.db(),
-        (provider, cid, cid_size),
-        limits,
-        now,
-        ReservationIntent::Admission(None),
-        work,
-        Some(tx),
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(in crate::store::pinning) async fn reserve_runtime_unique_with_route(
-    tx: &crate::store::RuntimeTransaction,
-    provider: &str,
-    cid: &str,
-    cid_size: i64,
-    limits: &ProviderLimitMap,
-    now: DateTimeUtc,
-    work: DecodeWork<'_>,
-    original_route: &crate::pinning::identity::ProviderRouteSnapshot,
-) -> AppResult<ReservationOutcome> {
-    reserve_unique_for_intent_with_work(
-        tx.db(),
-        (provider, cid, cid_size),
-        limits,
-        now,
-        ReservationIntent::Admission(Some(original_route)),
-        work,
-        Some(tx),
-    )
-    .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -593,8 +570,8 @@ pub(in crate::store::pinning) async fn reserve_runtime_waiter(
     limits: &ProviderLimitMap,
     now: DateTimeUtc,
     work: DecodeWork<'_>,
-) -> AppResult<ReservationOutcome> {
-    reserve_unique_for_intent_with_work(
+) -> AppResult<Option<ReservationOutcome>> {
+    reserve_intent_with_work(
         tx.db(),
         (provider, cid, cid_size),
         limits,
@@ -733,8 +710,9 @@ async fn confirmed_release_inner<C: ConnectionTrait>(
     );
     // A confirmed removal settles its own cleanup marker, not unknown submissions.
     let confirmed_delete = matches!(request_guard, RequestIdentityGuard::Exact(Some(_)));
-    if super::ledger::submission::admission_barriers_with_catalog(
+    if super::ledger::submission::resource_admission_barriers_with_catalog(
         provider,
+        &[cid],
         catalog,
         &work,
         !confirmed_delete,
@@ -954,17 +932,39 @@ async fn confirmed_release_inner<C: ConnectionTrait>(
     Ok(ConfirmedReleaseOutcome::Released)
 }
 
-/// Reserves and projects provider waiters in FIFO order without exceeding local limits.
-///
-/// Callers couple this to a confirmed release in their own transaction. A periodic worker scan
-/// invokes the same API to recover a crash after release but before wake.
-pub async fn wake_provider_waiters<C: ConnectionTrait>(
+/// Reserves and projects provider waiters after discovery, independently of the release transaction.
+/// `db` must open a new transaction rather than nest inside a caller's write transaction.
+pub async fn wake_provider_waiters<C: ConnectionTrait + sea_orm::TransactionTrait>(
     db: &C,
     provider: &str,
     limits: &ProviderLimits,
     now: DateTimeUtc,
 ) -> AppResult<Vec<String>> {
-    leases::wake_quota_waiting_targets(db, provider, limits, now).await
+    let budget = SharedDecodeBudget::default();
+    let work = DecodeWork::shared(&budget);
+    let catalog = super::legacy_migration::ReceiptCatalog::full(db);
+    let candidates =
+        leases::discover_quota_wake_candidates(provider, limits, now, catalog, work).await?;
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+    let tx = db.begin().await?;
+    match leases::apply_quota_wake_candidates(&tx, provider, limits, now, candidates, None, None)
+        .await
+    {
+        Ok(WaiterWakeOutcome::Woken(woken)) => {
+            tx.commit().await?;
+            Ok(woken)
+        }
+        Ok(WaiterWakeOutcome::Invalid(_)) => {
+            tx.rollback().await?;
+            Err(invalid_quota("quota waiter is not eligible"))
+        }
+        Err(error) => {
+            tx.rollback().await?;
+            Err(error)
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -974,14 +974,56 @@ pub(crate) enum WaiterWakeOutcome {
 }
 
 pub(crate) async fn wake_runtime_provider_waiters(
-    tx: &crate::store::RuntimeTransaction,
+    store: &crate::store::Store,
     provider: &str,
     limits: &ProviderLimits,
     now: DateTimeUtc,
     work: DecodeWork<'_>,
     policy: Option<&crate::pinning::policy::PinPolicyEvaluator>,
 ) -> AppResult<WaiterWakeOutcome> {
-    leases::wake_runtime_quota_waiting_targets(tx, provider, limits, now, work, policy).await
+    let candidates =
+        discover_runtime_quota_wake_candidates(store, provider, limits, now, work).await?;
+    if candidates.is_empty() {
+        return Ok(WaiterWakeOutcome::Woken(Vec::new()));
+    }
+
+    let tx = store.begin_runtime(work).await?;
+    let result = leases::apply_quota_wake_candidates(
+        tx.db(),
+        provider,
+        limits,
+        now,
+        candidates,
+        Some((&tx, work)),
+        policy,
+    )
+    .await
+    .and_then(|outcome| {
+        work.with(|session| session.check())
+            .map_err(admission::work_error)?;
+        Ok(outcome)
+    });
+    if matches!(&result, Ok(WaiterWakeOutcome::Woken(_))) {
+        tx.commit().await?;
+    } else {
+        tx.rollback().await?;
+    }
+    result
+}
+
+async fn discover_runtime_quota_wake_candidates(
+    store: &crate::store::Store,
+    provider: &str,
+    limits: &ProviderLimits,
+    now: DateTimeUtc,
+    work: DecodeWork<'_>,
+) -> AppResult<Vec<QuotaWaiterCandidate>> {
+    let read = store.begin_runtime(work).await?;
+    let candidates =
+        leases::discover_quota_wake_candidates(provider, limits, now, read.catalog(work), work)
+            .await;
+    read.rollback().await?;
+    candidates
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1074,37 +1116,10 @@ pub(crate) async fn evict_for_provider_waiter(
     limits: &ProviderLimits,
     now: DateTimeUtc,
 ) -> AppResult<Vec<leases::QuotaEvictedTarget>> {
-    evict_for_required_headroom(db, provider, EvictionRequest::Waiter, limits, now, None).await
-}
-
-pub(crate) async fn evict_runtime_provider_waiter(
-    tx: &crate::store::RuntimeTransaction,
-    provider: &str,
-    limits: &ProviderLimits,
-    now: DateTimeUtc,
-) -> AppResult<Vec<leases::QuotaEvictedTarget>> {
-    evict_for_required_headroom(
-        tx.db(),
-        provider,
-        EvictionRequest::Waiter,
-        limits,
-        now,
-        Some(tx),
-    )
-    .await
-}
-
-/// Applies one bounded provider-quota response eviction while protecting the errored CID.
-///
-/// The caller must fence the exact running Submit claim as the first operation in `db`. This
-/// function then validates the target generation and reserved request-less remote under the same
-/// transaction before any unrelated reservation is marked for eviction.
-#[derive(Clone, Copy)]
-pub(crate) struct ProviderQuotaWork<'a> {
-    pub cid: &'a str,
-    pub lease_id: &'a str,
-    pub target_id: &'a str,
-    pub expected_generation: i64,
+    let Some(snapshot) = discover_waiter_eviction(db, provider, limits, now).await? else {
+        return Ok(Vec::new());
+    };
+    apply_eviction(db, &snapshot, now, None).await
 }
 
 #[cfg(test)]
@@ -1115,33 +1130,11 @@ pub(crate) async fn evict_for_provider_quota(
     limits: &ProviderLimits,
     now: DateTimeUtc,
 ) -> AppResult<Vec<leases::QuotaEvictedTarget>> {
-    evict_for_required_headroom(
-        db,
-        provider,
-        EvictionRequest::ProviderQuota(work),
-        limits,
-        now,
-        None,
-    )
-    .await
-}
-
-pub(crate) async fn evict_runtime_provider_quota(
-    tx: &crate::store::RuntimeTransaction,
-    provider: &str,
-    work: ProviderQuotaWork<'_>,
-    limits: &ProviderLimits,
-    now: DateTimeUtc,
-) -> AppResult<Vec<leases::QuotaEvictedTarget>> {
-    evict_for_required_headroom(
-        tx.db(),
-        provider,
-        EvictionRequest::ProviderQuota(work),
-        limits,
-        now,
-        Some(tx),
-    )
-    .await
+    let Some(snapshot) = discover_provider_quota_eviction(db, provider, work, limits, now).await?
+    else {
+        return Ok(Vec::new());
+    };
+    apply_eviction(db, &snapshot, now, None).await
 }
 
 enum ReserveAttempt {
@@ -1240,12 +1233,17 @@ async fn reserve_unique_attempt_with_work<C: ConnectionTrait>(
         }
         None
     };
-    let barrier =
-        super::ledger::submission::admission_barriers_with_catalog(provider, catalog, &work, true)
-            .await?
-            .get(cid)
-            .copied()
-            .unwrap_or_default();
+    let barrier = super::ledger::submission::resource_admission_barriers_with_catalog(
+        provider,
+        &[cid],
+        catalog,
+        &work,
+        true,
+    )
+    .await?
+    .get(cid)
+    .copied()
+    .unwrap_or_default();
     match barrier {
         super::ledger::submission::AdmissionBarrier::Temporary => {
             return Ok(ReserveAttempt::Outcome(ReservationOutcome::QuotaWaiting {
@@ -1995,18 +1993,23 @@ async fn eviction_candidates<C: ConnectionTrait>(
     limits: &ProviderLimits,
 ) -> AppResult<Vec<(String, String)>> {
     record_order_event("eviction_candidates");
-    let barriers = super::ledger::submission::admission_barriers_with_catalog(
-        provider,
-        super::legacy_migration::ReceiptCatalog::full(db),
-        &(),
-        true,
-    )
-    .await?;
     let remotes = remote_pin::Entity::find()
         .filter(remote_pin::Column::Provider.eq(provider))
         .filter(remote_pin::Column::Status.is_in(capacity_holding_statuses()))
         .all(db)
         .await?;
+    let cids = remotes
+        .iter()
+        .map(|remote| remote.cid.as_str())
+        .collect::<Vec<_>>();
+    let barriers = super::ledger::submission::resource_admission_barriers_with_catalog(
+        provider,
+        &cids,
+        super::legacy_migration::ReceiptCatalog::full(db),
+        &(),
+        true,
+    )
+    .await?;
     let mut candidates = Vec::with_capacity(remotes.len());
     for remote in remotes {
         // A request-less reservation with no submit debt can be cancelled locally.
@@ -2036,305 +2039,6 @@ async fn eviction_candidates<C: ConnectionTrait>(
         limits,
         candidates,
     )
-}
-
-#[derive(Clone, Copy)]
-enum EvictionRequest<'a> {
-    Waiter,
-    ProviderQuota(ProviderQuotaWork<'a>),
-}
-
-struct EvictionSnapshot {
-    selected: Vec<(String, String)>,
-    potential_pairs: Vec<(String, String)>,
-    waiter_owner_ids: Vec<String>,
-}
-
-/// Evicts only after locking and revalidating every lifecycle row that can affect selection.
-///
-/// The caller owns the transaction. The first snapshot discovers the complete potential
-/// frontier; lifecycle rows then lock before their remotes, and provider usage locks after every
-/// remote. A second snapshot under those locks is the sole source of the destructive selection.
-async fn evict_for_required_headroom(
-    db: &DatabaseTransaction,
-    provider: &str,
-    request: EvictionRequest<'_>,
-    limits: &ProviderLimits,
-    now: DateTimeUtc,
-    runtime: Option<&crate::store::RuntimeTransaction>,
-) -> AppResult<Vec<leases::QuotaEvictedTarget>> {
-    let initial = eviction_snapshot(db, provider, request, limits, now).await?;
-    if initial.selected.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    leases::lock_publication_lifecycle_frontier(
-        db,
-        &initial.waiter_owner_ids,
-        &initial.potential_pairs,
-    )
-    .await?;
-    lock_eviction_usage_row(db, provider).await?;
-
-    #[cfg(test)]
-    stage_eviction_drift(db, &initial.selected).await?;
-
-    let revalidated = eviction_snapshot(db, provider, request, limits, now).await?;
-    if revalidated.selected.is_empty() {
-        return Ok(Vec::new());
-    }
-    if revalidated.potential_pairs != initial.potential_pairs
-        || revalidated.waiter_owner_ids != initial.waiter_owner_ids
-    {
-        // A row outside the locked frontier appeared or disappeared. Commit no destructive work;
-        // the durable waiter scan or the next exact provider response will build a fresh frontier.
-        return Ok(Vec::new());
-    }
-    leases::evict_provider_cids_core(db, &revalidated.selected, now, runtime).await
-}
-
-/// Builds a deterministic eviction decision without mutating state.
-///
-/// The first call determines which complete lifecycle frontier must lock. The second runs after
-/// that frontier and its provider usage row are locked, so it observes the only snapshot allowed
-/// to drive eviction.
-async fn eviction_snapshot<C: ConnectionTrait>(
-    db: &C,
-    provider: &str,
-    request: EvictionRequest<'_>,
-    limits: &ProviderLimits,
-    now: DateTimeUtc,
-) -> AppResult<EvictionSnapshot> {
-    let barriers = super::ledger::submission::admission_barriers_with_catalog(
-        provider,
-        super::legacy_migration::ReceiptCatalog::full(db),
-        &(),
-        true,
-    )
-    .await?;
-    let (cid_size, excluded_cid, waiter_owner_ids) = match request {
-        EvictionRequest::Waiter => {
-            let waiting = active_quota_waiters(db, provider, now).await?;
-            let Some((target, _)) = waiting
-                .iter()
-                .find(|(target, _)| !barriers.contains_key(&target.cid))
-            else {
-                return Ok(EvictionSnapshot {
-                    selected: Vec::new(),
-                    potential_pairs: Vec::new(),
-                    waiter_owner_ids: Vec::new(),
-                });
-            };
-            if target.last_touched_at > target.created_at {
-                // A previously evicted all-mode target may reuse genuine headroom after its
-                // cooldown, but it never evicts the CID that just replaced it.
-                return Ok(EvictionSnapshot {
-                    selected: Vec::new(),
-                    potential_pairs: Vec::new(),
-                    waiter_owner_ids: Vec::new(),
-                });
-            }
-            (
-                target.logical_size,
-                None,
-                waiting
-                    .into_iter()
-                    .map(|(_, lease)| lease.owner_object_id)
-                    .collect::<BTreeSet<_>>()
-                    .into_iter()
-                    .collect(),
-            )
-        }
-        EvictionRequest::ProviderQuota(work) => {
-            let Some(cid_size) = current_provider_quota_work_size(db, provider, work).await? else {
-                return Ok(EvictionSnapshot {
-                    selected: Vec::new(),
-                    potential_pairs: Vec::new(),
-                    waiter_owner_ids: Vec::new(),
-                });
-            };
-            (cid_size, Some(work.cid), Vec::new())
-        }
-    };
-    if cid_size < 0 {
-        return Err(invalid_quota("CID size cannot be negative"));
-    }
-    if cid_size > limits.max_bytes {
-        return Ok(EvictionSnapshot {
-            selected: Vec::new(),
-            potential_pairs: Vec::new(),
-            waiter_owner_ids: Vec::new(),
-        });
-    }
-    let Some(usage) = read_usage(db, provider).await? else {
-        return Ok(EvictionSnapshot {
-            selected: Vec::new(),
-            potential_pairs: Vec::new(),
-            waiter_owner_ids: Vec::new(),
-        });
-    };
-    let mut projected = ProviderUsage {
-        reserved_bytes: usage.reserved_bytes,
-        reserved_pins: usage.reserved_pins,
-    };
-    let remotes = remote_pin::Entity::find()
-        .filter(remote_pin::Column::Provider.eq(provider))
-        .filter(remote_pin::Column::Status.is_in(capacity_holding_statuses()))
-        .order_by_asc(remote_pin::Column::Cid)
-        .all(db)
-        .await?;
-    let potential_pairs = remotes
-        .iter()
-        .map(|remote| (remote.provider.clone(), remote.cid.clone()))
-        .collect();
-    let mut candidates = Vec::with_capacity(remotes.len());
-    for remote in remotes {
-        if barriers.contains_key(&remote.cid) {
-            continue; // Unconfirmed capacity is neither evictable nor projected headroom.
-        }
-        match newest_active_target_touch(db, provider, &remote.cid).await? {
-            Some(last_active_touch) if excluded_cid != Some(remote.cid.as_str()) => {
-                candidates.push(EvictionCandidate {
-                    provider: provider.to_owned(),
-                    cid: remote.cid,
-                    cid_size: remote.cid_size,
-                    last_active_touch,
-                });
-            }
-            Some(_) => {}
-            None => {
-                projected.reserved_bytes = projected
-                    .reserved_bytes
-                    .checked_sub(remote.cid_size)
-                    .ok_or_else(|| invalid_quota("projected byte accounting underflow"))?;
-                projected.reserved_pins = projected
-                    .reserved_pins
-                    .checked_sub(1)
-                    .ok_or_else(|| invalid_quota("projected pin accounting underflow"))?;
-                if projected.reserved_bytes < 0 || projected.reserved_pins < 0 {
-                    return Err(invalid_quota("projected provider usage cannot be negative"));
-                }
-            }
-        }
-    }
-    Ok(EvictionSnapshot {
-        selected: select_eviction_candidates(projected, cid_size, limits, candidates)?,
-        potential_pairs,
-        waiter_owner_ids,
-    })
-}
-
-/// Revalidates that a provider quota response belongs to live capacity-acquisition work.
-async fn current_provider_quota_work_size<C: ConnectionTrait>(
-    db: &C,
-    provider: &str,
-    work: ProviderQuotaWork<'_>,
-) -> AppResult<Option<i64>> {
-    let Some(target) = pin_lease_target::Entity::find_by_id(work.target_id.to_owned())
-        .one(db)
-        .await?
-    else {
-        return Ok(None);
-    };
-    if target.lease_id != work.lease_id
-        || target.provider != provider
-        || target.cid != work.cid
-        || !ACTIVE_TARGET_STATES.contains(&target.state.as_str())
-    {
-        return Ok(None);
-    }
-    let Some(lease) = pin_lease::Entity::find_by_id(work.lease_id.to_owned())
-        .one(db)
-        .await?
-    else {
-        return Ok(None);
-    };
-    if lease.state != ACTIVE_LEASE_STATE || lease.generation != work.expected_generation {
-        return Ok(None);
-    }
-    let Some(remote) = remote_pin::Entity::find_by_id((provider.to_owned(), work.cid.to_owned()))
-        .one(db)
-        .await?
-    else {
-        return Ok(None);
-    };
-    if remote.status != REMOTE_STATUS_RESERVED || remote.request_id.is_some() {
-        return Ok(None);
-    }
-    Ok(Some(remote.cid_size))
-}
-
-/// Returns the exact FIFO waiters whose owning lease remains active.
-async fn active_quota_waiters<C: ConnectionTrait>(
-    db: &C,
-    provider: &str,
-    now: DateTimeUtc,
-) -> AppResult<Vec<(pin_lease_target::Model, pin_lease::Model)>> {
-    let waiting = pin_lease_target::Entity::find()
-        .filter(pin_lease_target::Column::Provider.eq(provider))
-        .filter(pin_lease_target::Column::State.eq(TARGET_QUOTA_WAITING))
-        .filter(pin_lease_target::Column::LastTouchedAt.lte(now))
-        .order_by_asc(pin_lease_target::Column::CreatedAt)
-        .order_by_asc(pin_lease_target::Column::Id)
-        .all(db)
-        .await?;
-    let mut active = Vec::with_capacity(waiting.len());
-    for target in waiting {
-        let Some(lease) = pin_lease::Entity::find_by_id(target.lease_id.clone())
-            .one(db)
-            .await?
-        else {
-            continue;
-        };
-        if lease.state == ACTIVE_LEASE_STATE {
-            active.push((target, lease));
-        }
-    }
-    Ok(active)
-}
-
-/// Locks provider accounting after the lifecycle remote frontier.
-async fn lock_eviction_usage_row<C: ConnectionTrait>(db: &C, provider: &str) -> AppResult<()> {
-    let usage = read_usage(db, provider).await?.ok_or_else(|| {
-        AppError::Internal(format!(
-            "provider usage row disappeared during eviction prelock: {provider}"
-        ))
-    })?;
-    if db.get_database_backend() == DatabaseBackend::Postgres {
-        pin_provider_usage::Entity::find_by_id(provider.to_owned())
-            .lock_exclusive()
-            .one(db)
-            .await?
-            .ok_or_else(|| {
-                AppError::Internal(format!(
-                    "provider usage row disappeared during eviction prelock: {provider}"
-                ))
-            })?;
-        return Ok(());
-    }
-
-    // SQLite has no row-level `FOR UPDATE`; this exact no-op CAS takes its serialized write
-    // guard while preserving the same lifecycle → remote → usage order as PostgreSQL.
-    let locked = pin_provider_usage::Entity::update_many()
-        .col_expr(
-            pin_provider_usage::Column::ReservedBytes,
-            Expr::value(usage.reserved_bytes),
-        )
-        .col_expr(
-            pin_provider_usage::Column::ReservedPins,
-            Expr::value(usage.reserved_pins),
-        )
-        .filter(pin_provider_usage::Column::Provider.eq(provider))
-        .filter(pin_provider_usage::Column::ReservedBytes.eq(usage.reserved_bytes))
-        .filter(pin_provider_usage::Column::ReservedPins.eq(usage.reserved_pins))
-        .exec(db)
-        .await?;
-    if locked.rows_affected != 1 {
-        return Err(AppError::Internal(
-            "provider usage changed during eviction prelock".to_owned(),
-        ));
-    }
-    Ok(())
 }
 
 async fn newest_active_target_touch<C: ConnectionTrait>(
@@ -2992,15 +2696,13 @@ mod tests {
         );
         assert_eq!(
             outcome,
-            ReservationOutcome::QuotaWaiting { evict: Vec::new() }
+            Some(ReservationOutcome::QuotaWaiting { evict: Vec::new() })
         );
 
         order_events::clear();
-        let txn = db.begin().await.unwrap();
-        let woken = wake_provider_waiters(&txn, "pinata", &limits["pinata"], time(5))
+        let woken = wake_provider_waiters(&db, "pinata", &limits["pinata"], time(5))
             .await
             .unwrap();
-        txn.commit().await.unwrap();
         assert!(
             woken.is_empty(),
             "a reusable tail must not bypass the FIFO head"
@@ -3066,12 +2768,10 @@ mod tests {
 
         let mut all_woken = Vec::new();
         for expected_batch in [&expected[..4], &expected[4..]] {
-            let txn = db.begin().await.unwrap();
-            let woken = wake_provider_waiters(&txn, "pinata", &limits["pinata"], time(10))
+            let woken = wake_provider_waiters(&db, "pinata", &limits["pinata"], time(10))
                 .await
                 .unwrap();
             assert_eq!(woken, expected_batch);
-            txn.commit().await.unwrap();
             all_woken.extend(woken);
             assert_eq!(
                 usage(&db).await,
@@ -3102,14 +2802,12 @@ mod tests {
             }
         }
         assert_eq!(all_woken, expected);
-        let txn = db.begin().await.unwrap();
         assert!(
-            wake_provider_waiters(&txn, "pinata", &limits["pinata"], time(10))
+            wake_provider_waiters(&db, "pinata", &limits["pinata"], time(10))
                 .await
                 .unwrap()
                 .is_empty()
         );
-        txn.commit().await.unwrap();
         assert_eq!(usage(&db).await, (6, 6));
         assert_eq!(remote_pin::Entity::find().count(&db).await.unwrap(), 6);
         for target_id in ["inactive", "cooldown"] {
@@ -3190,9 +2888,11 @@ mod tests {
             .unwrap(),
             RemoteDeleteCompletion::Released
         );
-        let woken = wake_provider_waiters(&txn, "pinata", &limits["pinata"], time(5))
+        txn.commit().await.unwrap();
+        let woken = wake_provider_waiters(&db, "pinata", &limits["pinata"], time(5))
             .await
             .unwrap();
+        let txn = db.begin().await.unwrap();
         let retried = leases::requeue_released_all_quota_targets(
             &txn,
             "pinata",
@@ -3522,7 +3222,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn candidate_touch_after_selection_recomputes_the_oldest_locked_prefix() {
+    async fn candidate_touch_after_selection_defers_eviction_until_next_discovery() {
         let _gate = EVICTION_DRIFT_TEST_LOCK.lock().await;
         let db = setup().await;
         let limits = limits(100, 3);
@@ -3557,6 +3257,12 @@ mod tests {
             .unwrap();
         txn.commit().await.unwrap();
 
+        assert!(evicted.is_empty());
+        let txn = db.begin().await.unwrap();
+        let evicted = evict_for_provider_waiter(&txn, "pinata", &limits["pinata"], time(12))
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
         assert_eq!(
             evicted
                 .iter()
@@ -3765,18 +3471,8 @@ mod tests {
         let wake = |db: DatabaseConnection, barrier: Arc<Barrier>| {
             let provider_limits = provider_limits.clone();
             async move {
-                let txn = db.begin().await.unwrap();
                 barrier.wait().await;
-                match wake_provider_waiters(&txn, "pinata", &provider_limits, time(3)).await {
-                    Ok(woken) => {
-                        txn.commit().await.unwrap();
-                        Ok(woken)
-                    }
-                    Err(error) => {
-                        txn.rollback().await.unwrap();
-                        Err(error)
-                    }
-                }
+                wake_provider_waiters(&db, "pinata", &provider_limits, time(3)).await
             }
         };
         let (first, second) =
@@ -3859,45 +3555,37 @@ mod tests {
         seed_quota_waiter(&db, "bafy-release-wake-b", "release-wake-b", 60, time(4)).await;
         let barrier = Arc::new(Barrier::new(2));
 
-        let release_and_wake =
-            |db: DatabaseConnection, cid: &'static str, barrier: Arc<Barrier>| {
-                let provider_limits = provider_limits.clone();
-                async move {
-                    for attempt in 0..8 {
-                        let txn = db.begin().await.unwrap();
-                        if attempt == 0 {
-                            barrier.wait().await;
+        let release_and_wake = |db: DatabaseConnection,
+                                cid: &'static str,
+                                barrier: Arc<Barrier>| {
+            let provider_limits = provider_limits.clone();
+            async move {
+                for attempt in 0..8 {
+                    let txn = db.begin().await.unwrap();
+                    if attempt == 0 {
+                        barrier.wait().await;
+                    }
+                    match leases::complete_remote_delete(&txn, "pinata", cid, 1, time(5)).await {
+                        Ok(release) => {
+                            assert_eq!(release, RemoteDeleteCompletion::Released);
+                            txn.commit().await.unwrap();
+                            return wake_provider_waiters(&db, "pinata", &provider_limits, time(5))
+                                .await
+                                .unwrap();
                         }
-                        let result = async {
-                            assert_eq!(
-                                leases::complete_remote_delete(&txn, "pinata", cid, 1, time(5),)
-                                    .await?,
-                                RemoteDeleteCompletion::Released
-                            );
-                            let woken =
-                                wake_provider_waiters(&txn, "pinata", &provider_limits, time(5))
-                                    .await?;
-                            Ok::<_, crate::error::AppError>(woken)
+                        Err(error) if super::is_sqlite_contention(&error.to_string()) => {
+                            txn.rollback().await.unwrap();
+                            super::retry_delay(attempt).await;
                         }
-                        .await;
-                        match result {
-                            Ok(woken) => {
-                                txn.commit().await.unwrap();
-                                return woken;
-                            }
-                            Err(error) if super::is_sqlite_contention(&error.to_string()) => {
-                                txn.rollback().await.unwrap();
-                                super::retry_delay(attempt).await;
-                            }
-                            Err(error) => {
-                                txn.rollback().await.unwrap();
-                                panic!("release+wake failed: {error}");
-                            }
+                        Err(error) => {
+                            txn.rollback().await.unwrap();
+                            panic!("release+wake failed: {error}");
                         }
                     }
-                    panic!("release+wake exhausted SQLite retries")
                 }
-            };
+                panic!("release+wake exhausted SQLite retries")
+            }
+        };
         let (first, second) = tokio::join!(
             release_and_wake(db.clone(), "bafy-release-a", barrier.clone()),
             release_and_wake(db.clone(), "bafy-release-b", barrier),
@@ -3943,13 +3631,13 @@ mod tests {
                 .unwrap(),
             RemoteDeleteCompletion::Released
         );
+        txn.commit().await.unwrap();
         assert!(
-            wake_provider_waiters(&txn, "pinata", &provider_limits, time(6))
+            wake_provider_waiters(&db, "pinata", &provider_limits, time(6))
                 .await
                 .unwrap()
                 .is_empty()
         );
-        txn.commit().await.unwrap();
         assert_eq!(usage(&db).await, (60, 1));
     }
 

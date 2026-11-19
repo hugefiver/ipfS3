@@ -1122,16 +1122,17 @@ async fn park_submit_in_transaction(
     let history = submission_history(db, &claimed.model.id).await?;
     let receipt = super::ledger::submission::latest(db, &claimed.model.id).await?;
     let recoverable = receipt.as_ref().is_some_and(|receipt| {
-        super::ledger::submission::unknown_recovery_request(receipt).is_some()
+        (claimed.reclaimed && receipt.outcome == "in_flight" && receipt.observed_at.is_none())
+            || super::ledger::submission::unknown_recovery_request(receipt).is_some()
             || super::ledger::submission::matching_request(receipt).is_some()
     });
-    let bounded_unknown = safe_error == RPC_RECOVERY_PARK_REASON
+    let bounded_recovery = safe_error == RPC_RECOVERY_PARK_REASON
         && recoverable
         && history.as_ref().is_some_and(|history| {
             history.recovery_queries < MAX_SUBMIT_RECOVERY_ATTEMPTS
                 && now.signed_duration_since(history.started_at) < ChronoDuration::hours(1)
         });
-    if !bounded_unknown {
+    if !bounded_recovery {
         if !terminate_claim(db, claimed, safe_error, now).await? {
             return Err(stale_claim_error(&claimed.model.id));
         }
@@ -3437,12 +3438,12 @@ pub async fn complete_job<C: ConnectionTrait>(
         .one(db)
         .await?
         .ok_or_else(|| stale_claim_error(job_id))?;
-    let submit_phase = if job.operation == PinJobOperation::Submit.persisted() {
+    let reset_submit = if job.operation == PinJobOperation::Submit.persisted() {
         let remote = remote_pin::Entity::find_by_id((job.provider.clone(), job.cid.clone()))
             .one(db)
             .await?;
         if remote.and_then(|row| row.request_id).is_none() {
-            Some(SubmitPhase::Ready.persisted())
+            true
         } else {
             history::Entity::update_many()
                 .col_expr(history::Column::Effect, Expr::value("created"))
@@ -3450,18 +3451,70 @@ pub async fn complete_job<C: ConnectionTrait>(
                 .filter(history::Column::JobId.eq(&job.id))
                 .exec(db)
                 .await?;
-            job.submit_phase.as_deref()
+            false
         }
     } else {
-        None
+        false
     };
-    let result = pin_job::Entity::update_many()
+    write_job_done(db, job_id, expected_locked_until, now, reset_submit).await
+}
+
+/// Projection commits before one-mode coordination, which can advance the original lease generation.
+/// A reclaim can finish that handoff without projecting the old response into the new generation.
+pub(crate) async fn submit_projection_committed<C: ConnectionTrait>(
+    db: &C,
+    job: &pin_job::Model,
+) -> AppResult<bool> {
+    Ok(db
+        .query_one(sea_orm::Statement::from_sql_and_values(
+            db.get_database_backend(),
+            "SELECT 1 FROM pin_submit_history h JOIN pin_submit_observations o \
+         ON o.job_id=h.job_id AND o.submit_call=h.submit_calls \
+         WHERE h.job_id=$1 AND h.state='settled' AND h.effect='created' \
+         AND o.expected_cid=$2 AND o.outcome IN ('matched','accepted') \
+         AND o.observed_at IS NOT NULL AND NOT o.needs_attention",
+            [job.id.as_str().into(), job.cid.as_str().into()],
+        ))
+        .await?
+        .is_some())
+}
+
+/// A settled Submit retains its recorded call phase. Only its exact worker claim is released.
+pub(crate) async fn complete_settled_submit<C: ConnectionTrait>(
+    db: &C,
+    claimed: &ClaimedPinJob,
+    now: DateTimeUtc,
+) -> AppResult<()> {
+    write_job_done(
+        db,
+        &claimed.model.id,
+        claimed_lock(&claimed.model)?,
+        now,
+        false,
+    )
+    .await
+}
+
+async fn write_job_done<C: ConnectionTrait>(
+    db: &C,
+    job_id: &str,
+    expected_locked_until: DateTimeUtc,
+    now: DateTimeUtc,
+    reset_submit: bool,
+) -> AppResult<()> {
+    let mut update = pin_job::Entity::update_many();
+    if reset_submit {
+        update = update.col_expr(
+            pin_job::Column::SubmitPhase,
+            Expr::value(SubmitPhase::Ready.persisted()),
+        );
+    }
+    let result = update
         .col_expr(pin_job::Column::State, Expr::value(STATE_DONE))
         .col_expr(
             pin_job::Column::LockedUntil,
             Expr::value(Option::<DateTimeUtc>::None),
         )
-        .col_expr(pin_job::Column::SubmitPhase, Expr::value(submit_phase))
         .col_expr(pin_job::Column::UpdatedAt, Expr::value(now))
         .filter(pin_job::Column::Id.eq(job_id))
         .filter(pin_job::Column::State.eq(STATE_RUNNING))
@@ -3483,9 +3536,6 @@ pub(crate) async fn finish_nonprojecting_job<C: ConnectionTrait>(
     now: DateTimeUtc,
 ) -> AppResult<()> {
     let until = claimed_lock(&claimed.model)?;
-    if !fence_job_claim(db, &claimed.model.id, until).await? {
-        return Ok(());
-    }
     pin_job::Entity::update_many()
         .col_expr(
             pin_job::Column::State,
@@ -3498,7 +3548,7 @@ pub(crate) async fn finish_nonprojecting_job<C: ConnectionTrait>(
         .col_expr(
             pin_job::Column::LastError,
             Expr::value(if attention {
-                Some("management observation needs_attention")
+                Some("observation needs_attention")
             } else {
                 None
             }),

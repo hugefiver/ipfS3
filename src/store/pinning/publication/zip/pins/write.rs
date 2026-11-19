@@ -283,23 +283,21 @@ impl PinWriteSet {
         {
             return Err(invalid());
         }
-        // Only admitted desired targets require a clear provider barrier. Existing
-        // blocked targets and owner cancellation may legitimately retain debt.
-        let admitted = self
-            .affected
-            .iter()
-            .map(|(provider, _)| provider)
-            .collect::<BTreeSet<_>>();
-        for provider in admitted {
-            if crate::store::pinning::ledger::submission::admission_barriers_with_catalog(
+        // Blocked targets and owner cancellation may legitimately retain debt.
+        let mut admitted: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+        for (provider, cid) in &self.affected {
+            admitted.entry(provider).or_default().push(cid);
+        }
+        for (provider, cids) in admitted {
+            if !crate::store::pinning::ledger::submission::resource_admission_barriers_with_catalog(
                 provider,
+                &cids,
                 reservations.catalog(work),
                 &work,
                 true,
             )
             .await?
-            .into_keys()
-            .any(|cid| self.affected.contains(&(provider.clone(), cid)))
+            .is_empty()
             {
                 return Err(invalid());
             }
