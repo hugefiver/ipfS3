@@ -4,7 +4,7 @@ use sea_orm::{ConnectionTrait, DatabaseTransaction, Value};
 
 use crate::pinning::config::ProviderLimitMap;
 
-use super::{AppResult, stmt};
+use super::{AppResult, OCCUPIED, stmt};
 
 // Resource reads bind two chunks at once and must fit SQLite's 999-bind limit.
 const IN_CHUNK: usize = 450;
@@ -56,10 +56,9 @@ impl Placement {
             let row = tx
                 .query_one(stmt(
                     tx,
-                    "SELECT COUNT(*) AS pins, CAST(COALESCE(SUM(logical_size),0) AS BIGINT) AS bytes
+                    &format!("SELECT COUNT(*) AS pins, CAST(COALESCE(SUM(logical_size),0) AS BIGINT) AS bytes
                      FROM pin_resources WHERE provider=$1 AND status!='cleaned' AND (
-                         status IN ('accepted','pending','unknown') OR handle IS NOT NULL OR
-                         (status='waiting' AND logical_size<=$2))",
+                         {OCCUPIED} OR (status='waiting' AND logical_size<=$2))"),
                     vec![provider.as_str().into(), max_bytes.into()],
                 ))
                 .await?

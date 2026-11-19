@@ -1360,6 +1360,9 @@ pub async fn finalize_completed_multipart_zip_batch(
     {
         return Err(s3s::s3_error!(InternalError, "completion attempt mismatch"));
     }
+    let has_pin_intent = request
+        .capture
+        .may_create_pin_refs(!request.successes.is_empty());
     let work = async {
         Ok::<_, s3s::S3Error>(
             crate::store::pinning::publication::publish_captured_zip(
@@ -1379,7 +1382,7 @@ pub async fn finalize_completed_multipart_zip_batch(
     if let Some(lease) = &completed.mutation_lease {
         lease.finish().await;
     }
-    match commit? {
+    let result = match commit? {
         Ok(results) => results
             .into_iter()
             .find(|(_, result)| result.object_id == completed.completion_attempt_id)
@@ -1413,7 +1416,11 @@ pub async fn finalize_completed_multipart_zip_batch(
                 }
             }
         }
+    }?;
+    if has_pin_intent {
+        state.pinning.notify_pin_work();
     }
+    Ok(result)
 }
 
 pub(crate) async fn finalize_completed_multipart_zip_with_store<
@@ -1521,6 +1528,9 @@ pub async fn finalize_completed_multipart_archive(
         Some(lease) => lease.commit(work).await,
         None => work.await,
     };
+    if result.is_ok() && !completed.publication_policy.leases.is_empty() {
+        state.pinning.notify_pin_work();
+    }
     if let Some(lease) = &completed.mutation_lease {
         lease.finish().await;
     }

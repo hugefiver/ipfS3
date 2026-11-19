@@ -1,16 +1,11 @@
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use chrono::{TimeDelta, Utc};
-use tokio::{
-    sync::{Semaphore, watch},
-    task::{JoinHandle, JoinSet},
-    time::{Instant, sleep_until},
-};
+use tokio::{task::JoinHandle, time::Instant};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
     pinning::{
-        config::ProviderLimits,
         coordinator::PinningCoordinator,
         provider::{
             PinningProvider, ProviderError, ProviderErrorClass, RemotePinStatus, SubmitPin,
@@ -21,6 +16,9 @@ use crate::{
         pinning::resources::{self, Action, Claim, Outcome},
     },
 };
+
+#[path = "worker_dispatch.rs"]
+mod dispatch;
 
 #[cfg(test)]
 #[path = "worker_tests.rs"]
@@ -51,32 +49,39 @@ pub(crate) fn start(
     let stop = cancellation.clone();
     let join = tokio::spawn(async move {
         let config = coordinator.effective_config();
-        let slots = Arc::new(Semaphore::new(config.worker_concurrency));
         let interval = Duration::from_secs(config.worker_interval.as_seconds());
-        let mut tasks = JoinSet::new();
-        for (name, limits) in coordinator.provider_limits() {
-            tasks.spawn(run_provider(
+        let lanes = coordinator
+            .provider_limits()
+            .keys()
+            .map(|name| {
+                dispatch::Lane::new(
+                    coordinator.provider(name).unwrap(),
+                    coordinator.request_interval(name),
+                )
+            })
+            .collect();
+        tokio::join!(
+            dispatch::run(
                 store.clone(),
-                coordinator.provider(name).unwrap(),
-                limits.clone(),
-                slots.clone(),
+                lanes,
+                coordinator.provider_limits(),
+                config.worker_concurrency,
                 interval,
-                coordinator.request_interval(name),
-                coordinator.subscribe_provider_wake(name),
-                stop.clone(),
-            ));
-        }
-        tasks.spawn(expire_references(store, interval, stop));
-        while let Some(result) = tasks.join_next().await {
-            if let Err(error) = result {
-                tracing::error!(%error, "pin worker stopped unexpectedly");
-            }
-        }
+                coordinator.subscribe_pin_work(),
+                stop.clone()
+            ),
+            expire_references(store, interval, stop, &coordinator),
+        );
     });
     PinningWorkerHandle { cancellation, join }
 }
 
-async fn expire_references(store: Store, interval: Duration, stop: CancellationToken) {
+async fn expire_references(
+    store: Store,
+    interval: Duration,
+    stop: CancellationToken,
+    coordinator: &PinningCoordinator,
+) {
     const PAGE: u32 = 128;
     loop {
         let result = tokio::select! {
@@ -85,7 +90,12 @@ async fn expire_references(store: Store, interval: Duration, stop: CancellationT
             result = resources::expire(store.db(), Utc::now(), PAGE) => result,
         };
         match result {
-            Ok(count) if count >= u64::from(PAGE) => continue,
+            Ok(count) if count > 0 => {
+                coordinator.notify_pin_work();
+                if count >= u64::from(PAGE) {
+                    continue;
+                }
+            }
             Err(error) => tracing::warn!(%error, "could not expire pin references"),
             _ => {}
         }
@@ -93,106 +103,47 @@ async fn expire_references(store: Store, interval: Duration, stop: CancellationT
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn run_provider(
-    store: Store,
-    provider: Arc<dyn PinningProvider>,
-    limits: ProviderLimits,
-    slots: Arc<Semaphore>,
-    idle: Duration,
-    min_interval: Duration,
-    mut wake: watch::Receiver<()>,
-    stop: CancellationToken,
-) {
-    let mut requests = JoinSet::new();
-    let mut next = Instant::now();
-    let mut idle_after_empty_scan = false;
-    loop {
-        tokio::select! {
-            biased;
-            _ = stop.cancelled() => break,
-            Some(result) = requests.join_next(), if !requests.is_empty() => {
-                if let Err(error) = result { tracing::error!(%error, "pin request task stopped unexpectedly"); }
-                continue;
+enum Rescan {
+    None,
+    Cleanup,
+    Provider,
+    All,
+}
+
+async fn perform(store: Store, provider: Arc<dyn PinningProvider>, claim: Claim) -> Rescan {
+    let log_timing = tracing::enabled!(tracing::Level::DEBUG);
+    tracing::debug!(name: "pin_dispatched", provider=%claim.provider, cid=%claim.cid, source_cid=%claim.source_cid, action=?claim.action, attempt=claim.attempt, "pin action dispatched");
+    let provider_started = log_timing.then(Instant::now);
+    let outcome = execute(provider.as_ref(), &claim).await;
+    let elapsed_us = provider_started.map(|start| start.elapsed().as_micros() as u64);
+    tracing::debug!(name: "pin_provider_complete", provider=%claim.provider, cid=%claim.cid, action=?claim.action, attempt=claim.attempt, elapsed_us, "pin provider action finished");
+    let settle_started = log_timing.then(Instant::now);
+    let mut cleanup = None;
+    for attempt in 0..3 {
+        match resources::settle_dispatch(store.db(), &claim, outcome.clone(), Utc::now()).await {
+            Ok(due_delete) => {
+                cleanup = Some(due_delete);
+                break;
             }
-            _ = sleep_until(next) => {}
-            Ok(()) = wake.changed(), if idle_after_empty_scan => {}
-        };
-        if slots.available_permits() == 0 {
-            tokio::select! {
-                _ = stop.cancelled() => break,
-                permit = slots.acquire() => drop(permit.unwrap()),
-            }
-        }
-        // This scan covers earlier hints; keep any hint arriving during it.
-        wake.mark_unchanged();
-        let now = Utc::now();
-        match resources::claim(
-            store.db(),
-            provider.name(),
-            &limits,
-            now,
-            now + TimeDelta::minutes(5),
-        )
-        .await
-        {
-            Ok(Some(claim)) => {
-                let slot = tokio::select! {
-                    biased;
-                    _ = stop.cancelled() => {
-                        if let Err(error) = resources::settle(store.db(), &claim, Outcome::RetryAt(Utc::now()), Utc::now()).await {
-                            tracing::error!(%error, "could not return undispatched pin action");
-                        }
-                        break;
-                    }
-                    permit = slots.clone().acquire_owned() => permit.unwrap(),
-                };
-                let store = store.clone();
-                let provider = provider.clone();
-                requests.spawn(async move {
-                    let log_timing = tracing::enabled!(tracing::Level::DEBUG);
-                    tracing::debug!(name: "pin_dispatched", provider=%claim.provider, cid=%claim.cid, source_cid=%claim.source_cid, action=?claim.action, attempt=claim.attempt, "pin action dispatched");
-                    let provider_started = log_timing.then(Instant::now);
-                    let outcome = execute(provider.as_ref(), &claim).await;
-                    let elapsed_us = provider_started.map(|start| start.elapsed().as_micros() as u64);
-                    drop(slot);
-                    tracing::debug!(name: "pin_provider_complete", provider=%claim.provider, cid=%claim.cid, action=?claim.action, attempt=claim.attempt, elapsed_us, "pin provider action finished");
-                    let settle_started = log_timing.then(Instant::now);
-                    let mut settled = false;
-                    for attempt in 0..3 {
-                        match resources::settle(store.db(), &claim, outcome.clone(), Utc::now()).await {
-                            Ok(()) => {
-                                settled = true;
-                                break;
-                            }
-                            Err(crate::error::AppError::Database(_)) if attempt < 2 => {
-                                tokio::time::sleep(Duration::from_millis(250 << attempt)).await;
-                            }
-                            Err(error) => {
-                                tracing::error!(%error, provider=%claim.provider, cid=%claim.cid, "could not save pin action result");
-                                break;
-                            }
-                        }
-                    }
-                    let elapsed_us = settle_started.map(|start| start.elapsed().as_micros() as u64);
-                    tracing::debug!(name: "pin_settle_complete", provider=%claim.provider, cid=%claim.cid, action=?claim.action, attempt=claim.attempt, elapsed_us, settled, "pin writeback finished");
-                });
-                next = Instant::now() + min_interval;
-                idle_after_empty_scan = false;
-            }
-            Ok(None) => {
-                tracing::trace!(name: "pin_worker_idle", provider = provider.name(), "pin scan found no due action");
-                next = Instant::now() + idle;
-                idle_after_empty_scan = true;
+            Err(crate::error::AppError::Database(_)) if attempt < 2 => {
+                tokio::time::sleep(Duration::from_millis(250 << attempt)).await;
             }
             Err(error) => {
-                tracing::warn!(%error, provider=provider.name(), "could not claim pin action");
-                next = Instant::now() + idle;
-                idle_after_empty_scan = false;
+                tracing::error!(%error, provider=%claim.provider, cid=%claim.cid, "could not save pin action result");
+                break;
             }
         }
     }
-    while requests.join_next().await.is_some() {}
+    let elapsed_us = settle_started.map(|start| start.elapsed().as_micros() as u64);
+    tracing::debug!(name: "pin_settle_complete", provider=%claim.provider, cid=%claim.cid, action=?claim.action, attempt=claim.attempt, elapsed_us, settled=cleanup.is_some(), "pin writeback finished");
+    match (cleanup, claim.action, outcome) {
+        (Some(true), _, _) => Rescan::Cleanup,
+        (Some(false), Action::Submit, Outcome::Failed) => Rescan::All,
+        (Some(false), _, Outcome::Deleted) | (Some(false), Action::Submit, Outcome::RetryAt(_)) => {
+            Rescan::Provider
+        }
+        _ => Rescan::None,
+    }
 }
 
 async fn execute(provider: &dyn PinningProvider, claim: &Claim) -> Outcome {

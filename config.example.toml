@@ -91,7 +91,8 @@ base_backoff_secs = 1
 max_backoff_secs = 60
 
 [pinning]
-# Override scheduling without changing provider limits or policies:
+# The interval is the idle scan delay. With queued work the dispatcher refills
+# available slots without waiting for the interval. Concurrency is per gateway.
 # IPFS_S3_PINNING_WORKER_INTERVAL (e.g. "15s")
 # IPFS_S3_PINNING_WORKER_CONCURRENCY (positive integer, e.g. "1")
 worker_interval = "5s"

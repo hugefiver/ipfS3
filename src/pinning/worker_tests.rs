@@ -3,7 +3,7 @@ use crate::pinning::ipfs_rpc::{IpfsRpcProvider, RpcProfile, RpcStrategy};
 use crate::{
     config::PinningConfig,
     pinning::{
-        config::{LeaseDuration, ProviderMode, ValidatedPinningConfig},
+        config::{LeaseDuration, ProviderLimits, ProviderMode, ValidatedPinningConfig},
         policy::{LeaseIntent, LeaseSource},
         tags::ContentMode,
     },
@@ -15,6 +15,14 @@ use wiremock::{
     Mock, MockServer, ResponseTemplate,
     matchers::{body_partial_json, method, path},
 };
+
+fn cid(seed: u8) -> String {
+    cid::Cid::new_v1(
+        0x55,
+        cid::multihash::Multihash::wrap(0x12, &[seed; 32]).unwrap(),
+    )
+    .to_string()
+}
 
 async fn wait_status(store: &Store, cid: &str, expected: &str) {
     tokio::time::timeout(Duration::from_secs(10), async {
@@ -40,6 +48,148 @@ async fn wait_status(store: &Store, cid: &str, expected: &str) {
     })
     .await
     .unwrap();
+}
+
+async fn noop_backlog(cids: &[String]) -> (Store, Arc<PinningCoordinator>) {
+    let raw: PinningConfig = toml::from_str(
+        r#"
+        worker_interval = "60s"
+        worker_concurrency = 3
+        [[providers]]
+        name = "noop"
+        kind = "noop"
+        priority = 1
+        max_bytes = 1000
+        max_pins = 10
+    "#,
+    )
+    .unwrap();
+    let coordinator =
+        PinningCoordinator::build(ValidatedPinningConfig::from_raw(&raw, |_| None).unwrap())
+            .unwrap();
+    let store = Store::open(Database::connect("sqlite::memory:").await.unwrap())
+        .await
+        .unwrap();
+    let intent = LeaseIntent {
+        source: LeaseSource::Manual,
+        provider_mode: ProviderMode::One,
+        providers: vec!["noop".into()],
+        policy_id: "one".into(),
+        content_mode: ContentMode::Object,
+        duration: LeaseDuration::parse("1h").unwrap(),
+    };
+    let rows = cids
+        .iter()
+        .map(|key| {
+            (
+                key.clone(),
+                PinTargetSpec {
+                    cid: key.clone(),
+                    logical_size: 1,
+                },
+                intent.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let tx = store.db().begin().await.unwrap();
+    resources::attach_many(&tx, &rows, coordinator.provider_limits(), Utc::now())
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+
+    (store, coordinator)
+}
+
+#[tokio::test]
+async fn ack_without_demand_wakes_cleanup_then_refills_the_freed_quota() {
+    let cids = (0..11).map(cid).collect::<Vec<_>>();
+    let (store, coordinator) = noop_backlog(&cids).await;
+    let (released, waiting) = (&cids[0], &cids[1]);
+    store.db().execute(Statement::from_sql_and_values(DatabaseBackend::Sqlite,
+        "UPDATE pin_resources SET status='accepted',action=NULL,handle=cid WHERE cid NOT IN (?,?)", [released.clone().into(), waiting.clone().into()])).await.unwrap();
+    store
+        .db()
+        .execute(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "UPDATE pin_resources SET next_at=1 WHERE cid=?",
+            [waiting.clone().into()],
+        ))
+        .await
+        .unwrap();
+    // Remove demand just after reservation, without a process-local notification.
+    store
+        .db()
+        .execute_unprepared(&format!(
+            "CREATE TRIGGER lose_demand AFTER UPDATE OF claim_token ON pin_resources
+        WHEN NEW.cid='{released}' AND NEW.action='submit' AND NEW.claim_token IS NOT NULL
+        BEGIN DELETE FROM pin_refs WHERE cid=NEW.cid; END"
+        ))
+        .await
+        .unwrap();
+    let worker = coordinator.start(store.clone(), CancellationToken::new());
+    wait_status(&store, released, "cleaned").await;
+    wait_status(&store, waiting, "accepted").await;
+    worker.shutdown(Duration::from_secs(2)).await;
+}
+
+#[tokio::test]
+async fn repeated_work_hints_do_not_starve_a_fitting_candidate_after_an_oversized_page() {
+    let last = resources::MAX_CANDIDATES as u8 + 1;
+    let cids = (0..=last).map(cid).collect::<Vec<_>>();
+    let (store, coordinator) = noop_backlog(&cids).await;
+    let fit = &cids[usize::from(last)];
+    store
+        .db()
+        .execute_unprepared("UPDATE pin_resources SET logical_size=2")
+        .await
+        .unwrap();
+    store.db().execute(Statement::from_sql_and_values(DatabaseBackend::Sqlite,
+        "UPDATE pin_resources SET logical_size=999,status='accepted',handle='resident',action=NULL WHERE cid=?", [cids[0].clone().into()])).await.unwrap();
+    store
+        .db()
+        .execute(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "UPDATE pin_resources SET logical_size=1,next_at=1 WHERE cid=?",
+            [fit.clone().into()],
+        ))
+        .await
+        .unwrap();
+
+    let notifier = coordinator.clone();
+    let mut db = store.db().clone();
+    // Deliver a publication hint even during each page read and each reservation.
+    db.set_metric_callback(move |_| notifier.notify_pin_work());
+    let worker = coordinator.start(Store::new(db), CancellationToken::new());
+    wait_status(&store, fit, "accepted").await;
+    worker.shutdown(Duration::from_secs(2)).await;
+}
+
+#[tokio::test]
+async fn unrestricted_backlog_reserves_multiple_resources_in_one_write_up_to_free_slots() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let cids: Vec<_> = (1..=7).map(cid).collect();
+    let (store, coordinator) = noop_backlog(&cids).await;
+    let largest_write = Arc::new(AtomicUsize::new(0));
+    let observed = largest_write.clone();
+    let keys = cids.clone();
+    let mut db = store.db().clone();
+    db.set_metric_callback(move |info| {
+        if info.statement.sql.to_ascii_uppercase().contains("UPDATE")
+            && let Some(values) = &info.statement.values
+        {
+            let count = keys
+                .iter()
+                .filter(|cid| values.0.contains(&sea_orm::Value::from(cid.as_str())))
+                .count();
+            observed.fetch_max(count, Ordering::Relaxed);
+        }
+    });
+    let worker = coordinator.start(Store::new(db), CancellationToken::new());
+    for key in &cids {
+        wait_status(&store, key, "accepted").await;
+    }
+    worker.shutdown(Duration::from_secs(2)).await;
+    assert_eq!(largest_write.load(Ordering::Relaxed), 3);
 }
 
 #[tokio::test]
@@ -113,16 +263,21 @@ async fn canonical_resource_uploads_with_original_cidv0_unixfs_profile() {
     .unwrap();
     tx.commit().await.unwrap();
     let stop = CancellationToken::new();
-    let worker = tokio::spawn(run_provider(
-        store.clone(),
-        Arc::new(provider),
-        limits,
-        Arc::new(Semaphore::new(1)),
-        Duration::from_secs(1),
-        Duration::ZERO,
-        watch::channel(()).1,
-        stop.clone(),
-    ));
+    let worker_store = store.clone();
+    let worker_stop = stop.clone();
+    let (_wake, receiver) = tokio::sync::watch::channel(());
+    let worker = tokio::spawn(async move {
+        dispatch::run(
+            worker_store,
+            vec![dispatch::Lane::new(Arc::new(provider), Duration::ZERO)],
+            &BTreeMap::from([("rpc".to_owned(), limits)]),
+            1,
+            Duration::from_secs(60),
+            receiver,
+            worker_stop,
+        )
+        .await;
+    });
     wait_status(&store, &canonical, "accepted").await;
     stop.cancel();
     worker.await.unwrap();
@@ -141,14 +296,14 @@ async fn queued_ack_and_exact_delete_complete_while_another_post_is_stalled() {
     let server = MockServer::start().await;
     let raw: PinningConfig = toml::from_str(&format!(
         r#"
-        worker_interval = "1s"
+        worker_interval = "60s"
         worker_concurrency = 2
         [[providers]]
         name = "backup"
         kind = "filebase"
         endpoint = "{}"
         token_env = "BACKUP_TOKEN"
-        requests_per_second = 100
+        requests_per_second = 2
         priority = 1
         max_bytes = 1000
         max_pins = 8
@@ -161,16 +316,10 @@ async fn queued_ack_and_exact_delete_complete_while_another_post_is_stalled() {
     let store = Store::open(Database::connect("sqlite::memory:").await.unwrap())
         .await
         .unwrap();
-    let cid = |seed: u8| {
-        cid::Cid::new_v1(
-            0x55,
-            cid::multihash::Multihash::wrap(0x12, &[seed; 32]).unwrap(),
-        )
-        .to_string()
-    };
     let slow = cid(1);
     let good = cid(2);
     let unknown = cid(3);
+    let (posts, mut arrivals) = tokio::sync::mpsc::unbounded_channel();
     for (key, response) in [
         (
             &slow,
@@ -184,10 +333,15 @@ async fn queued_ack_and_exact_delete_complete_while_another_post_is_stalled() {
         ),
         (&unknown, ResponseTemplate::new(503)),
     ] {
+        let posts = posts.clone();
+        let cid = key.clone();
         Mock::given(method("POST"))
             .and(path("/pins"))
             .and(body_partial_json(json!({"cid":key})))
-            .respond_with(response)
+            .respond_with(move |_: &wiremock::Request| {
+                posts.send((cid.clone(), Instant::now())).unwrap();
+                response.clone()
+            })
             .expect(1)
             .mount(&server)
             .await;
@@ -229,16 +383,53 @@ async fn queued_ack_and_exact_delete_complete_while_another_post_is_stalled() {
         tx.commit().await.unwrap();
     };
     attach(&slow).await;
-    let worker = coordinator.start(store.clone(), CancellationToken::new());
-    tokio::time::timeout(Duration::from_secs(10), async {
-        while server.received_requests().await.unwrap().is_empty() {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .unwrap();
     attach(&good).await;
+    store
+        .db()
+        .execute(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "UPDATE pin_resources SET next_at=1 WHERE cid=?",
+            [good.clone().into()],
+        ))
+        .await
+        .unwrap();
+    let worker = coordinator.start(store.clone(), CancellationToken::new());
+    let first = tokio::time::timeout(Duration::from_secs(5), arrivals.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.0, slow);
+    // The later insertion sorts before `good` in a fresh scan. The prefetched tail
+    // still runs first, and holds no token while the provider is rate-limited.
+    let waiting = store
+        .db()
+        .query_one(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "SELECT claim_token FROM pin_resources WHERE cid=?",
+            [good.clone().into()],
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        waiting
+            .try_get::<Option<String>>("", "claim_token")
+            .unwrap(),
+        None
+    );
     attach(&unknown).await;
+    coordinator.notify_pin_work();
+    let second = tokio::time::timeout(Duration::from_secs(5), arrivals.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let third = tokio::time::timeout(Duration::from_secs(5), arrivals.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!((&second.0, &third.0), (&good, &unknown));
+    assert!(second.1 - first.1 >= Duration::from_millis(400));
+    assert!(third.1 - second.1 >= Duration::from_millis(400));
     wait_status(&store, &good, "accepted").await;
     wait_status(&store, &unknown, "unknown").await;
     let tx = store.db().begin().await.unwrap();
@@ -246,6 +437,13 @@ async fn queued_ack_and_exact_delete_complete_while_another_post_is_stalled() {
         .await
         .unwrap();
     tx.commit().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert_eq!(
+        server.received_requests().await.unwrap().len(),
+        3,
+        "idle worker rescanned before its interval or a work hint"
+    );
+    coordinator.notify_pin_work();
     wait_status(&store, &good, "cleaned").await;
     tokio::time::timeout(
         Duration::from_secs(2),

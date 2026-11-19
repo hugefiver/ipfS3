@@ -7,7 +7,7 @@ mod support;
 use std::{
     collections::{BTreeSet, HashMap},
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use axum::{
@@ -34,11 +34,21 @@ use sha2::{Digest, Sha256};
 use support::decompress::{AddReply, KuboScript, start_kubo_harness, start_s3_server};
 use tokio::sync::{Semaphore, watch};
 use tokio_util::sync::CancellationToken;
+use tracing_subscriber::{Layer, filter::filter_fn, layer::SubscriberExt};
 
 const W: usize = 4;
+const IDLE: Duration = Duration::from_secs(30);
 const BLOCKED_PAYLOAD: &[u8] = &[b'x'; 200];
 const FAILED_PAYLOAD: &[u8] = b"b-11";
 const NORMAL_PAYLOAD: &[u8] = b"data";
+
+struct PinIdle(Arc<Semaphore>);
+
+impl<S: tracing::Subscriber> Layer<S> for PinIdle {
+    fn on_event(&self, _: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+        self.0.add_permits(1);
+    }
+}
 
 #[derive(Default)]
 struct Traffic {
@@ -53,7 +63,7 @@ struct ProviderState {
     name: &'static str,
     shared: Arc<Mutex<Traffic>>,
     failed_cid: String,
-    first_cid: watch::Sender<Option<String>>,
+    first_post: watch::Sender<Option<(String, Instant)>>,
     release: Arc<Semaphore>,
 }
 
@@ -65,13 +75,12 @@ impl Drop for ActiveCall {
 }
 
 impl ProviderState {
-    async fn wait_first_post(&self) -> String {
-        let mut first_cid = self.first_cid.subscribe();
-        let reached =
-            tokio::time::timeout(Duration::from_secs(10), first_cid.wait_for(Option::is_some))
-                .await
-                .expect("first provider POST reached the barrier")
-                .unwrap();
+    async fn wait_first_post(&self) -> (String, Instant) {
+        let mut first_post = self.first_post.subscribe();
+        let reached = tokio::time::timeout(IDLE / 3, first_post.wait_for(Option::is_some))
+            .await
+            .expect("already-idle worker must POST before its polling interval")
+            .unwrap();
         reached.clone().unwrap()
     }
 }
@@ -90,11 +99,11 @@ async fn submit(
         traffic.max_global = traffic.max_global.max(traffic.current);
     }
     let _active = ActiveCall(state.shared.clone());
-    if state.first_cid.send_if_modified(|first| {
+    if state.first_post.send_if_modified(|first| {
         if first.is_some() {
             return false;
         }
-        *first = Some(cid.clone());
+        *first = Some((cid.clone(), Instant::now()));
         true
     }) {
         state.release.acquire().await.unwrap().forget();
@@ -126,7 +135,7 @@ async fn provider(
         name,
         shared,
         failed_cid: raw_cid(FAILED_PAYLOAD),
-        first_cid: watch::channel(None).0,
+        first_post: watch::channel(None).0,
         release: Arc::new(Semaphore::new(0)),
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -223,6 +232,11 @@ fn zip_headers(token: &str) -> HeaderMap {
 #[tokio::test]
 #[ignore = "run explicitly for the multi-provider ZIP fanout acceptance gate"]
 async fn signed_zip_batches_share_resources_and_provider_acks_leave_s3_unblocked() {
+    let idle_scans = Arc::new(Semaphore::new(0));
+    let trace_layer =
+        PinIdle(idle_scans.clone()).with_filter(filter_fn(|meta| meta.name() == "pin_worker_idle"));
+    tracing::subscriber::set_global_default(tracing_subscriber::registry().with(trace_layer))
+        .unwrap();
     let shared = Arc::new(Mutex::new(Traffic::default()));
     let (a, a_handle, a_url) = provider("a", shared.clone()).await;
     let (b, b_handle, b_url) = provider("b", shared.clone()).await;
@@ -288,7 +302,7 @@ async fn signed_zip_batches_share_resources_and_provider_acks_leave_s3_unblocked
         [decompress_zip]
         auto_pin_outputs = true
         [pinning]
-        worker_interval = "1s"
+        worker_interval = "{}s"
         worker_concurrency = 4
         [[pinning.providers]]
         name = "a"
@@ -336,6 +350,7 @@ async fn signed_zip_batches_share_resources_and_provider_acks_leave_s3_unblocked
         max_duration = "2h"
     "#,
         kubo.server.uri(),
+        IDLE.as_secs(),
         format!("{a_url}/v1/ipfs"),
         format!("{b_url}/v1/ipfs")
     );
@@ -416,21 +431,31 @@ async fn signed_zip_batches_share_resources_and_provider_acks_leave_s3_unblocked
     });
     let server = start_s3_server(state.clone(), Arc::default()).await;
 
-    for (source, token, bytes, count) in [
-        ("first.zip", "first-load", first_zip, 65),
-        ("second.zip", "second-load", second_zip, 30),
-    ] {
-        let response = support::sigv4::send_sigv4(
-            reqwest::Method::PUT,
-            &server.endpoint,
-            "test-bkt",
-            source,
-            &[("decompress-zip", "out/")],
-            bytes,
-            zip_headers(token),
-            "test",
+    let worker = state
+        .pinning
+        .start(state.store.clone(), CancellationToken::new());
+    tokio::time::timeout(IDLE / 3, idle_scans.acquire_many(2))
+        .await
+        .expect("worker completed an empty scan for both providers")
+        .unwrap()
+        .forget();
+
+    let publish = async |source: &str, token: &str, bytes: Vec<u8>, count: usize| {
+        let response = tokio::time::timeout(
+            IDLE / 3,
+            support::sigv4::send_sigv4(
+                reqwest::Method::PUT,
+                &server.endpoint,
+                "test-bkt",
+                source,
+                &[("decompress-zip", "out/")],
+                bytes,
+                zip_headers(token),
+                "test",
+            ),
         )
-        .await;
+        .await
+        .expect("ZIP publication must not wait for blocked provider acknowledgments");
         let status = response.status();
         let xml = response.text().await.unwrap();
         assert_eq!(status, StatusCode::OK, "{xml}");
@@ -439,31 +464,29 @@ async fn signed_zip_batches_share_resources_and_provider_acks_leave_s3_unblocked
             "{xml}"
         );
         assert!(xml.contains("<RootStatus>disabled</RootStatus>"), "{xml}");
-    }
+    };
+    let started = Instant::now();
+    publish("first.zip", "first-load", first_zip, 65).await;
+    let ((first_a, posted_a), (first_b, posted_b)) =
+        tokio::join!(a.wait_first_post(), b.wait_first_post());
+    let first_post = posted_a.min(posted_b).duration_since(started);
+    assert!(
+        first_post < IDLE / 2,
+        "already-idle worker took {first_post:?} to POST (idle {IDLE:?})"
+    );
+    publish("second.zip", "second-load", second_zip, 30).await;
+
     let db = state.store.db();
     assert_eq!(object_version::Entity::find().count(db).await.unwrap(), 95);
     assert_eq!(pin_rows::count(db, "pin_refs").await, 95);
-    let resources = pin_rows::resources(db).await;
-    assert_eq!(resources.len(), 41, "28 A + 12 B + one oversized CID");
-    assert!(resources.iter().all(|r| r.status == "waiting"
-        && r.action.as_deref() == Some("submit")
-        && r.handle.is_none()));
-    {
-        let traffic = shared.lock().unwrap();
-        assert!(
-            traffic.posts.is_empty() && traffic.unexpected.is_empty(),
-            "publication does not perform remote HTTP"
-        );
-    }
+    assert_eq!(
+        pin_rows::resources(db).await.len(),
+        41,
+        "28 A + 12 B + one oversized CID"
+    );
     let blocked_cid = raw_cid(BLOCKED_PAYLOAD);
     let failed_cid = raw_cid(FAILED_PAYLOAD);
     let normal_cid = raw_cid(NORMAL_PAYLOAD);
-
-    let worker = state
-        .pinning
-        .start(state.store.clone(), CancellationToken::new());
-    let first_a = a.wait_first_post().await;
-    b.wait_first_post().await;
     let normal = tokio::time::timeout(
         Duration::from_secs(10),
         support::sigv4::send_sigv4(
@@ -497,25 +520,33 @@ async fn signed_zip_batches_share_resources_and_provider_acks_leave_s3_unblocked
             && r.provider == b_key
             && r.cid == normal_cid)
     );
-    b.release.add_permits(1);
-    tokio::time::timeout(Duration::from_secs(10), async {
+    let acks_while_blocked = tokio::time::timeout(IDLE / 3, async {
         loop {
             let rows = pin_rows::resources(db).await;
             if rows
                 .iter()
                 .any(|r| r.cid == normal_cid && r.status == "accepted")
+                && rows
+                    .iter()
+                    .any(|r| r.provider == b_key && r.cid != normal_cid && r.status == "accepted")
             {
-                let stalled = rows.iter().find(|r| r.cid == first_a).unwrap();
-                assert_eq!(stalled.status, "pending");
-                assert!(stalled.handle.is_none());
-                break;
+                for (provider, cid) in [(&a_key, &first_a), (&b_key, &first_b)] {
+                    let stalled = rows
+                        .iter()
+                        .find(|r| &r.provider == provider && &r.cid == cid)
+                        .unwrap();
+                    assert_eq!(stalled.status, "pending");
+                    assert!(stalled.handle.is_none());
+                }
+                break rows.iter().filter(|r| r.status == "accepted").count();
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
-    .expect("ordinary pin reached ACK on B while A still had a blocked ZIP pin");
+    .expect("independent ZIP and ordinary pins reached ACK on B with both first POSTs blocked");
     a.release.add_permits(1);
+    b.release.add_permits(1);
 
     let settled = tokio::time::timeout(Duration::from_secs(45), async {
         loop {
@@ -593,6 +624,13 @@ async fn signed_zip_batches_share_resources_and_provider_acks_leave_s3_unblocked
             "one POST per eligible provider/CID, including the rejected CID"
         );
         assert_eq!(posts, expected);
+        eprintln!(
+            "signed ZIP: first POST in {first_post:?} (idle {IDLE:?}); {} refs, {} resources, {} POSTs, peak {}, {acks_while_blocked} ACKs while both first POSTs were blocked",
+            refs.len(),
+            settled.len(),
+            traffic.posts.len(),
+            traffic.max_global,
+        );
     }
     server.shutdown().await;
     a_handle.abort();

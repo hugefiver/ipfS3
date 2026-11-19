@@ -745,6 +745,14 @@ successful submit acknowledgment and its handle, then requests removal when
 the last reference ends. A removal acknowledgment, including a provider response
 that the target is already gone, ends remote cleanup and releases quota.
 
+Each gateway runs one pin dispatcher. It reads due candidates in batches and
+claims work as slots become available, up to `pinning.worker_concurrency` across
+all providers. With a backlog, it refills slots as individual calls finish,
+subject to each provider's request rate and quota. When idle it waits for a
+local publication hint or `pinning.worker_interval`; the periodic scan also
+finds work committed by other gateways. Fetching a candidate does not send a
+request or reserve provider capacity.
+
 Provider acknowledgment reports operation acceptance, not replica count,
 physical storage or garbage collection. An unknown submission result isn't
 replayed to seek confirmation. An expired reference may never have received a

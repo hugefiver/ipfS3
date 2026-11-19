@@ -565,6 +565,7 @@ pub(super) async fn complete(
     };
     let terminal = serde_json::json!({"input_sha256": bound.input_sha256.ok_or_else(conflict)?,
         "published_count": manifest.successful.len(), "failed_count": manifest.failed.len(), "status": status}).to_string();
+    let has_pin_intent = intent.may_create_pin_refs(!manifest.successful.is_empty());
     let request = CapturedZipPublication {
         batch_id: id.clone(),
         source: upload.as_ref().map(|upload| {
@@ -613,7 +614,12 @@ pub(super) async fn complete(
         state.pinning.control_mode(),
     )
     .await;
-    if matches!(publication, Err(AppError::InvalidPinningRequest(_))) {
+    if let Ok(results) = &publication
+        && has_pin_intent
+        && !results.is_empty()
+    {
+        state.pinning.notify_pin_work();
+    } else if matches!(publication, Err(AppError::InvalidPinningRequest(_))) {
         execution::fence(db, &claim).await.map_err(store_error)?;
     } else if matches!(publication, Err(AppError::StaleContentMutation)) {
         let fenced = if options.publish_source {
@@ -644,7 +650,12 @@ pub(super) async fn complete(
     .await
     .map_err(store_error)?
     {
-        CompleteState::Completed(receipt) => receipt_response(receipt),
+        CompleteState::Completed(receipt) => {
+            if has_pin_intent && matches!(publication, Err(AppError::Database(_))) {
+                state.pinning.notify_pin_work();
+            }
+            receipt_response(receipt)
+        }
         CompleteState::Pending => match publication {
             Err(error) => Err(store_error(error)),
             Ok(_) => Err(conflict()),

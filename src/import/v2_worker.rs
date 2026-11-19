@@ -680,6 +680,7 @@ async fn execute_inner(
         _ = coordinator.execution_observer().before_publication(&claim.batch_id) => {}
     }
     let digest = snapshot.input_sha256.as_deref().ok_or(RunError::Lost)?;
+    let has_pin_intent = intent.may_create_pin_refs(!successes.is_empty());
     let terminal = serde_json::json!({
         "input_sha256": digest, "published_count": successes.len(), "failed_count": failed,
         "status": if successes.is_empty() && !options.publish_source { "failed" } else { "completed" },
@@ -709,11 +710,16 @@ async fn execute_inner(
     )
     .await
     {
-        Ok(_) => Ok(()),
+        Ok(results) => {
+            if has_pin_intent && !results.is_empty() {
+                state.pinning.notify_pin_work();
+            }
+            Ok(())
+        }
         Err(AppError::StaleContentMutation | AppError::InvalidPinningRequest(_)) => {
             Err(RunError::Fenced)
         }
-        Err(_) => {
+        Err(error) => {
             // An unknown DB commit outcome is not proof of rollback. The next
             // due claim reconciles the committed receipt or retries the exact
             // admitted manifest; never write a synthetic failure receipt.
@@ -729,6 +735,9 @@ async fn execute_inner(
                 status,
                 Ok(Some(import_intake::Status { state: "ready", .. }))
             ) {
+                if has_pin_intent && matches!(error, AppError::Database(_)) {
+                    state.pinning.notify_pin_work();
+                }
                 Ok(())
             } else {
                 let _ = execution::fence_if_lost(db, claim).await;

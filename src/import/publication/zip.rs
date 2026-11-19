@@ -142,6 +142,7 @@ pub(crate) async fn publish_zip_import(
         )
     })?;
     let root_enabled = capture.controls().root.enabled();
+    let has_pin_intent = capture.may_create_pin_refs(!successes.is_empty());
     let published = publish_captured_zip(
         state.store.db(),
         CapturedZipPublication {
@@ -170,6 +171,9 @@ pub(crate) async fn publish_zip_import(
     )
     .await
     .map_err(|error| map_publication_error(error, cancellation))?;
+    if has_pin_intent {
+        state.pinning.notify_pin_work();
+    }
     published
         .into_iter()
         .find(|(key, _)| key == &job.key)

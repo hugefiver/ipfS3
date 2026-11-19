@@ -240,6 +240,16 @@ impl CapturedZipIntent {
             })
     }
 
+    // Exact routes are selected during publication; the wake only needs a possible target.
+    pub(crate) fn may_create_pin_refs(&self, has_outputs: bool) -> bool {
+        self.controls.targets.source
+            || (has_outputs && self.controls.targets.extracted)
+            || self
+                .source_intents()
+                .iter()
+                .any(|intent| intent.content_mode == ContentMode::Object || has_outputs)
+    }
+
     pub(crate) fn source_provider_candidates(&self) -> &[CapturedProvider] {
         self.resolved_source
             .as_ref()

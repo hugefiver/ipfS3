@@ -1,5 +1,8 @@
 use super::*;
 
+mod dispatch_batch;
+mod pg_batch;
+
 #[path = "../../../../tests/support/baseline_postgres.rs"]
 mod postgres;
 use crate::{
@@ -325,28 +328,32 @@ async fn lost_post_never_reposts_and_late_ack_tracks_demand_reversals() {
     let tx = db.begin().await.unwrap();
     release_owner(&tx, "temporary", time(13)).await.unwrap();
     tx.commit().await.unwrap();
-    settle(
-        &db,
-        &post,
-        Outcome::Submitted("first-upload".into()),
-        time(14),
-    )
-    .await
-    .unwrap();
+    assert!(
+        settle_dispatch(
+            &db,
+            &post,
+            Outcome::Submitted("first-upload".into()),
+            time(14)
+        )
+        .await
+        .unwrap()
+    );
     let remove = next(&db, "alpha", 15).await.unwrap();
     assert_eq!(remove.handle.as_deref(), Some("first-upload"));
     add(&db, "new-owner", &file, &request, time(16)).await;
     settle(&db, &remove, Outcome::Deleted, time(17))
         .await
         .unwrap();
-    settle(
-        &db,
-        &post,
-        Outcome::Submitted("stale-upload".into()),
-        time(18),
-    )
-    .await
-    .unwrap();
+    assert!(
+        !settle_dispatch(
+            &db,
+            &post,
+            Outcome::Submitted("stale-upload".into()),
+            time(18)
+        )
+        .await
+        .unwrap()
+    );
     let tx = db.begin().await.unwrap();
     release_owner(&tx, "unrelated", time(18)).await.unwrap();
     tx.commit().await.unwrap();

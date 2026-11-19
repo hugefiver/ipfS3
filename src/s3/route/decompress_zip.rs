@@ -1059,6 +1059,7 @@ impl DecompressZipRoute {
                     build_zip_root(&self.state, &batch_id, &manifest, root_enabled).await;
                 let published = final_entries(&manifest);
                 let failures = outcome.failures;
+                let has_pin_intent = zip_intent.may_create_pin_refs(!published.is_empty());
                 let archive_object = PublicationObject::from_put(
                     uuid::Uuid::new_v4().to_string(),
                     &parsed.bucket,
@@ -1102,6 +1103,9 @@ impl DecompressZipRoute {
                         self.state.pinning.control_mode(),
                     ))
                     .await?;
+                if has_pin_intent {
+                    self.state.pinning.notify_pin_work();
+                }
                 let publication_result = results
                     .into_iter()
                     .find(|(_, result)| result.object_id == source_id)

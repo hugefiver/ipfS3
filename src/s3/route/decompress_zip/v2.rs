@@ -1245,6 +1245,7 @@ pub(super) async fn put(
         })
         .collect::<Vec<_>>();
     let terminal = serde_json::json!({"input_sha256": sha, "published_count": manifest.successful.len(), "failed_count": manifest.failed.len(), "status": if manifest.successful.is_empty() && !options.publish_source { "failed" } else { "completed" }}).to_string();
+    let has_pin_intent = intent.may_create_pin_refs(!successes.is_empty());
     let publication = CapturedZipPublication {
         batch_id: id.clone(),
         source: options.publish_source.then(|| {
@@ -1277,7 +1278,7 @@ pub(super) async fn put(
     if lease.cancelled.is_cancelled() {
         return Err(conflict());
     }
-    if let Err(error) = publication::publish_captured_zip(
+    match publication::publish_captured_zip(
         state.store.db(),
         publication,
         state.pinning.effective_config(),
@@ -1286,21 +1287,25 @@ pub(super) async fn put(
     )
     .await
     {
-        if matches!(error, AppError::InvalidPinningRequest(_)) {
-            execution::fence(state.store.db(), &claim)
-                .await
-                .map_err(store_error)?;
-        } else if matches!(error, AppError::StaleContentMutation) {
-            let fenced = if options.publish_source {
-                execution::fence(state.store.db(), &claim).await
-            } else {
-                execution::fence_if_lost(state.store.db(), &claim).await
-            };
-            if let Err(error) = fenced {
-                tracing::warn!(%error, "ZIP guard reconciliation deferred");
+        Ok(results) if has_pin_intent && !results.is_empty() => state.pinning.notify_pin_work(),
+        Ok(_) => {}
+        Err(error) => {
+            if matches!(error, AppError::InvalidPinningRequest(_)) {
+                execution::fence(state.store.db(), &claim)
+                    .await
+                    .map_err(store_error)?;
+            } else if matches!(error, AppError::StaleContentMutation) {
+                let fenced = if options.publish_source {
+                    execution::fence(state.store.db(), &claim).await
+                } else {
+                    execution::fence_if_lost(state.store.db(), &claim).await
+                };
+                if let Err(error) = fenced {
+                    tracing::warn!(%error, "ZIP guard reconciliation deferred");
+                }
             }
+            return Err(store_error(error));
         }
-        return Err(store_error(error));
     }
     let completed = execution::read(state.store.db(), &id)
         .await

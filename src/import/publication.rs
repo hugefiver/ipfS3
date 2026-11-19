@@ -128,6 +128,7 @@ pub(crate) async fn publish_direct(
 ) -> Result<(), ImportExecutionError> {
     ensure_active(cancellation)?;
     let (policy, decision) = resolved_policy(state, job, cancellation)?;
+    let has_pin_intent = !policy.leases.is_empty();
     let metadata: serde_json::Value = serde_json::from_str(&job.metadata_json).map_err(|_| {
         terminal_failure(
             ImportFailureCode::PublicationFailed,
@@ -211,5 +212,8 @@ pub(crate) async fn publish_direct(
         .await
     }
     .map_err(|error| map_publication_error(error, cancellation))?;
+    if has_pin_intent {
+        state.pinning.notify_pin_work();
+    }
     Ok(())
 }

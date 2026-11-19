@@ -1654,6 +1654,7 @@ pub async fn copy_object(
             object_created_at,
         );
         object.multipart = src_obj.multipart;
+        let has_pin_intent = !policy.leases.is_empty();
         let publication = PublicationRequest {
             object,
             tags: policy.tags.clone(),
@@ -1686,6 +1687,9 @@ pub async fn copy_object(
                     .await?
             }
         };
+        if has_pin_intent {
+            state.pinning.notify_pin_work();
+        }
 
         Ok(S3Response::with_headers(CopyObjectOutput {
             copy_object_result: Some(CopyObjectResult {

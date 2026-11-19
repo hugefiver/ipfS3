@@ -48,7 +48,7 @@ pub struct PinningCoordinator {
     policy: PinPolicyEvaluator,
     providers: HashMap<String, Arc<dyn PinningProvider>>,
     request_intervals: HashMap<String, Duration>,
-    provider_wakes: HashMap<String, watch::Sender<()>>,
+    work_wake: watch::Sender<()>,
 }
 
 /// Resolve the physical allocation namespace and reject incompatible aliases.
@@ -256,11 +256,6 @@ impl PinningCoordinator {
             providers.insert(name, implementation);
         }
 
-        let provider_wakes = config
-            .provider_limits
-            .keys()
-            .map(|name| (name.clone(), watch::channel(()).0))
-            .collect();
         Ok(Arc::new(Self {
             decompress_zip_config: zip.clone(),
             zip_output_rules,
@@ -270,7 +265,7 @@ impl PinningCoordinator {
             },
             providers,
             request_intervals,
-            provider_wakes,
+            work_wake: watch::channel(()).0,
         }))
     }
 
@@ -322,14 +317,23 @@ impl PinningCoordinator {
         self.request_intervals[name]
     }
 
-    pub(crate) fn subscribe_provider_wake(&self, name: &str) -> watch::Receiver<()> {
-        self.provider_wakes[name].subscribe()
+    pub(super) fn subscribe_pin_work(&self) -> watch::Receiver<()> {
+        self.work_wake.subscribe()
+    }
+
+    pub(crate) fn notify_pin_work(&self) {
+        self.work_wake.send_replace(());
     }
 
     pub(crate) fn notify_put_committed(&self, source_cid: &str, intents: &[LeaseIntent]) {
-        let cid = (!intents.is_empty() && tracing::enabled!(tracing::Level::DEBUG))
-            .then(|| canonical_resource_cid(source_cid).ok())
-            .flatten();
+        if intents.is_empty() {
+            return;
+        }
+        self.notify_pin_work();
+        if !tracing::enabled!(tracing::Level::DEBUG) {
+            return;
+        }
+        let cid = canonical_resource_cid(source_cid).ok();
         for (index, intent) in intents.iter().enumerate() {
             for provider in &intent.providers {
                 if !self.provider_limits()[provider].enabled
@@ -340,7 +344,6 @@ impl PinningCoordinator {
                     continue;
                 }
                 tracing::debug!(name: "pin_put_committed", cid = cid.as_deref(), source_cid, %provider, "PUT committed with pin intent for candidate provider");
-                self.provider_wakes[provider].send_replace(());
             }
         }
     }
