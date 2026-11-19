@@ -485,10 +485,10 @@ async fn run_worker(
         }
     };
     let dispatch = async {
-        loop {
+        'dispatch: loop {
             let maintenance_due = tokio::select! {
                 biased;
-                _ = cancellation.cancelled() => break,
+                _ = cancellation.cancelled() => break None,
                 _ = interval.tick() => true,
                 _ = wake.notified() => false,
                 completed = in_flight.join_next_with_id(), if !in_flight.is_empty() => {
@@ -501,7 +501,7 @@ async fn run_worker(
                 }
             };
             if cancellation.is_cancelled() {
-                break;
+                break None;
             }
             while let Some(completed) = in_flight.try_join_next_with_id() {
                 handle_join_result(completed, &mut job_contexts, "pinning worker task failed");
@@ -511,7 +511,7 @@ async fn run_worker(
             if maintenance_due {
                 let expiry = tokio::select! {
                     biased;
-                    _ = cancellation.cancelled() => break,
+                    _ = cancellation.cancelled() => break None,
                     result = expire_worker_leases(&store, Utc::now(), &mut expiry_cursor, settings.claim_limit) => result,
                 };
                 if let Err(error) = expiry {
@@ -558,14 +558,17 @@ async fn run_worker(
                 );
                 let scan_result = tokio::select! {
                     biased;
-                    _ = cancellation.cancelled() => break,
+                    _ = cancellation.cancelled() => break 'dispatch None,
                     result = scan => result,
                 };
                 match scan_result {
                     Ok(claimed) => {
-                        for job in claimed {
+                        let mut claimed = claimed.into_iter();
+                        while let Some(job) = claimed.next() {
+                            #[cfg(test)]
+                            tests::pause_before_claim_dispatch(&job.model.id).await;
                             if cancellation.is_cancelled() {
-                                break;
+                                break 'dispatch Some(std::iter::once(job).chain(claimed));
                             }
                             let coordinator = coordinator.clone();
                             let store = store.clone();
@@ -625,10 +628,10 @@ async fn run_worker(
             }
         }
     };
-    tokio::select! {
-        () = dispatch => {},
+    let unspawned = tokio::select! {
+        unspawned = dispatch => unspawned,
         () = maintenance => unreachable!(),
-    }
+    };
 
     let drain = async {
         while let Some(result) = in_flight.join_next_with_id().await {
@@ -639,12 +642,44 @@ async fn run_worker(
             );
         }
     };
-    if tokio::time::timeout(settings.shutdown_grace, drain)
+    let shutdown = async {
+        tokio::join!(
+            drain,
+            release_unspawned_claims(&store, unspawned.into_iter().flatten()),
+        );
+    };
+    if tokio::time::timeout(settings.shutdown_grace, shutdown)
         .await
         .is_err()
     {
         in_flight.abort_all();
         while in_flight.join_next().await.is_some() {}
+    }
+}
+
+async fn release_unspawned_claims(store: &Store, claims: impl IntoIterator<Item = ClaimedPinJob>) {
+    for claimed in claims {
+        if claimed.previous_state != "pending" || claimed.reclaimed {
+            continue;
+        }
+        let Some(locked_until) = claimed.model.locked_until else {
+            continue;
+        };
+        let id = &claimed.model.id;
+        if let Err(error) = pin_job::Entity::update_many()
+            .col_expr(pin_job::Column::State, Expr::value("pending"))
+            .col_expr(
+                pin_job::Column::LockedUntil,
+                Expr::value(Option::<DateTime<Utc>>::None),
+            )
+            .filter(pin_job::Column::Id.eq(id))
+            .filter(pin_job::Column::State.eq("running"))
+            .filter(pin_job::Column::LockedUntil.eq(locked_until))
+            .exec(store.db())
+            .await
+        {
+            tracing::warn!(job_id = %id, %error, "pinning worker could not release unspawned claim");
+        }
     }
 }
 
@@ -1245,8 +1280,9 @@ async fn execute_management_observation(
         move || async move {
             admission::managed_call_allowed_store(store, &preflight_job, ManagedCall::Observe).await
         },
-        move |provider| async move {
+        move |provider, permit| async move {
             let observation = provider.get_observed(&request_id).await;
+            drop(permit);
             update_provider_health(&call_runtime, &observation.result).await;
             Ok(observation)
         },
@@ -1861,12 +1897,13 @@ async fn dispatch_submit(
             }
             jobs::check_target_job_generation(store.db(), &preflight_job).await
         },
-        move |provider| async move {
+        move |provider, permit| async move {
             let _ = CID_START.try_with(|(start, wake)| {
                 drop(start.take());
                 wake.notify_one();
             });
             let observation = provider.submit_observed(request).await;
+            drop(permit);
             update_provider_health(&call_runtime, &observation.result).await;
             Ok(observation)
         },
@@ -2438,7 +2475,8 @@ async fn recover_submit(
         cancellation,
         ManagedCall::Observe,
         || async { Ok(true) },
-        move |provider| async move {
+        move |provider, permit| async move {
+            let _permit = permit;
             provider
                 .observe_historical(query, &history.api, &history.strategy)
                 .await
@@ -2634,8 +2672,9 @@ async fn recover_unknown_rpc(
             )
             .await
         },
-        move |provider| async move {
+        move |provider, permit| async move {
             let observation = provider.get_observed(&expected_request_id).await;
+            drop(permit);
             update_provider_health(&call_runtime, &observation.result).await;
             Ok(observation)
         },
@@ -2813,8 +2852,9 @@ async fn execute_poll(
                     .as_deref()
                     == Some(preflight_request_id.as_str()))
         },
-        move |provider| async move {
+        move |provider, permit| async move {
             let observation = provider.get_observed(&request_id).await;
+            drop(permit);
             update_provider_health(&call_runtime, &observation.result).await;
             Ok(observation)
         },
@@ -3509,7 +3549,10 @@ async fn execute_unpin(
                         == Some(preflight_request_id.as_str()),
             )
         },
-        move |provider| async move { provider.unpin_owned(&request_for_call).await },
+        move |provider, permit| async move {
+            let _permit = permit;
+            provider.unpin_owned(&request_for_call).await
+        },
     )
     .await?
     {
@@ -4357,7 +4400,10 @@ async fn reconcile_failed(
                     .await?,
             )
         },
-        move |provider| async move { provider.unpin_owned(&request_for_call).await },
+        move |provider, permit| async move {
+            let _permit = permit;
+            provider.unpin_owned(&request_for_call).await
+        },
     )
     .await?
     {
@@ -5181,7 +5227,7 @@ async fn provider_call_with_heartbeat<T, P, PFut, F, Fut>(
 where
     P: FnOnce() -> PFut,
     PFut: Future<Output = AppResult<bool>>,
-    F: FnOnce(Arc<dyn PinningProvider>) -> Fut,
+    F: FnOnce(Arc<dyn PinningProvider>, Option<OwnedSemaphorePermit>) -> Fut,
     Fut: Future<Output = Result<T, ProviderError>>,
 {
     renew_claim_once(store, claimed, lock_for).await?;
@@ -5190,25 +5236,33 @@ where
     if !allowed {
         return Ok(ProviderCallOutcome::PreflightRejected);
     }
-    let rate_lock = slot.runtime.next_request_at.clone().lock_owned();
-    let ClaimWait::Ready(mut rate_gate) =
-        wait_with_claim_heartbeat(store, claimed, lock_for, cancellation, rate_lock).await?
-    else {
-        return Ok(ProviderCallOutcome::Cancelled);
-    };
-    if let Some(at) = *rate_gate {
-        let ClaimWait::Ready(()) = wait_with_claim_heartbeat(
-            store,
-            claimed,
-            lock_for,
-            cancellation,
-            tokio::time::sleep_until(at),
-        )
-        .await?
+    let rate_gate = if slot.runtime.min_request_interval.is_zero() {
+        if cancellation.is_cancelled() {
+            return Ok(ProviderCallOutcome::Cancelled);
+        }
+        None
+    } else {
+        let rate_lock = slot.runtime.next_request_at.clone().lock_owned();
+        let ClaimWait::Ready(rate_gate) =
+            wait_with_claim_heartbeat(store, claimed, lock_for, cancellation, rate_lock).await?
         else {
             return Ok(ProviderCallOutcome::Cancelled);
         };
-    }
+        if let Some(at) = *rate_gate {
+            let ClaimWait::Ready(()) = wait_with_claim_heartbeat(
+                store,
+                claimed,
+                lock_for,
+                cancellation,
+                tokio::time::sleep_until(at),
+            )
+            .await?
+            else {
+                return Ok(ProviderCallOutcome::Cancelled);
+            };
+        }
+        Some(rate_gate)
+    };
     if *slot.runtime.health.read().await == ProviderHealth::Terminal {
         return Ok(ProviderCallOutcome::Completed(
             Err(terminal_health_error()),
@@ -5218,7 +5272,7 @@ where
 
     // Rate waiting is complete before a global HTTP permit is requested. Slow providers can hold
     // only their own permit/start gate while sleeping, never global capacity needed by peers.
-    let _global_permit = if slot.provider_permit.is_some() {
+    let global_permit = if slot.provider_permit.is_some() {
         let permit = global.clone().acquire_owned();
         let ClaimWait::Ready(permit) =
             wait_with_claim_heartbeat(store, claimed, lock_for, cancellation, permit).await?
@@ -5329,11 +5383,11 @@ where
         if submit_expiry.is_some_and(|at| at <= Utc::now()) {
             return None;
         }
-        if !slot.runtime.min_request_interval.is_zero() {
+        if let Some(mut rate_gate) = rate_gate {
             *rate_gate = Some(tokio::time::Instant::now() + slot.runtime.min_request_interval);
         }
-        drop(rate_gate);
-        Some(call(slot.provider.clone()).await)
+        // Typed observations absorb health inside the call, after releasing HTTP capacity.
+        Some(call(slot.provider.clone(), global_permit).await)
     });
     let mut lost_rpc_claim = false;
     let result = loop {
@@ -7586,6 +7640,25 @@ mod tests {
                 .await
                 .unwrap();
             id
+        }
+    }
+
+    struct ClaimDispatchGate {
+        job_id: String,
+        arrived: Notify,
+        resume: Notify,
+    }
+
+    tokio::task_local! {
+        static CLAIM_DISPATCH_GATE: Arc<ClaimDispatchGate>;
+    }
+
+    pub(super) async fn pause_before_claim_dispatch(job_id: &str) {
+        if let Ok(gate) = CLAIM_DISPATCH_GATE.try_with(Arc::clone)
+            && gate.job_id == job_id
+        {
+            gate.arrived.notify_one();
+            gate.resume.notified().await;
         }
     }
 
@@ -13027,6 +13100,175 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn zero_interval_provider_allows_peer_call_during_blocked_preflight() {
+        let fixture = fixture([Script::Get(Ok(remote_for(
+            "bafy-no-interval-peer",
+            "request-no-interval-peer",
+            RemotePinStatus::Queued,
+        )))])
+        .await;
+        let store = &fixture.store;
+        let coordinator = &fixture.coordinator;
+        let due = Utc::now() - chrono::Duration::seconds(1);
+        fixture.seed_poll("no-interval-first", due).await;
+        fixture
+            .seed_poll("no-interval-peer", due + chrono::Duration::milliseconds(1))
+            .await;
+        let lock_for = coordinator.settings().lock_for;
+        let claims = jobs::claim_due_jobs(store.db(), Utc::now(), lock_for, 2)
+            .await
+            .unwrap();
+        let [mut first, mut peer] = claims.try_into().expect("expected two independent claims");
+        let global = Arc::new(Semaphore::new(2));
+        let cancellation = CancellationToken::new();
+        let first_slot =
+            super::acquire_provider_slot(coordinator, store, &mut first, false, &cancellation)
+                .await
+                .unwrap()
+                .unwrap();
+        let peer_slot =
+            super::acquire_provider_slot(coordinator, store, &mut peer, false, &cancellation)
+                .await
+                .unwrap()
+                .unwrap();
+        let entered = Notify::new();
+        let release = Notify::new();
+        let first_call = super::provider_call_with_heartbeat(
+            first_slot,
+            coordinator,
+            &global,
+            store,
+            &mut first,
+            lock_for,
+            &cancellation,
+            super::ManagedCall::Observe,
+            || async {
+                entered.notify_one();
+                release.notified().await;
+                Ok(false)
+            },
+            |provider, permit| async move {
+                let _permit = permit;
+                provider.get("request-no-interval-first").await
+            },
+        );
+        let (first_result, peer_result) = tokio::join!(first_call, async {
+            let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                entered.notified().await;
+                super::provider_call_with_heartbeat(
+                    peer_slot,
+                    coordinator,
+                    &global,
+                    store,
+                    &mut peer,
+                    lock_for,
+                    &cancellation,
+                    super::ManagedCall::Observe,
+                    || async { Ok(true) },
+                    |provider, permit| async move {
+                        let _permit = permit;
+                        provider.get("request-no-interval-peer").await
+                    },
+                )
+                .await
+            })
+            .await;
+            release.notify_one();
+            result
+        });
+        assert!(matches!(
+            first_result.unwrap(),
+            super::ProviderCallOutcome::PreflightRejected
+        ));
+        assert!(matches!(
+            peer_result
+                .expect("peer provider call waited for an unrelated preflight")
+                .unwrap(),
+            super::ProviderCallOutcome::Completed(Ok(_), _)
+        ));
+        assert_eq!(fixture.provider.gets.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn completed_submit_releases_global_http_capacity_before_health_update() {
+        let blocker = Arc::new(SubmitBlocker {
+            entered: Notify::new(),
+            release: Notify::new(),
+            result: Mutex::new(Some(Ok(remote(
+                "submit-http-complete",
+                RemotePinStatus::Pinned,
+            )))),
+        });
+        let mut fixture = fixture([Script::BlockSubmit(blocker.clone())]).await;
+        let peer_provider = ScriptProvider::new([Script::Get(Ok(remote_for(
+            "bafy-http-capacity-peer",
+            "request-http-capacity-peer",
+            RemotePinStatus::Queued,
+        )))]);
+        PinningCoordinator::replace_provider_for_test(
+            &mut fixture.coordinator,
+            "fast",
+            peer_provider.clone(),
+        );
+        let due = Utc::now() - chrono::Duration::seconds(1);
+        fixture
+            .seed_poll_for("fast", "http-capacity-peer", due)
+            .await;
+        fixture.enqueue_submit().await;
+        let db = fixture.store.db();
+        let claims =
+            jobs::claim_due_jobs(db, Utc::now(), fixture.coordinator.settings().lock_for, 2)
+                .await
+                .unwrap();
+        let [peer, submit] = claims.try_into().expect("expected one poll and one submit");
+        let submit_id = submit.model.id.clone();
+        let global = Arc::new(Semaphore::new(1));
+        let first_call = tokio::spawn({
+            let store = fixture.store.clone();
+            let coordinator = fixture.coordinator.clone();
+            let global = global.clone();
+            async move { super::execute_claimed_job(&store, &coordinator, &global, submit).await }
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            blocker.entered.notified(),
+        )
+        .await
+        .expect("submit did not start");
+        let runtime = fixture.coordinator.provider_runtime("noop").unwrap();
+        let health = runtime.health.write().await;
+        assert_eq!(global.available_permits(), 0);
+        blocker.release.notify_one();
+        let peer_result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            super::execute_claimed_job(&fixture.store, &fixture.coordinator, &global, peer),
+        )
+        .await;
+        assert!(
+            !first_call.is_finished(),
+            "submit skipped its health update"
+        );
+        drop(health);
+        tokio::time::timeout(std::time::Duration::from_secs(5), first_call)
+            .await
+            .expect("submit did not finish when its health update resumed")
+            .unwrap()
+            .unwrap();
+        peer_result
+            .expect("completed submit retained global HTTP capacity during health update")
+            .unwrap();
+        assert_eq!(peer_provider.gets.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            jobs::submission_history(db, &submit_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .submit_calls,
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn rate_wait_heartbeats_without_using_fast_provider_capacity_and_cancels_cleanly() {
         let mut fixture = fixture([]).await;
         let fast_provider = ScriptProvider::new([Script::Get(Ok(remote_for(
@@ -13157,6 +13399,141 @@ mod tests {
         }
         paused_runtime_keepalive.finish().await;
         tokio::time::resume();
+    }
+
+    #[tokio::test]
+    async fn shutdown_releases_only_exact_unspawned_fresh_claims_while_draining() {
+        let blocker = Arc::new(GetBlocker {
+            entered: Notify::new(),
+            release: Notify::new(),
+            result: remote_for(
+                "bafy-shutdown-started",
+                "request-shutdown-started",
+                RemotePinStatus::Queued,
+            ),
+        });
+        let mut fixture = fixture([Script::BlockGet(blocker.clone())]).await;
+        PinningCoordinator::configure_worker_for_test(&mut fixture.coordinator, |settings| {
+            settings.worker_concurrency = 4;
+            settings.claim_limit = 4;
+            settings.shutdown_grace = std::time::Duration::from_secs(10);
+        });
+        let db = fixture.store.db();
+        let now = Utc::now();
+        let due = now - chrono::Duration::seconds(10);
+        let old_due = due + chrono::Duration::seconds(2);
+        let reclaimed = fixture.seed_poll("shutdown-reclaimed", old_due).await;
+        let previous = jobs::claim_due_jobs(db, old_due, chrono::Duration::seconds(1), 1)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(previous.model.id, reclaimed);
+        let started = fixture.seed_poll("shutdown-started", due).await;
+        let replaced = fixture
+            .seed_poll("shutdown-replaced", due + chrono::Duration::seconds(3))
+            .await;
+        fixture.enqueue_submit().await;
+        let submit = jobs::stable_submit_id("noop", "bafy-worker", "target-1", 1);
+        pin_job::Entity::update_many()
+            .col_expr(
+                pin_job::Column::NextAttemptAt,
+                sea_orm::sea_query::Expr::value(due + chrono::Duration::seconds(1)),
+            )
+            .col_expr(
+                pin_job::Column::Attempts,
+                sea_orm::sea_query::Expr::value(2),
+            )
+            .filter(pin_job::Column::Id.eq(&submit))
+            .exec(db)
+            .await
+            .unwrap();
+        let history = jobs::submission_history(db, &submit)
+            .await
+            .unwrap()
+            .unwrap();
+        let gate = Arc::new(ClaimDispatchGate {
+            job_id: submit.clone(),
+            arrived: Notify::new(),
+            resume: Notify::new(),
+        });
+        let cancellation = CancellationToken::new();
+        let (completion, _) = tokio::sync::watch::channel(0);
+        let worker = tokio::spawn(CLAIM_DISPATCH_GATE.scope(
+            gate.clone(),
+            super::run_worker(
+                fixture.coordinator.clone(),
+                Arc::new(fixture.store.clone()),
+                cancellation.clone(),
+                completion,
+            ),
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            gate.arrived.notified().await;
+            blocker.entered.notified().await;
+        })
+        .await
+        .expect("worker did not return a batch with a spawned head and an unspawned tail");
+
+        let snapshot = async || {
+            pin_job::Entity::find()
+                .all(db)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|job| (job.id.clone(), job))
+                .collect::<HashMap<_, _>>()
+        };
+        let before = snapshot().await;
+        for id in [&started, &submit, &reclaimed, &replaced] {
+            assert_eq!(before[id].state, "running");
+        }
+        assert!(before[&reclaimed].locked_until > previous.model.locked_until);
+        let old_lock = before[&replaced].locked_until.unwrap();
+        let new_lock = old_lock + chrono::Duration::minutes(1);
+        let renewed_at = Utc::now();
+        assert_eq!(
+            jobs::renew_job_claim(db, &replaced, old_lock, new_lock, renewed_at)
+                .await
+                .unwrap(),
+            Some(new_lock)
+        );
+        cancellation.cancel();
+        gate.resume.notify_one();
+
+        let released_while_draining =
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    let after = snapshot().await;
+                    if after[&submit].state == "pending" {
+                        return after;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await;
+        blocker.release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(5), worker)
+            .await
+            .expect("worker did not finish draining")
+            .unwrap();
+        let during_drain =
+            released_while_draining.expect("unspawned claim waited for the active drain");
+        assert_eq!(during_drain[&started], before[&started]);
+        let after = snapshot().await;
+        let mut expected = before[&submit].clone();
+        expected.state = "pending".to_owned();
+        expected.locked_until = None;
+        assert_eq!(after[&submit], expected);
+        assert_eq!(
+            jobs::submission_history(db, &submit).await.unwrap(),
+            Some(history)
+        );
+        assert_eq!(after[&reclaimed], before[&reclaimed]);
+        assert_eq!(after[&replaced].state, "running");
+        assert_eq!(after[&replaced].locked_until, Some(new_lock));
+        assert_eq!(fixture.provider.gets.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.provider.submits.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

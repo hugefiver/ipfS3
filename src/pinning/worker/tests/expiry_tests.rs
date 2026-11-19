@@ -55,7 +55,13 @@ async fn expired_submit_yields_to_live_sibling_before_recording_any_call() {
 
 #[tokio::test]
 async fn submit_expiring_at_the_rate_gate_never_enters_the_provider() {
-    let fixture = fixture([]).await;
+    let mut fixture = fixture([]).await;
+    PinningCoordinator::configure_provider_runtime_for_test(
+        &mut fixture.coordinator,
+        "noop",
+        2,
+        std::time::Duration::from_secs(1),
+    );
     fixture.register_fixture_routes().await;
     let db = fixture.store.db();
     let leases::TargetProjection::Waiting { submit_job_id } =
