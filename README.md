@@ -5,28 +5,22 @@ An S3-compatible gateway backed by IPFS (Kubo). Translates S3 API calls into Kub
 [![CI](https://github.com/hugefiver/ipfS3/actions/workflows/ci.yml/badge.svg)](https://github.com/hugefiver/ipfS3/actions/workflows/ci.yml)
 [![License: AAAPL](https://img.shields.io/badge/License-AAAPL-blue.svg)](LICENSE.md)
 
-## Features
+## Project status
 
-- **S3-compatible API** — PutObject, GetObject, HeadObject, DeleteObject, CopyObject, ListObjectsV2, ListBuckets, CreateBucket, DeleteBucket, HeadBucket
-- **Multipart Upload** — CreateMultipartUpload, UploadPart, CompleteMultipartUpload, AbortMultipartUpload, ListParts
-- **SigV4 Authentication** — AWS Signature Version 4 via [s3s](https://github.com/s3s-project/s3s)
-- **Per-object Encryption** — SSE-S3 (gateway-managed key) and SSE-C (customer-provided key) with AES-256-GCM
-- **Content-addressed Storage** — ETag = IPFS CID; plain objects accessible via any public IPFS gateway (`https://ipfs.io/ipfs/<CID>`)
-- **Object Versioning** — Unversioned, Enabled, and Suspended bucket states with S3-style version IDs, delete markers, and `ListObjectVersions`
-- **Lifecycle Rules** — Expiration, incomplete multipart abort, and current/noncurrent `STANDARD -> STANDARD_IA` transitions to an optional independent cold Kubo
-- **Streaming** — Request and response bodies stream end to end; the documented exception is a Range read of an encrypted object, which decrypts the full object before slicing; chunk-level encrypted Range reads are planned for v0.8
-- **Dual Backend** — SQLite (dev) or PostgreSQL (prod) via sea-orm, with a final-layout schema baseline and explicit historical upgrades
-- **Remote Pinning:** Asynchronous Pinata, Filebase PSA/RPC upload, and independent Kubo RPC pinning with ordered policies, durable work, leases, and local soft quotas
-- **Durable Import** — SigV4-authenticated CID or allowlisted HTTPS import with persisted progress, lease-based recovery, optional idempotency, optional ZIP extraction, and stale-publication fencing
+- **S3 API:** Bucket and object CRUD, batch delete, ListObjects v1/v2, multipart uploads, object versioning, per-version tagging and path-style bucket CORS. [s3s](https://github.com/s3s-project/s3s) verifies SigV4 with configured access keys, including presigned GET and PUT.
+- **Lifecycle:** Expiration, incomplete multipart abort, and current/noncurrent `STANDARD` to `STANDARD_IA` transitions to an optional independent cold Kubo. CORS and lifecycle configurations honor `ExpectedBucketOwner` when supplied.
+- **Storage and encryption:** Kubo stores content and the object ETag is its CID. The gateway streams plaintext and AES-256-GCM (SSE-S3 and SSE-C) objects. An encrypted Range streams the selected bytes with bounded plaintext buffering and still reads and authenticates the full ciphertext.
+- **Remote backups:** Asynchronous Pinata, Filebase, independent Kubo RPC and IPFS Cluster pinning, with expiring file references, shared resources and provider acknowledgment status.
+- **Import and ZIP:** Signed CID or allowlisted HTTPS imports have durable job status and fenced publication. ZIP extraction supports direct PUT, multipart completion and import, with durable batch results and optional UnixFS directory roots.
+- **Metadata and deployment:** SQLite or PostgreSQL via SeaORM. The two-gateway profile shares PostgreSQL and Kubo; the same-host Cluster profile adds private-swarm pinset replication. See [database initialization and upgrades](docs/database-storage.md).
+
+The gateway uses static credentials. IAM, STS and per-bucket policy authorization are planned; `ExpectedBucketOwner` only compares a supplied value with the bucket owner. Pin-provider dispatch limits do not limit S3 requests. See the [roadmap](ROADMAP.md) for planned request controls, ciphertext chunk fetching and other S3 extensions.
 
 ## Hardening boundaries
 
-- **Mutation-lease upgrades:** Standard content mutations use a database-clock
-  lease of 120 seconds and long requests renew it every 30 seconds. Before the
-  migration that introduces this lease, stop and drain every old writer. Do not
-  run old and new writers against the upgraded database together: an old writer
-  bypasses the fence. Failed renewal or a crashed process is recovered after
-  lease expiry, not by an immediate handoff.
+- **Mutation leases:** Standard content mutations use a 120-second database-clock
+  lease. Long requests renew it every 30 seconds. A failed renewal or crashed
+  process is recovered after lease expiry.
 - **Unsupported write shapes:** `POST` browser `multipart/form-data` is rejected
   before the body reaches s3s, including requests with media-type parameters.
   `If-Match` and `If-None-Match` on `PutObject` or multipart completion are
@@ -46,11 +40,9 @@ An S3-compatible gateway backed by IPFS (Kubo). Translates S3 API calls into Kub
   seconds. The multi-gateway Nginx configuration retries only `GET` and `HEAD`.
   A write-side upstream failure fails the request and is never replayed.
 
-**Verification boundary:** Stage 4 passed isolated Kubo 0.43.0 and PostgreSQL 17
-and 18 checks, signed HTTP regressions, and mock URL/provider recovery tests. Real
-Filebase/Pinata account writes remain **NOT RUN**. The process-restart check uses
-two test executables with the production import components, not the production
-`main` binary; it does not claim complete deployment or remote-account coverage.
+Real Filebase and Pinata account writes aren't covered by the documented local
+checks. The provider status reflects its acknowledgment, not an independent
+check of the stored copy.
 
 ## Quick Start
 
@@ -122,8 +114,10 @@ separate deployment below.
 behind one Nginx entry point. Both replicas share one PostgreSQL 18 service, one
 Kubo service, identical S3 credentials, and the same master key. There is no
 session stickiness: PostgreSQL provides shared metadata and Kubo provides shared
-content. PostgreSQL startup migrations are serialized with a transaction-scoped
-advisory lock before either gateway binds its listener.
+content. An empty PostgreSQL schema is initialized under a transaction-scoped
+advisory lock. For an existing older schema, follow the
+[offline upgrade procedure](docs/database-storage.md#upgrade-an-existing-database)
+before starting either gateway.
 
 Set the four required secret values as in the PostgreSQL baseline, then provide
 an explicit non-wildcard load-balancer bind and port:
@@ -316,7 +310,7 @@ aws --endpoint-url http://localhost:9000 s3 cp s3://my-bucket/file.txt -
 
 ### Access via IPFS Gateway
 
-Plain (unencrypted) objects can be accessed directly through any public IPFS gateway:
+A public IPFS gateway can read a plain object by CID when it can retrieve the content from the IPFS network. Content kept on a private or offline swarm isn't publicly reachable:
 
 ```bash
 # Get the CID from the ETag header
@@ -390,9 +384,7 @@ while a lifecycle action observing the same absence succeeds idempotently.
 Aborted CID pins are retained; no lifecycle path calls `pin/rm`.
 Abort response headers (`x-amz-abort-date`, `x-amz-abort-rule-id`) and
 `ListMultipartUploads` are not implemented.
-PG17 runner (requires two gateways, a load balancer, and Kubo endpoints):
-`pwsh tests/run-postgres-lifecycle-validation.ps1 -PostgresUrl <url>`
-See [validation evidence](tests/results/postgres-lifecycle-validation/) for run status.
+See the [lifecycle design](docs/superpowers/specs/2026-08-26-lifecycle-program-design.md) for eligibility and task execution.
 
 ### Transition to independent cold storage
 
@@ -406,8 +398,8 @@ CID and complete local pinned content are verified, and only then is that
 immutable version's cold residency/class published atomically.
 
 CID, ETag, public version ID, object bytes, metadata, tags, and encryption remain
-unchanged, including SSE-S3 key wrapping and SSE-C key identity. GET/HEAD, Range,
-object listings and version listings use the selected version's residency;
+unchanged, including SSE-S3 key wrapping and SSE-C key identity. GET serves the selected version from its recorded tier; HEAD, object listings
+and version listings report its storage class. Range is supported;
 different versions sharing a CID can have different classes. Copying an IA
 source creates a new `STANDARD` destination; it does not reverse the source's
 transition.
@@ -430,7 +422,7 @@ transition.
   Keep cold configured and its repository intact for those versions.
 - **No physical reclamation promise.** Transition cleanup releases only its
   logical references. No lifecycle path calls `pin_rm` (`pin/rm`), runs GC or
-  deletes blocks. Shared-CID owners and pinning leases remain protected; hot
+  deletes blocks. Shared-CID owners and remote pin references remain protected; hot
   disk usage need not shrink, and extra cold copies may remain after failures.
 - Archive/restore tiers, provider pseudo-tiers, direct IA writes (PUT/COPY/
   multipart initiation), and reverse lifecycle transitions are unsupported.
@@ -443,21 +435,7 @@ and tier-aware reader/writer, with identical hot/cold bindings to the same two
 node identities and separate repositories/volumes. Do not mix old workers or
 readers with the upgraded database. Keep the master key stable. Disabling rules
 is not a schema rollback: do not blindly downgrade binaries or remove residency
-tables/cold storage after IA publication. A separately designed reverse migration
-would be required; this release does not provide one.
-
-See the [lifecycle program design](docs/superpowers/specs/2026-08-26-lifecycle-program-design.md),
-[transition implementation plan](docs/superpowers/plans/2026-09-12-lifecycle-transition.md),
-and [F1 CURRENT evidence](tests/results/lifecycle-transition/CURRENT.md).
-The linked CURRENT receipt identifies the sole authoritative full F1 run (exit
-0); the deployment smoke below is not a replacement for that full validation matrix.
-
-F2 deployment smoke (2026-09-13, current-source offline image
-`ipfs3-f2-current:20260913-b631aa`, image ID prefix `4233de1f7f3f`) verified a
-signed Days=1 transition using one precisely aged disposable SQLite version,
-DB cold/IA publication, unchanged CID/ETag and 67 bytes, IA GET/HEAD/listing,
-and complete pinned cold-local content with hot stopped; its project data and
-unique image were removed after logs-first cleanup.
+tables or cold storage after IA publication. The gateway has no reverse migration.
 
 ### Opt-in dual-Kubo development deployment
 
@@ -471,12 +449,10 @@ docker compose -p ipfs3-lifecycle -f docker-compose.yml -f docker-compose.lifecy
 curl.exe --fail http://127.0.0.1:9000/ready
 ```
 
-Build the gateway from the upgraded source; an old cached `latest` image is not
-evidence of transition support. For an already-built, verified gateway and cached
-Kubo images, replace `--build` with `--no-build --pull never`. The overlay pins
-both Kubo nodes to the F1-validated `ipfs/kubo:v0.43.0`, with separate project-scoped
-`ipfs_data` (hot) and `cold_ipfs_data` (cold) named volumes. Cold runs offline as
-in F1: CAR import over private RPC provides its data, not swarm retrieval from hot.
+Use a gateway image that supports lifecycle transitions. The overlay uses
+`ipfs/kubo:v0.43.0` for both nodes, with separate project-scoped `ipfs_data`
+(hot) and `cold_ipfs_data` (cold) volumes. Cold runs offline and receives data
+by CAR import over private RPC.
 Neither Kubo publishes host ports in this overlay; the gateway binds only to
 `127.0.0.1:${IPFS_S3_LIFECYCLE_PORT:-9000}`. The gateway uses
 `IPFS_S3_COLD_KUBO_RPC_URL=http://cold:5001`, and waits for both nodes at startup.
@@ -589,7 +565,7 @@ entries together, for example
 ### ZIP batch and UnixFS root contract
 
 Legacy ZIP requests keep their archive object and its real CID ETag and
-VersionId, including existing result-body behavior. The new ZIP-only
+VersionId, including existing result-body behavior. The ZIP-only
 `[decompress_zip] unixfs_directory_root` default is on. A ZIP request can
 override it with the exact signed `x-amz-tagging` value
 `ipfs-s3%3Azip-root=false` or `ipfs-s3%3Azip-root=true`. This tag doesn't
@@ -699,11 +675,9 @@ isn't proof that the source body was consumed or verified.
 rejected. For source=false MPU Complete with zero successful output files, the
 contract remains a durable failed batch and the same original 4xx failure
 receipt on completion/replay, queryable through the UploadId. Don't treat an open or pending
-batch as a published object or a successful remote pin. **R25 local isolated
-acceptance passed**, including default-concurrency regression, unchanged wire
-goldens and native PostgreSQL transaction checks. Real paid-provider accounts
-and physical remote pins remain **NOT RUN**; see
-[the verification boundaries](docs/testing.md#stage-9-r25-zip-verification).
+batch as a published object or a successful remote pin. The [ZIP verification scope](docs/testing.md#stage-9-r25-zip-verification)
+covers local publication and replay; real paid-provider accounts and physical
+remote pins aren't covered.
 
 Legacy jobs, attempts, and progress are persisted. If a process or worker stops, a
 lease can expire so another worker reclaims and retries the job. This recovery
@@ -749,8 +723,8 @@ default when `enabled = true`; URL imports remain unavailable until
 `IPFS_S3_MASTER_KEY` must remain unchanged for the full lifetime of every SSE-C
 object and multipart upload. The gateway uses it to verify the persisted
 SSE-C key fingerprint during PutObject, UploadPart, CompleteMultipartUpload,
-GetObject, HeadObject, and CopyObject. v0.4 has no master-key rotation
-procedure. Changing this value can make an existing SSE-C object inaccessible.
+GetObject, HeadObject, and CopyObject. There is no master-key rotation procedure.
+Changing this value can make an existing encrypted object inaccessible.
 
 ## Remote Pinning
 
@@ -759,14 +733,19 @@ Manage remote pins through signed S3 requests. `PutObject`, `CopyObject`,
 alongside their objects. They do not wait for a backup provider. Individual
 multipart parts are not pinned remotely.
 
-A reference identifies the file version or task requesting a pin and its expiry.
-References to the same CID on the same provider share one resource and one
-logical quota charge. The worker submits the pin, stores the provider's
-acknowledgment and handle, and requests removal when the last reference ends.
-An acknowledgment is the service's acceptance of an operation, not a check of
-physical storage, replica count or garbage collection. A request can expire
-without ever receiving a submit acknowledgment. Expiry does not delete the S3
-object or unpin it from the primary Kubo node.
+A reference identifies the file version requesting a pin and its expiry;
+ZIP output demand applies to individual files. References to the same canonical
+CID in the same provider allocation domain share one resource and one logical
+quota charge. The worker makes provider calls outside the database transaction
+and records the result against the claim that issued the call. It stores a
+successful submit acknowledgment and its handle, then requests removal when
+the last reference ends. A removal acknowledgment, including a provider response
+that the target is already gone, ends remote cleanup and releases quota.
+
+Provider acknowledgment reports operation acceptance, not replica count,
+physical storage or garbage collection. An unknown submission result isn't
+replayed to seek confirmation. An expired reference may never have received a
+submit acknowledgment; expiry leaves the S3 object and its primary Kubo pin intact.
 
 ### Configure a backup provider
 
@@ -787,7 +766,8 @@ key prefix. Use `trigger = "always"` for automatic pinning or `"request"` for
 tagged requests. `provider_mode = "one"` selects one provider; `"all"` targets
 each provider in the rule. The policy supplies the default and maximum duration.
 The [configuration example](config.example.toml) includes provider identities,
-RPC/Cluster routes and credential environment variables. `--config-explain`
+routes and credential environment variables. See the [Kubo and Filebase RPC adapter](src/pinning/ipfs_rpc/README.md)
+and the [Cluster adapter](src/pinning/cluster/README.md) for their transport contracts. `--config-explain`
 reads local configuration without exposing secrets or connecting to providers
 or the database. `--ready-probe` checks the running gateway's readiness.
 
@@ -850,11 +830,8 @@ add `&versionId=VERSION` for a specific version. The JSON response includes
 `expires_at` and `status` for each. `accepted` means the provider acknowledged
 the request; an empty array means the selected version has no active reference.
 
-For deployment from the old pin schema, drain the old writers and workers and
-release old pins on their backup providers and back up the database. Run
-`ipfs-s3-gateway --upgrade-database` with the deployment's database configuration
-before starting the new gateway. The upgrade does not reconstruct remote handles
-or replay old pin requests. See the [supported source layouts and upgrade procedure](docs/pinning-recovery.md#upgrade-from-the-old-pin-database-layout).
+For provider errors and ambiguous submissions, see [remote pin operations](docs/pinning-recovery.md).
+For an older pin schema, follow the [offline database upgrade procedure](docs/database-storage.md#upgrade-an-existing-database) before starting the gateway.
 
 ## Architecture
 
@@ -903,10 +880,10 @@ and `pinning` (`Arc<PinningCoordinator>`). `ImportCoordinator` is constructed se
 
 1. **ETag = CID.** Object ETag is its IPFS CID string, not MD5. Plain objects are accessible via `ipfs cat <cid>`.
 2. **Default plain.** No encryption headers = plaintext storage. `x-amz-server-side-encryption: AES256` triggers SSE-S3.
-3. **Metadata in DB, content in IPFS.** S3-strong-consistency via DB ACID + IPFS content addressing.
-4. **No pin::rm on delete.** Kubo's pin API has no reference counting. GC is disabled.
-5. **Multipart Complete = overall add.** Parts are concatenated and re-added as a single UnixFS file.
-6. **Encrypted Range = full decrypt + slice.** The gateway currently decrypts the entire encrypted object and then slices the response; chunk-level encrypted Range reads are planned for v0.8.
+3. **Short publication transactions.** Stream content and perform network work before committing its S3 metadata and pin references. Resolve ownership conflicts at the write for the affected key, version or task.
+4. **S3 deletion retains local pins.** Multiple keys or versions can share a CID. The gateway doesn't reclaim primary Kubo blocks on delete.
+5. **Multipart completion stores one UnixFS file.** Parts are concatenated and re-added as a single file.
+6. **Asynchronous results have their own scope.** Import admission acknowledges a persisted job; a backup provider's acknowledgment settles its remote operation. Check each operation's status for its own result.
 
 ## Development
 
@@ -938,4 +915,4 @@ checks, and the [dependency audit](docs/dependency-audit-2026-09-19.md) for the
 
 ## License
 
-Copyright (c) 2026 hugefiver. Licensed under the [AAAPL](LICENSE) (Anti American AI Public License).
+Copyright (c) 2026 hugefiver. Licensed under the [AAAPL](LICENSE.md) (Anti American AI Public License).

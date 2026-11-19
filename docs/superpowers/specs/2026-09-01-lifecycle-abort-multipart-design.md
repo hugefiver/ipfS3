@@ -1,57 +1,15 @@
 # Lifecycle Abort Incomplete Multipart Upload Design
 
-**Status:** Approved design
-**Date:** 2026-09-01
-**Roadmap scope:** Lifecycle program phase B, abort incomplete multipart uploads
+`AbortIncompleteMultipartUpload` uses the [lifecycle worker](2026-08-26-lifecycle-program-design.md)
+to scan active multipart uploads and abort an exact eligible upload. The action
+identifies the bucket, key, upload ID and database-recorded initiation time.
+Claims, retries, leases and rule revisions are shared with version actions.
 
-## Summary
-
-This phase enables `AbortIncompleteMultipartUpload` in the lifecycle control
-plane released by Phase A. It adds an immutable multipart-upload target to the
-existing durable action system, scans active uploads after version sources, and
-deletes an exact incomplete upload through one bucket-locked database
-primitive. It does not change expiration behavior.
-
-The implementation must keep lifecycle work separate from content mutation.
-An incomplete upload has not published an object version, so a lifecycle abort
-does not take the standard content-mutation admission token and cannot block a
-PUT or CopyObject. It does, however, serialize with CompleteMultipartUpload,
-explicit abort, and bucket deletion through the bucket lock.
-
-`ROADMAP.md` keeps its Lifecycle item unchecked. Transition,
-NoncurrentVersionTransition, physical residency, CORS, lifecycle abort
-response headers, and ListMultipartUploads are outside this phase.
-
-## Approaches and Decision
-
-### Selected: polymorphic lifecycle action target
-
-`lifecycle_actions` gains a typed target shape. Existing expiration actions
-keep their version identity. Abort actions carry a
-`MultipartUploadTargetIdentity` containing bucket, key, upload ID, and the
-database-recorded initiation timestamp. A `LifecycleTargetIdentity` enum makes
-the distinction explicit in the domain model and in worker revalidation.
-
-This keeps one claim, lease, retry, revision-fence, and action-audit system for
-all lifecycle work. The action row remains the durable record that a specific
-rule, at a specific configuration revision, was entitled to act on a specific
-immutable target at a specific due boundary.
-
-### Rejected: separate multipart action table
-
-A separate table would duplicate state transitions, lease recovery, retries,
-diagnostics, worker selection, and configuration invalidation. It would also
-force operational tooling to join two incompatible lifecycle queues. The
-different target shape is small and is enforced by a database check, so a
-second queue is not warranted.
-
-### Rejected: sentinel version fields
-
-Encoding an upload as a fake version row, a zero sequence, or a synthetic
-public version ID would weaken the exact-target invariant. It would make old
-version idempotency encodings ambiguous and permit an accidental version-path
-operation. A discriminated target is clearer and can be validated by both the
-database and Rust types.
+An incomplete upload has no published object version, so abort doesn't take a
+standard content-mutation admission token. The short final write uses the
+bucket lock to resolve conflicts with multipart completion, explicit abort and
+bucket deletion. S3 abort response headers and `ListMultipartUploads` are
+unsupported.
 
 ## Configuration Contract
 
@@ -73,10 +31,9 @@ be read as ambiguous on zero in adjacent lifecycle contexts; this gateway
 deliberately chooses a positive, full-day minimum so the action has a stable
 age contract.
 
-A rule must still contain at least one supported action. A valid prefix or
-all-objects rule may contain abort together with existing supported expiration
-actions. No action is discarded from a mixed valid rule. Unsupported transition
-actions remain a whole-document `InvalidRequest`, exactly as in Phase A.
+A rule must contain at least one supported action. A valid prefix or
+all-objects rule may mix abort with other supported actions. An unsupported
+action invalidates the entire configuration.
 
 An abort action narrows the selector accepted for that rule:
 
@@ -168,10 +125,11 @@ rather than delimiter-dependent concatenation.
 
 ### Migration shape
 
-Append `m20260901_000001_lifecycle_abort_multipart` after
-`m20260831_000001_bucket_cors`. It changes only the lifecycle action
-representation. It must not rewrite bucket configurations, multipart uploads,
-object versions, object content, pins, or provider work.
+The current baseline installs the multipart lifecycle action layout directly.
+The historical fixture `m20260901_000001_lifecycle_abort_multipart` models
+only the change to lifecycle actions. It leaves bucket configuration, multipart
+uploads, object versions, content, and pin records unchanged. For deployment,
+see [database initialization and upgrades](../../database-storage.md).
 
 `lifecycle_actions` becomes polymorphic with these additions and nullability
 changes:

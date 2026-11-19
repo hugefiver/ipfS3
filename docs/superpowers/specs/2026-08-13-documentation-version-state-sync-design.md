@@ -12,8 +12,4 @@ URL sources require exact configured HTTPS origins and public DNS addresses. Red
 
 The architecture description distinguishes `GatewayRoute`, `ImportObjectRoute`, `DecompressZipRoute` and the separate import coordinator/worker. It doesn't claim the coordinator is held in `AppState`.
 
-## Evidence and consistency
-
-Client compatibility statements cite actual dated receipts. Local execution, hosted execution and unexecuted checks remain distinct. A roadmap completion or numbered release claim needs its own supporting evidence; documentation edits alone don't establish either.
-
-README and ROADMAP use the same milestone for chunk-level encrypted Range support. Review examples against the public query/header contract and configuration schema rather than freezing prose or whole-file bytes.
+`202 Accepted` acknowledges the persisted import task. Object publication and any later provider acknowledgment are reported at their own boundaries. ZIP v2 options and replay are documented in the [public request contract](../../../README.md#zip-v2-request-and-replay-contract).

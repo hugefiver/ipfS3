@@ -36,9 +36,9 @@ S3Impl (impl S3 trait) ── holds Arc<AppState>
 | `auth.rs` | S3Auth impl (credential lookup) |
 | `kubo/` | Kubo RPC client (add/cat/pin): bounded control-plane client, unbounded upload client, idle-bounded download client |
 | `store/` | sea-orm entities, migrations, CRUD |
-| `store/pinning/` | Pin tags, leases, targets, remotes, jobs, quota, atomic publication transactions |
+| `store/pinning/` | Atomic S3 publication, per-file pin references and shared provider/CID resources |
 | `crypto/` | AES-256-GCM + key wrap + chunker |
-| `pinning/` | Provider clients (Pinata/Filebase/Noop), policy evaluation, coordinator, quota, durable worker |
+| `pinning/` | Backup provider clients, policy evaluation and the worker that records submit/remove acknowledgments |
 | `zip/` | decompress-zip streaming extraction, local-header observation, path sanitization |
 | `s3/handler.rs` | S3Impl: impl S3, delegates to ops |
 | `s3/ops/` | Per-operation implementations, including `tagging.rs` for the pin control plane |
@@ -50,9 +50,9 @@ S3Impl (impl S3 trait) ── holds Arc<AppState>
 1. **ETag = CID.** The S3 ETag for each object is its IPFS CID string (not MD5). This is a deliberate trade-off: enables `ipfs cat <cid>` for plain objects, but deviates from S3 standard. Clients with strict ETag-MD5 validation may need configuration.
 2. **Default plain.** No encryption headers = plaintext storage. `x-amz-server-side-encryption: AES256` triggers SSE-S3 (gateway-managed key). SSE-C via customer key headers.
 3. **Metadata in DB, content in IPFS.** All object metadata (key→CID mapping, size, encryption state) lives in sea-orm. Content lives in Kubo. This provides S3-strong-consistency via DB ACID + IPFS content addressing.
-4. **No pin::rm on delete.** Kubo's pin API has no reference counting. Deleting an object only removes the DB record; the CID may still be referenced by other keys (e.g. via CopyObject). GC is disabled in dev.
+4. **Separate primary content from remote backups.** Deleting a file version releases its pin references. Other references can keep the same backup CID alive; remote cleanup does not remove blocks from primary storage.
 5. **Multipart Complete = overall add.** Parts are individually added (each gets a part-CID). On Complete, all parts are concatenated and re-added as a single UnixFS file, producing a new root CID. This avoids manual dag-pb construction.
-6. **Encrypted Range = full decrypt + slice.** MVP decrypts the entire object then slices to the requested range. v0.9 will optimize to chunk-level Range.
+6. **Encrypted Range.** The gateway streams the requested plaintext range with bounded buffering. It still reads and authenticates the full ciphertext.
 
 ## Conventions
 

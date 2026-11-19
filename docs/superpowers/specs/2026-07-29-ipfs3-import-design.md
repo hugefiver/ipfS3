@@ -227,7 +227,7 @@ No environment-variable encoding for the origin list is added in this release. E
 
 ## 7. Persistent data model
 
-Import persistence is separate from provider-oriented `pin_jobs`.
+Each import is a durable task with its own status and claim. Its records are separate from `pin_refs` and `pin_resources`, which express file-level demand and shared provider allocations for published objects.
 
 ### 7.1 `import_jobs`
 
@@ -464,7 +464,9 @@ The prefix claim protects not-yet-discovered output keys. As each entry is disco
 
 ### 11.4 Final publication
 
-Import publication uses its `ImportPublicationGuard`. Guarded standard object, ZIP, completed-multipart, and delete entry points require the `StandardMutationGuard` returned by admission. Their final transaction locks the bucket first and verifies the standard token, exact generation, absent import owner, archive key, and normalized prefix before any object/delete side effect. The same transaction writes or deletes object rows, tags, leases, targets, provider reservations, remote pin jobs, multipart-upload state, and then clears the standard token. A preflight-only check is never sufficient. A stale standard guard aborts without changing publication, lease, result, or provider-job state and maps to stable S3 `OperationAborted` with HTTP 409.
+Source I/O, local pinning and extraction run outside the final write transaction. Independent destinations can progress concurrently. The publication write resolves conflicts on the affected keys and task; it commits only against the current owner and claim. Any remote pin references become eligible for the provider worker after commit. Provider acknowledgments do not gate S3 publication or import completion.
+
+Import publication uses its `ImportPublicationGuard`. Guarded standard object, ZIP, completed-multipart, and delete entry points require the `StandardMutationGuard` returned by admission. Their final transaction locks the bucket first and verifies the standard token, exact generation, absent import owner, archive key, and normalized prefix before any object/delete side effect. The same transaction writes or deletes object rows, tags, file pin references, shared pin resource state, and multipart-upload state as applicable, and clears the standard token. A preflight-only check is never sufficient. A stale standard guard aborts without changing publication, pin reference, result, or shared resource state and maps to stable S3 `OperationAborted` with HTTP 409.
 
 Inside the import publication transaction, the import guard:
 
@@ -488,7 +490,7 @@ A combined import performs no S3 publication until extraction has reached a vali
 - the imported archive;
 - every successfully extracted entry;
 - the archive and entry tags/metadata required by existing decompression semantics;
-- durable remote pinning leases/jobs selected by existing policy;
+- file pin references and shared resources selected by the captured policy;
 - paginated import result rows;
 - the completed job state.
 
@@ -577,7 +579,7 @@ Use the existing real-TCP SigV4 harness, mock Kubo, and mock HTTPS source:
 5. Combined import/decompress remains invisible until one atomic publication and returns paginated results.
 6. Fatal ZIP failure preserves all previous objects.
 7. A standard destination mutation supersedes a running job without changing that standard operation's response.
-8. With an older standard multipart or direct ZIP operation blocked after admission, a newer overlapping import completes first; releasing the older operation returns `OperationAborted` and creates no stale object, result, lease, or provider-job state.
+8. With an older standard multipart or direct ZIP operation blocked after admission, a newer overlapping import completes first; releasing the older operation returns `OperationAborted` and creates no stale object, result, pin reference, or shared resource state.
 9. Wrong credentials fail before job lookup or mutation.
 10. URL redirect, forbidden DNS answer, rebinding attempt, timeout, and over-limit stream fail safely.
 10. Worker restart reclaims jobs without allowing two owners to publish.
@@ -609,7 +611,7 @@ Add explicit assertions that requests with unrelated query parameters do not mat
 - Preserve streaming; never collect a source object or archive into memory.
 - Bound every XML body, result page, network stream, timeout, retry count, and stored error.
 - Keep progress events truthful and source-specific.
-- Keep import persistence separate from remote-provider `pin_jobs`.
+- Keep import task records separate from file pin references and shared provider resources.
 - Avoid adding import responsibilities to oversized existing modules.
 - Do not weaken current S3 validation, authentication, publication policy, encryption, or redaction behavior.
 - No implementation may treat `providers_observed` as a replica count.

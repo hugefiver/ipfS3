@@ -14,7 +14,7 @@ publish Kubo ports, include Cloudflared, and retain gateway data. That is useful
 for local work, but it is not a production deployment contract.
 
 The gateway supports PostgreSQL through SeaORM. `AppState::new` connects
-to the configured database and runs all migrations before binding the listener.
+to the configured database and opens or initializes its schema before binding the listener.
 `Store::db()` exposes the `DatabaseConnection`, and SeaORM 1.1.14 provides
 `DatabaseConnection::ping`. The `/health` handler always returns `200 OK`.
 The runtime image intentionally contains neither `curl` nor `wget`, so a Compose
@@ -142,9 +142,7 @@ including headers and body, contains no driver, database, hostname, credential,
 or timeout detail. A structured server-side warning records only the failure
 class, `error` or `timeout`, without a connection URL.
 
-`AppState::new` continues to connect and migrate before the listener binds.
-Consequently a process cannot report either endpoint until startup migration has
-succeeded. Readiness is a later, independent database check for a running
+`AppState::new` opens the configured schema before the listener binds. Readiness is a later, independent database check for a running
 process whose database becomes unavailable. It intentionally does not test
 Kubo, remote pinning providers, workers, S3 credentials, or an individual S3
 operation.
@@ -159,13 +157,10 @@ mode directly. No package is added to the runtime image.
 
 ## Migration ownership
 
-The single gateway owns automatic migration execution. On every gateway start,
-`AppState::new` connects to PostgreSQL and invokes the existing
-`store::run_migrations` before it binds port 9000. PostgreSQL has no separate
-migration container, init SQL, or manual migration command in this baseline.
-For the one-gateway topology, this provides one migration writer and avoids an
-extra lifecycle surface. It is deliberately not a design for simultaneous
-gateway startup; migration leader election is deferred with multi-gateway work.
+The gateway connects before binding port 9000. It initializes an empty schema
+and opens a current one. For any supported older schema, stop the gateway and
+run the [explicit database upgrade](../../database-storage.md#upgrade-an-existing-database)
+before starting it. The Compose file doesn't run an upgrade command.
 
 Persistent database data is retained by the named PostgreSQL volume. Production
 operator documentation must never recommend `docker compose down --volumes`,
@@ -173,68 +168,20 @@ because it deletes that volume. `down --volumes` is permitted only in disposable
 CI cleanup, where the project, volume, and data were created solely for that
 job.
 
-## PostgreSQL JSON compatibility migration
+## PostgreSQL JSON columns
 
-`m20260813_000001_postgres_json_columns` is a forward compatibility migration,
-registered in `src/store/migrations/mod.rs` in the existing `Migrator` order.
-Validation requires its marker in `seaql_migrations` alongside all later
-registered migrations and verifies the resulting JSONB column types.
-
-The PostgreSQL `up` path must validate every non-null source value before any
-type conversion. It must reject invalid JSON with a generic migration failure
-that identifies only the table and column, never a stored JSON value. PostgreSQL
-17 can perform that check with a validity predicate such as
-`pg_input_is_valid(value, 'jsonb')`; an equivalent check is acceptable only if
-it has the same no-content, fail-closed behavior. Invalid legacy text stops
-gateway startup and leaves the migration unapplied. The migration must not
-replace invalid values, turn them into `NULL`, substitute an empty object or
-array, or otherwise coerce or discard data.
-
-After validation, the migration uses PostgreSQL-only `ALTER TABLE ... ALTER
-COLUMN ... TYPE JSONB USING ...` statements. The nullable metadata columns use
-the equivalent of `CASE WHEN metadata IS NULL THEN NULL ELSE metadata::jsonb
-END`. `tags_json` uses a safe equivalent that preserves existing valid JSON and
-its logically empty-array default. It remains `NOT NULL`, and its PostgreSQL
-default is explicitly ` '[]'::jsonb`. The migration preserves each column's
-nullability and default semantics; it does not change keys, foreign keys,
-timestamps, privileges, or unrelated columns.
-
-The PostgreSQL `down` path converts the same three columns back to `TEXT` using
-the equivalent of `JSONB::text`, preserves `metadata` nulls, restores the
-logical empty-array default as text for `tags_json`, and retains its `NOT NULL`
-constraint. SQLite performs no schema change in either direction. The default
-SQLite Compose stack, its schema diff, and its runtime behavior remain
-unchanged.
-
-Migration execution is transactional where the backend permits it. PostgreSQL
-operators must account for the `ALTER TABLE` lock before deploying. A failed
-validation or conversion is an explicit failed deployment, not a partial
-success. Rollback is limited to the normal migration `down` operation after a
-successful `up`; it serializes JSONB canonically as text and does not promise to
-restore formatting or key order from pre-migration JSON text.
-
-## Regression coverage
-
-The PostgreSQL store tests exercise an upgrade from the pre-compatibility
-schema as well as a fresh full migration. They assert:
-
-1. PostgreSQL reports `jsonb` for `objects.metadata`,
-   `multipart_uploads.metadata`, and `multipart_uploads.tags_json`.
-2. Multipart upload creation and retrieval round-trip nullable metadata and
-   JSON tags through the store.
-3. Multipart-part upsert succeeds after that read and creates the expected part
-   row.
-
-Fixtures use a unique namespace and serialize shared migrations. Invalid legacy
-JSON must fail without changing columns or recording a successful migration
-marker. Diagnostics must not print stored JSON.
+New PostgreSQL schemas define `objects.metadata`, `multipart_uploads.metadata`,
+and `multipart_uploads.tags_json` as `JSONB`. Metadata is nullable; multipart
+tags are required and default to an empty array. SQLite uses `TEXT` for these
+columns. PostgreSQL store coverage includes multipart metadata and tags round
+trips and multipart-part writes.
 
 ## Data and failure flow
 
 1. Compose interpolates required variables. A missing required value stops
    `docker compose config` before resources are created.
 2. PostgreSQL and Kubo start on the internal network and become healthy.
-3. Gateway connects to PostgreSQL, applies migrations, initializes state, binds
+3. Gateway connects to PostgreSQL, opens or initializes the schema, binds
    internally on port 9000, then starts workers.
 4. The gateway probe requests `/ready`; only a successful database ping marks
    the service healthy.
@@ -304,10 +251,8 @@ the same order:
    project name.
 4. Request `/health` and `/ready` through the loopback gateway mapping and
     require `200 OK` bodies `OK` and `READY`.
-5. Query PostgreSQL inside its container and require the latest registered
-    migration chain, including `m20260813_000001_postgres_json_columns`, in
-    `seaql_migrations`. Also require `jsonb` for the three compatibility
-    columns before running E2E.
+5. Query PostgreSQL inside its container for the current schema marker in
+   `seaql_migrations` and verify the three JSONB column types before running E2E.
 6. Run the existing serial `cargo test --test e2e -- --nocapture
     --test-threads=1` target against the validation loopback endpoints. It must
     pass every selected case, including the 6 MiB multipart `UploadPart` case.
@@ -326,8 +271,7 @@ The PowerShell checks run in the release-validation infrastructure job before ho
 deployment validation. It checks the job is blocking, has the unique project
 name, includes all checks above in order, uses the disposable override, prints
 logs and cleans up on `always()`, and does not weaken the default SQLite Compose
-E2E job. Migration checks require the registered chain and `jsonb` for the three
-compatibility columns.
+E2E job.
 
 The `postgres-production-deployment` job is a blocking regression for pushes
 and pull requests. A GitHub-hosted pass is required before merge or release.
@@ -340,13 +284,12 @@ Local live results don't establish a hosted pass.
 | `docker-compose.postgres.yml` | Production PostgreSQL, Kubo, and gateway topology and environment contract. |
 | `tests/compose.postgres-production-validation.yml` | Disposable CI-only loopback port publication. |
 | `src/main.rs` | `/ready` route, readiness response, and `--ready-probe` process mode. |
-| `src/store/mod.rs` | Keep `Store::db()` as the readiness dependency and append the new migration to the `Migrator` registration order. |
+| `src/store/mod.rs` | Expose `Store::db()` for readiness. |
 | `Dockerfile` | Healthcheck-compatible binary packaging only if required, with no HTTP probe package installed. |
 | `.github/workflows/release-validation.yml` | Independent blocking production deployment job. |
 | `tests/postgres-production-baseline.Tests.ps1` | Static Compose and workflow contract checks. |
-| `src/store/migrations/m20260813_000001_postgres_json_columns.rs` | PostgreSQL-only, fail-closed JSON compatibility migration and reversible down path. |
-| `src/store/migrations/mod.rs` | Declare the new migration module. |
-| `tests/postgres_import.rs` | Direct PostgreSQL JSONB upgrade and multipart compatibility regressions. |
+| `src/store/migrations/baseline.rs` | Install the final SQLite or PostgreSQL layout. |
+| `tests/postgres_import.rs` | PostgreSQL JSONB and multipart compatibility coverage. |
 | `tests/release-validation.Tests.ps1` | Static latest-migration expectation used by the production validation workflow. |
 | `README.md` | Production invocation and secret-handling guidance, only after local live Docker evidence and the static workflow contract test pass. |
 | `ROADMAP.md` | Check only `PostgreSQL production deployment`, only after local live Docker evidence and the static workflow contract test pass. |
@@ -370,10 +313,8 @@ The implementation is accepted when all of the following are true:
    `503`/`NOT READY` without error detail.
 6. `--ready-probe` performs only the bounded local readiness request and serves
    as the gateway container healthcheck without adding curl or wget to the image.
-7. Gateway startup still completes migrations before binding. The initial local
-    live validation sequence and each subsequent hosted job run prove
-    `m20260813_000001_postgres_json_columns` is applied and the three specified
-    PostgreSQL columns are `jsonb`.
+7. Gateway startup initializes an empty schema before binding. Live validation
+   checks the current ledger marker and the three PostgreSQL `jsonb` columns.
 8. The initial local live validation sequence and the identical new CI job prove
    missing-secret configuration failure, successful stack readiness, both healthy
    endpoints, current migrations, existing E2E success, correct behavior after
@@ -389,20 +330,8 @@ The implementation is accepted when all of the following are true:
 11. `postgres-production-deployment` is a blocking regression on pushes and pull
     requests. Its GitHub-hosted pass is required before merge or release;
     reports distinguish local live evidence from hosted evidence.
-12. The compatibility migration validates all non-null legacy JSON text before
-    conversion. Invalid text fails migration and gateway startup without logging
-    or replacing the stored JSON value.
-13. On PostgreSQL, `objects.metadata`, `multipart_uploads.metadata`, and
-    `multipart_uploads.tags_json` are `JSONB`; nullable metadata remains
-    nullable, and `tags_json` remains `NOT NULL` with a logically empty-array
-    default. SQLite has no change in either schema or behavior.
-14. Direct PostgreSQL store tests verify the three `jsonb` types, multipart
-    create/get metadata and tags round-trip, successful part upsert, and
-    preservation of existing data through upgrade.
-15. The migration's PostgreSQL `down` path returns the three columns to `TEXT`
-    with the original nullability and logical defaults. It is not a guarantee of
-    preserving JSON whitespace or object key order. SQLite `up` and `down` are
-    no-ops.
-16. The complete validation sequence passes from a unique disposable Compose
+12. PostgreSQL store tests verify the three `jsonb` columns, multipart metadata
+    and tags round trips, and successful part upsert.
+13. The complete validation sequence passes from a unique disposable Compose
     project, including E2E, PostgreSQL-stop readiness behavior, diagnostics and
     scoped cleanup. Partial results don't satisfy deployment acceptance.

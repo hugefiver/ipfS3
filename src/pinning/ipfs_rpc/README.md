@@ -15,8 +15,9 @@ authentication, endpoint network policy and timeouts.
   `pin-roots=true`. The ACK requires one matching root with no pin error and
   the terminal stats record.
 
-A successful submit returns `RemotePinStatus::Pinned` from the provider's ACK.
-It does not establish physical residency or resource ownership. Streamed ACKs
+A successful submit returns `RemotePinStatus::Pinned` to the worker, which
+records the acknowledgment as `accepted` in file pin status. This doesn't
+establish physical residency or resource ownership. Streamed ACKs
 require source and multipart EOF, a complete response, and no stream error
 header or trailer. Payloads are streamed with bounded buffering and idle
 limits; control responses are limited to 64 KiB. RPC clients do not follow

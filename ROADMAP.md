@@ -1,137 +1,41 @@
 # Roadmap
 
-## v0.1 — MVP
+## Implemented
 
-- [x] S3 CRUD: PutObject, GetObject, HeadObject, DeleteObject, CopyObject, ListObjectsV2
-- [x] Bucket operations: CreateBucket, DeleteBucket, HeadBucket, ListBuckets
-- [x] SigV4 authentication (via s3s)
-- [x] SSE-S3 encryption (AES-256-GCM, gateway-managed key)
-- [x] SSE-C encryption (customer-provided key)
-- [x] Multipart Upload (Create, UploadPart, Complete, Abort, ListParts)
-- [x] Streaming (no full-body buffering)
-- [x] Docker Compose deployment
-- [x] Cloudflare Tunnel support
-- [x] Kubo config optimization (bootstrap, GC, datastore, CORS)
+### S3 client operations
 
-## v0.2 — Client Compatibility
+- Bucket creation, deletion, HEAD, listing and location (`us-east-1`).
+- Object PUT, GET, HEAD, COPY, single and batch DELETE, ListObjects v1/v2 and per-version tags. The object ETag is its IPFS CID; standard PUT also returns the CID and its `ipfs://` URI in response headers.
+- SigV4 with configured access keys, including presigned GET and PUT.
+- Multipart upload initiation, part upload and listing, completion and abort. Encrypted parts must use the same SSE-C key as the upload.
+- Bucket versioning (enable/suspend), `ListObjectVersions`, delete markers and exact-version operations.
+- Path-style bucket CORS. CORS and lifecycle configuration APIs honor `ExpectedBucketOwner` when supplied.
 
-Goal: make the gateway work out-of-the-box with common S3 clients, not only
-with the AWS CLI happy path. Compatibility is validated by running clients in
-Docker against the local docker-compose stack.
+### Storage and background work
 
-- [x] Fix docker-compose SQLite file database startup (`sqlite:///data/ipfs-s3.db`)
-- [x] GetBucketLocation (`us-east-1`) for MinIO `mc` and SDK preflight checks
-- [x] ListObjects v1 compatibility by reusing the ListObjectsV2 listing logic
-- [x] DeleteObjects (batch delete) for clients that remove multiple keys at once
-- [x] rclone smoke test PASSED: mkdir, copy, ls, cat, deletefile, rmdir through the Compose-network endpoint (`dual_head=NOT_RUN`; see `docs/client-smoke-evidence-2026-07-19.log`)
-- [x] MinIO `mc` smoke test PASSED: temporary alias config, alias list, mb, cp, ls, cat, stat through both endpoints, rm, rb (`dual_head=PASSED`; see `docs/client-smoke-evidence-2026-07-19.log`)
-- [x] AWS CLI smoke test PASSED: mb, cp, ls, get-bucket-location, ListObjects v1, same-client dual-endpoint HeadObject, DeleteObjects, rm, and rb (`dual_head=PASSED`; see `docs/client-smoke-evidence-2026-08-13.log`)
-- [x] Document recommended rclone options when exact S3 behavior differs (`list_version=2`, `use_server_modtime`)
-- [x] Verify HeadObject signatures for nested keys through direct docker networking and localhost (MinIO `mc` same-client dual endpoint `stat` PASSED with `client=Mc verifier=Mc` EVIDENCE; see `docs/client-smoke-evidence-2026-07-19.log`)
-- [x] Track client compatibility matrix in docs
+- Streaming plaintext, SSE-S3 and SSE-C object I/O. Encrypted Range responses stream with bounded plaintext buffering while reading and authenticating the full ciphertext. Each [AES-GCM stream](src/crypto/chunker.rs) reuses its cipher; encryption generates a fresh nonce per chunk.
+- Lifecycle expiration for current and noncurrent versions and eligible delete markers, incomplete multipart abort, and current/noncurrent transitions from `STANDARD` to `STANDARD_IA` on a configured independent cold Kubo. Rules support [prefix, tag and size filters](src/lifecycle/filter.rs) where the action allows them.
+- Asynchronous remote backups with Pinata, Filebase, independent Kubo RPC and IPFS Cluster. Signed S3 requests manage expiring per-file/version references and query status; references share one remote resource per provider allocation domain and canonical CID. Submit and cleanup finish on the provider's acknowledgment. See [remote pin operations](docs/pinning-recovery.md).
+- Durable, signed `ipfs3-import` from a CID or allowlisted HTTPS URL, with persisted progress, lease recovery, optional idempotency and ownership-fenced publication. `202 Accepted` acknowledges the job, before object publication or remote pin submission.
+- Streaming ZIP extraction for PUT, multipart completion and import, with durable batch results, optional source publication in v2, UnixFS directory roots and opt-in automatic pinning for published outputs.
+- SQLite and PostgreSQL metadata storage; a two-gateway profile with a shared PostgreSQL and Kubo backend and [Nginx upstream keepalive](deploy/nginx/multi-gateway.conf); a separate same-host IPFS Cluster replication profile with a private Kubo swarm.
 
-## v0.3 — Hardening
+## Planned
 
-- [x] Presigned URL (GET/PUT)
-- [x] Bucket name validation
-- [x] HeadObject Range support
-- [x] SSE-C key consistency validation for multipart
-- [x] Integration tests for encryption, multipart, SSE-C, Range
-- [x] PutObject response custom headers (x-amz-meta-ipfs-cid, x-amz-meta-ipfs-url)
+### Identity and request controls
 
-## Current: v0.4 — Pinning Service
+- IAM users and policies, STS temporary credentials, and per-bucket policy enforcement for authenticated callers. The existing owner-match check is not caller authorization.
+- Gateway request rate limits. Current dispatch limits apply to background pin providers, not S3 clients.
+- Audit logging for S3 requests and administrative changes.
 
-- [x] Filebase and Pinata PSA clients
-- [x] Ordered automatic and manual pinning policies
-- [x] Standard S3 object-tag control
-- [x] Durable asynchronous worker and crash recovery
-- [x] Sticky `one` failover and `all` provider coordination
-- [x] Lease duration, renewal and expiry; remote unpin on supported routes (provider-wide coverage is tracked below)
-- [x] Decompressed ZIP entry targets
-- [x] Unique-CID local soft quota and eviction
+### Storage reads and visibility
 
-## Current priorities — Pin expiry and project-wide fault isolation
+- Fetch and authenticate only the ciphertext chunks needed for an encrypted Range, instead of reading the entire encrypted object.
+- Gateway metrics and a Prometheus exporter.
 
-- [x] **Make expiry cleanup automatic for every pinning service**, including Pinata, Filebase PSA/RPC, Kubo RPC and IPFS Cluster. Start cleanup with the service and resume pending cleanup after restart; no `managed` opt-in, separate command or protocol exemption. Remove `cleanup = "retain"` from the configuration schema, defaults, examples and deployment configuration. Migrate existing settings and stored `retain` records so they do not silently disable cleanup after upgrade.
-  - Use the native delete for the gateway's submitted backup pin: the request or file handle where available, otherwise the CID. On a shared CID-addressed backup this removes the node's pin for that CID, including an independent hold on the same CID. Expiry leaves the S3 object and primary copy intact.
-  - [x] Share one quota reservation per `(provider, canonical CID)` and keep the remote pin while another live reference needs it. The same CID on another provider is independent ([shared-CID coverage](tests/integration/pinning.rs#L3308-L3392)).
-  - [x] Mark each expired reference as released. Releasing the **last live reference** enqueues one remote unpin job for that provider, CID and epoch; earlier releases leave the pin in place.
-  - Assign that job when the last reference ends, not in advance from a scheduled expiry time. Concurrent expiries or retries must not create duplicate cleanup jobs. A renewal or new reference must prevent stale cleanup from removing a pin it still needs. Return pin quota when the provider accepts the unpin or reports the pin already absent, then wake eligible waiters. Block reclamation is the node's GC responsibility.
-- [x] **Review failure propagation across the whole project**, from S3 requests, multipart completion and ZIP/import publication through pin scheduling, lifecycle/GC and database maintenance. For each failure, identify which work actually depends on it; keep unrelated work running without weakening atomic publication or reporting an unconfirmed remote outcome as success.
-  - Unresolved receipts hold their own CIDs. Lease expiry and receipt recovery handle failures per item, so ready jobs still dispatch. PostgreSQL claim fences lock the job without updating shared revision rows; terminal writes use the same target-before-job order as projection. Real account-wide capacity limits still apply.
-  - Acceptance: while one CID's submit or unpin remains unresolved, a second eligible CID on the same provider, a pin on another provider, and an unrelated S3 upload can all finish without operator intervention. The failed item remains visible and does not monopolize the queue; after the cause clears, eligible waiting or blocked work resumes automatically.
+### S3 and client extensions
 
-## Delivered — Release Assignment Pending
-
-Package version remains `0.1.0`. This unnumbered section records delivered
-functionality without assigning durable import to v0.4, v0.5, or any other
-numbered release.
-
-- [x] Durable SigV4 `ipfs3-import` submission from a CID or allowlisted HTTPS URL
-- [x] Persisted import status, progress, lease-based retries, and crash recovery
-- [x] Idempotent replay through the optional `x-ipfs3-client-token` header
-- [x] Optional ZIP extraction with ownership-fenced atomic publication
-- [x] Stale-worker and overlapping content-mutation fencing
-- [x] Durable ZIP batches, optional source publication and UnixFS directory/HAMT roots
-- [x] Shared v1/v2 ZIP intent and publication core, with explicitly configured automatic output pinning
-- [x] Scoped Filebase/Kubo RPC and Cluster Proxy/REST providers with strict CID and replica verification
-- [x] Explicit legacy pinning-capacity migration with atomic receipts and guarded rollback
-- [x] Local pinning management: nine action families, exact-version backfill, receipt-scoped workers and canonical retirement barriers
-
-Pinning Stages 1 to 7 and Stage 9 passed local isolated acceptance. Production
-migrations and real paid-provider account operations haven't been run. See the
-[current requirements and status](docs/superpowers/plans/2026-09-20-pinning-zip-unixfs.md)
-and [verification boundaries](docs/testing.md).
-
-- [ ] **ZIP/MPU incident recovery before Stage 8.** Recover the fixed batch set using proven original MPU/parts and frozen Complete contracts, without overwriting current objects or fabricating metadata. Verify exact receipts, root adoption, immutable version bindings and complete S3/Kubo content; missing inputs remain explicitly blocked. See the [production investigation and recovery status](docs/investigations/2026-10-22-zip-mpu-publication-recovery.md).
-- **Current production hotfix scope: partial database liveness mitigation.** Bound quota wake batches, keep SQLite text-key lookups indexable and avoid unused waiter/publication eviction proposals. Scope admission context reads to the complete referenced-evidence closure while retaining ledger/evidence and historical provider aliases. Maintain still-current source/root claims cooperatively inside the same atomic Legacy MPU publication transaction, including shared-CID inner loops; never revive expired ownership or relax TTL/fences. Use a deployment-scoped pinning scheduling override (one in-flight job, a conservative five-minute scan interval after the six-hour recovery window) to reduce contention. The original-MPU cohort of 23 batches and 3,534 outputs has passed publication and full-content verification; 35 fixed-scope batches still lack current executable recovery inputs/authorization. Quota-waiting replicas and ambiguity-parked jobs remain subject to their existing safety boundaries, not manually reclassified as complete. Preserve existing connection count, timeouts, quota, authorization, fencing, atomic publication and receipt requirements. Acceptance requires bounded database waiting, repeated normal Complete completion and committed background progress at normal scan rates under representative SQLite/no-headroom workloads. A recovery quiet window alone is not acceptance; transient readiness failures remain visible. Scheduling or query benchmarks do not complete ZIP/MPU recovery.
-- [ ] **Next after the hotfix, before Stage 8: database control-plane liveness and recovery refactor.** Coordinate this with the Stage 7.5 management scalability work; replace internal execution paths incrementally while preserving existing data and external contracts.
-  - [ ] Separate quota reservation, advisory candidate discovery and fenced eviction execution; remove repeated provider-wide work from ordinary waiter paths.
-  - [ ] Make transaction ownership and completed rollback explicit, bound discovery and processing cost, and apply fair scheduling/backpressure between business requests, claim/renewal and background maintenance. Retain complete required lock frontiers, fresh admission checks and queue-head ordering. Validate connection-local schema/shadow checks and DDL/rollback visibility before enabling multiple SQLite connections.
-  - [ ] Reduce N+1 reads with indexable, set-oriented queries without caching authorization or debt decisions; instrument connection waits, lock waits, transaction duration, renewal and unknown commit results.
-  - [ ] Provide controlled recovery of prepared open MPU batches using proven original inputs and frozen contracts, with atomic publication/receipts and idempotent replay; missing inputs remain explicitly blocked.
-  - [ ] Validate no-headroom and growing queues, shared CIDs, provider debt, cancellation/restart and unknown commits at representative scale, with sustained production observation beyond the prior recurrence window.
-- [ ] Stage 8 capacity and cross-process scheduling research with a reproducible baseline, after the control-plane refactor
-- [ ] Full-owner GC inventory and isolated writer-barrier/fault-recovery validation
-
-Stage 8 isn't accepted. Draft measurements don't establish production capacity,
-global rate limits or safe physical reclamation; production unpin/GC remains unrun.
-
-## v0.5 — Multi-node
-
-- [x] PostgreSQL production deployment
-- [x] Multiple gateway instances (horizontal scaling)
-- [x] IPFS Cluster for pinset replication
-- [x] Private swarm (swarm.key) for node-to-node communication
-
-## v0.6 — Versioning & Lifecycle
-
-- [x] Object versioning (enable/suspend on bucket)
-- [x] ListObjectVersions
-- [x] DeleteMarker support
-- [x] Lifecycle rules (expiration, transition)
-- [x] Bucket CORS configuration
-
-## v0.7 — IAM & Security
-
-- [ ] IAM users and policies
-- [ ] STS temporary credentials
-- [ ] Per-bucket access control
-- [ ] Request rate limiting
-- [ ] Audit logging
-
-## v0.8 — Performance
-
-- [ ] Chunk-level encrypted Range
-- [ ] Pebble datastore backend for Kubo
-- [ ] Connection pooling tuning
-- [ ] Metrics and Prometheus exporter
-- [ ] AES cipher reuse (avoid per-chunk key schedule)
-
-## v0.9 — Ecosystem
-
-- [ ] S3 Select
-- [ ] Advanced tag-based search and policy conditions
-- [ ] Event notifications (webhook on Put/Delete)
-- [ ] Static website hosting (via IPFS Gateway + DNSLink)
-- [ ] rclone backend plugin
+- S3 Select and tag-based search and policy conditions. Tag conditions belong to the authorization boundary; search can be eventually consistent.
+- Object event notifications via webhook for committed PUT and DELETE operations. Delivery work is tracked independently of request completion and settled by the destination's acknowledgment.
+- Static website hosting via IPFS Gateway and DNSLink.
+- Native rclone backend for gateway extensions, separate from rclone's existing S3 backend.

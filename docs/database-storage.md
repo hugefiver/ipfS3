@@ -1,154 +1,35 @@
-# Hybrid database storage
+# Database storage and upgrades
 
-Management authority remains in the relational source catalog. Archive payloads
-are immutable storage, not independent authorization sources. Their revisions
-participate in history-export checkpoints; writing an archive does not recursively
-capture its own payload as a new management source.
+The gateway keeps S3 metadata and durable work in SQLite or PostgreSQL. Object bytes live in Kubo. Use a persistent SQLite URL for data you want to keep (for example, `sqlite:///data/ipfs-s3.db?mode=rwc` in Docker), or provision a PostgreSQL database and schema before starting the gateway.
 
-## Storage and integrity
+## Initialize an empty database
 
-Each plan's approved anchor item owns the frozen proposal and confirmed ACK
-document. Other items retain their exact identities, creation times, expiry,
-results, and native-before locator, with an `S7R2` integrity reference to the
-anchor's exact confirmed bytes. Membership validation resolves the anchor and
-checks every item; a reference alone never supplies confirmation authority.
-Existing full per-item bindings remain readable without rewriting their original
-text. Result publication compares the selected item's original binding in the
-same transaction as the business mutation and receipt.
+Normal startup installs the final schema directly and records `m20261120_000001_file_pins` in `seaql_migrations`. It doesn't run the historical migration chain. On a current database startup reads the latest ledger marker; it doesn't rerun DDL or audit the catalog. It refuses nonempty databases with an older or missing marker. PostgreSQL serializes concurrent empty-schema initialization using a transaction-scoped advisory lock.
 
-The anchor is the plan-level aggregate: a second plan table is not required to
-share the approved proposal and acknowledgements. Only the proposal timestamp is
-shared. An item's original creation time and expiry are never inferred from its
-siblings or recomputed from a shared timestamp.
+## Upgrade an existing database
 
-`pin_management_inline_archive` stores complete documents whose serialized body is
-at most 64 KiB and whose header plus body fits a 1 MiB read page. Its `S75I2` digest
-binds the format, inline representation, exact header bytes, and body length and
-bytes. The immutable row is published in the caller's transaction. Small-document
-reads and writes each use one SQL statement and do not fetch chunk rows.
+The old ledger must be an exact ordered prefix of the list below, with at least the first two entries. A matching last entry alone doesn't make an old ledger eligible.
 
-Larger bodies use `pin_management_archive` and
-`pin_management_archive_chunks`. `S75A1` retains its exact segmented format and
-integrity algorithm, including chunk ordinals and lengths. Incremental staging
-also uses this representation. The 64 KiB inline threshold is not a rejection
-limit for existing or new large archives. A segmented reader must verify the
-trailer before its sink is published.
+- `m20261027_000001_schema_baseline`
+- `m20261108_000001_current_pinning_config`
+- `m20261109_000001_pin_cid_comparisons`
+- `m20261110_000001_requeue_retained`
 
-Both representations reserve `archive_id` through the primary key of
-`pin_management_archive_identity` in their insert transaction, including unsealed
-staging roots. PostgreSQL's unique-key conflict serializes competing inserts even
-under repeatable-read snapshots. This immutable identity index is rebuilt from
-root IDs during isolated upgrade; it is not an authority or history payload source.
-Private v3 loading verifies either representation, its header/body binding, and
-the complete v3 stream before exposing a cursor.
+For earlier layouts, first use the previous gateway's documented upgrade path to reach a supported layout. Before running the file-pin upgrade, stop accepting writes, drain and stop every old gateway and worker using the database, back up the database, and release the old remote pins on their original backup providers. Keep the backup until you've verified you can restore it. If the old Cluster configuration uses `min_replicas` or `verifier_limits`, remove those options before starting the new gateway; the current adapter records service acknowledgments.
 
-Bodies are bytes, not normalized database JSON. Original whitespace, duplicate
-JSON keys, binary data, SQL-cell null markers, and original timestamp text remain
-recoverable. Headers and payloads are length-bounded in SQL before materialization.
-Private history export includes both archive representations and restores their
-exact bytes without applying them to a live database.
+Run the new binary with the deployment's configuration:
 
-## Initialization and isolated upgrade
+```powershell
+$env:IPFS_S3_CONFIG = "C:\gateway\config.toml"
+ipfs-s3-gateway --upgrade-database
+```
 
-The registered migration `m20261023_000001_inline_documents` contains the SQLite
-and PostgreSQL DDL. It adds inline storage and its immutable/revision guards, and
-moves frozen import input into `import_job_requests`. It does not rewrite or
-delete existing archive roots, chunks, or historical records.
-No destructive downgrade is provided.
+Check `storage.database_url` and any `IPFS_S3_DATABASE_URL` override before running the command. It opens that database and runs the schema change in a transaction without starting HTTP, workers, or Kubo or provider operations. If the connection is lost during commit, establish the database outcome before proceeding. Start only upgraded gateway and worker binaries after the upgrade succeeds. There's no down migration.
 
-Ordinary startup initializes an empty database. It performs only read-only schema
-checks for a nonempty database and rejects an old or incomplete schema with
-upgrade-required. Operators must quiesce writers and workers and retain a separate
-backup before invoking the explicit local upgrade entry.
+The upgrade removes the old pin tables and management triggers and creates empty `pin_refs` and `pin_resources` tables. It retains buckets, object versions, ordinary tags, multipart uploads, ZIP and import records, lifecycle configuration, and residency. It doesn't recover remote handles, replay old pin requests, or rebuild references from S3 tags. For any file that still needs remote pinning, [submit a fresh signed request under the current policy](../README.md#standard-s3-tag-control).
 
-`store::initialization::upgrade_existing` accepts the exact source versions
-`m20261013_000001_zip_root_logical_release`,
-`m20261017_000001_management_storage`, `m20261023_000001_inline_documents`,
-`m20261027_000001_schema_baseline`, and `m20261108_000001_current_pinning_config`,
-the current target version, and the original
-database scope and native identity. Import layout conversion runs in the isolated
-schema transaction: SQL projects at most 256 bounded IDs per page, then copies
-their cold cells within the database without driver materialization or JSON
-normalization. The source columns are removed only after all copies succeed;
-failure rolls the layout and cells back together. SQLite column removal rewrites
-the source table and requires maintenance time and free disk space. Management
-history conversion uses bounded source reads and per-original transactions.
-The identity-bound upgrade stamp is target-specific;
-retry resumes the same upgrade without replacing prior upgrade originals.
-Readiness is published only after source/locator coverage and revisions pass the
-existing final fence. Incomplete conversion leaves the database unavailable to
-ordinary startup.
+## Durable import requests
 
-Historical committed results remain recoverable under their original identities.
-Recorded recovery retains the verified original anchor and core identity and reads
-current and historical provider captures as their respective strict DTOs. It never
-constructs a replacement execution capture. Conversion indexes use a versioned
-namespace, leaving earlier indexes and original archive references intact.
-Converted unexecuted plans retain their original review material, not renewed
-execution authority: new execution requires a new plan ID. Upgrade does not renew
-TTL, alter item creation times, re-execute committed business work, or automatically
-delete originals or backups. Production upgrade requires separate authorization.
+`import_jobs` holds scheduling, claim epochs, progress, destination identity, idempotency keys, and terminal state. Its one-to-one `import_job_requests` row holds the frozen source value, content type, metadata, tags, and pin or ZIP inputs. Admission commits both together, and deleting a job cascades to its request. The request keeps SQL text and nullable cells. ZIP capture carries the frozen options used at execution instead of applying live defaults to an already admitted job.
 
-The existing CLI entry is `--pinning-manage-upgrade` with `--database-url`,
-`--native-identity`, `--database-scope`, `--source-version`, and `--target-version`.
-It opens an existing database without ordinary gateway initialization or provider
-RPCs. Use the preserved original identity and a supported source version; the
-target is `m20261109_000001_pin_cid_comparisons`. This migration derives indexed
-canonical comparison keys from existing remote and ledger CID strings; original
-CIDs, object ETags and historical receipt contents stay unchanged. Keep the operator's independent
-backup until restore has been verified. No migration deletes that backup.
-
-PostgreSQL preparation has an unresolved migration-lock timeout, error-redaction,
-and transaction-cancellation safety limitation. A timeout or cancelled caller is
-not proof of rollback or of a connection being safe to reuse; a commit whose
-acknowledgement was lost has an unknown outcome. PostgreSQL preparation is not
-accepted for production use until these guarantees are verified. Retain the
-independent backup and establish the database outcome before retrying a failed
-or interrupted upgrade.
-
-## Frozen intake and import hot state
-
-New ZIP imports and multipart intakes retain the frozen source decision in their
-ZIP capture rather than serializing a second decision document. ZIP imports also
-retain the root option in that capture. Ordinary and historical uncaptured
-intakes keep their explicit standalone variants. Readers reject contradictory
-historical duplicate fields; they never infer executable intent from tags or
-current configuration. Multipart parts remain independent relational rows.
-
-`import_jobs` contains scheduling, claim epochs, progress, terminal results,
-destination identity, idempotency keys, and original timestamps. Its one-to-one
-`import_job_requests` row owns the source value, content type, metadata, tags,
-and captured pin/ZIP inputs. Submission writes both within the ownership
-transaction; expiry deletes the request through the existing job lifetime.
-Request revisions participate in current native snapshots. Private management
-history exports carry cold requests only when frozen inside original management
-reviews; they do not enumerate the live request table. The live cold table is
-neither a management history source nor a second management action authority.
-
-This request aggregate keeps original SQL text and nullable cells rather than
-wrapping them in another JSON serialization. There is no internal JSON predicate
-to justify JSONB or a second normalized body. Its layout is bound by the registered
-schema catalog; historical catalogs retain the predecessor's exact column shape.
-New ZIP captures still use their existing typed, versioned domain document.
-
-Claim selection projects only bounded job IDs and source types, ordered by due
-time, creation time, and ID. A claim page contains at most 256 candidates. CAS
-updates acquire jobs in ascending ID order; returned jobs retain due-time order.
-Only successful claims are loaded in full. SQL byte-length projections select
-small joined rows into pages of at most 256 rows and 1 MiB. Larger requests are
-read as 64 KiB byte slices, batched across up to 15 jobs per payload page, rather
-than issuing a new full-request read per job. UTF-8 is decoded after reassembly,
-so a slice can cross a code point without changing the original text. A request
-larger than 1 MiB is not rejected merely for crossing a page boundary. Resident
-assembly remains bounded; pathological requests can exhaust that budget without
-publishing partial claims.
-
-Renewal and progress updates retain their existing claim-epoch fences and never
-load or rewrite request bodies. Status has a separate projection: it reads hot
-counters and only the frozen capture fields needed for response headers and ZIP
-status, never source descriptors, object metadata or tags. SQL bounds every
-selected status cell before decoding; larger captures use the bounded cell reader
-inside the same read transaction. Execution uses the complete joined projection.
-Ownership and publication fences select only hot claim state. Bucket supersession
-pages IDs with SQL byte bounds; extraction separately reads only its frozen prefix.
-New intake writes go through the import store, not arbitrary full-model updates.
+The worker first selects bounded candidate pages and loads complete requests only for jobs it claims. It reads large request values in bounded byte slices and decodes UTF-8 after reassembly. Renewal, progress, and ownership checks don't load or rewrite full request bodies. Status queries project only the state and capture fields needed for the response. See the [import request and status contract](../README.md#durable-ipfs3-import).

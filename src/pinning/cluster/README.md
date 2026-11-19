@@ -6,4 +6,4 @@ Configure a `kind = "cluster"` provider with an explicit `strategy` (`cid`, `upl
 
 Private endpoints and cleartext HTTP require `allow_private_network = true`. Clients disable redirects, automatic HTTP retries, and ambient proxies. TLS hostname and certificate verification remain enabled. Configure transfer deadlines and body and CAR limits with `transfer_limits`; `stream_channels` controls the add response framing.
 
-See [Cluster write transport](provider/README.md) for the wire contract.
+See the [configuration example](../../../config.example.toml) for a complete provider entry and [Cluster write transport](provider/README.md) for the wire contract. For file status, cancellation and ambiguous writes, see [remote pin operations](../../../docs/pinning-recovery.md).

@@ -1,28 +1,10 @@
 # Lifecycle Expiration Design
 
-**Status:** Approved design
-**Date:** 2026-08-26
-**Roadmap scope:** Lifecycle program phase A, independently deliverable expiration subset
+This document covers current `Expiration`, `NoncurrentVersionExpiration`, and
+`ExpiredObjectDeleteMarker`. The [lifecycle design](2026-08-26-lifecycle-program-design.md)
+covers the shared configuration, multipart abort, and supported cold transition.
 
-## Summary
-
-This project delivers a complete, durable S3 Bucket Lifecycle configuration
-surface for expiration actions. It stores one canonical, revisioned
-configuration per bucket, evaluates it with bounded database-clock scans, and
-executes safe, idempotent actions through the established version-aware
-ownership boundary. It supports current `Expiration`,
-`NoncurrentVersionExpiration`, and `ExpiredObjectDeleteMarker`.
-
-The project deliberately does not claim full lifecycle support. PUT rejects
-`Transition`, `NoncurrentVersionTransition`, and
-`AbortIncompleteMultipartUpload` with `InvalidRequest`, and a rejected request
-persists no portion of its XML. The next program project adds multipart abort;
-storage-class transition waits for the residency, dual-Kubo, and saga projects
-defined in `2026-08-26-lifecycle-program-design.md`.
-
-## Scope and Decisions
-
-### Selected approach
+## Expiration execution
 
 Lifecycle configuration has a dedicated control-plane table and lifecycle work
 has a dedicated durable-action table. The evaluator uses stable cursors and
@@ -32,27 +14,10 @@ noncurrent state, filter, tags, size, and conflict winner before calling a
 privileged deletion operation. The worker uses database UTC time for every
 persisted due-time and eligibility comparison.
 
-This separates a customer-visible retention policy from pin-provider work.
-`pin_jobs` remains responsible only for provider `submit`, `poll`, `unpin`, and
-`reconcile` work under pin-lease fences. A lifecycle record must instead retain
-the configuration revision, rule ID, immutable version or marker identity,
-eligibility, and S3 deletion semantics. Reusing `pin_jobs` would make a rule
-replacement look like provider cancellation and could corrupt retries.
-
-### Rejected approaches
-
-1. **An in-memory daily sweep, rejected.** It loses progress and can repeat
-   destructive selection after restart. Durable records make crash recovery and
-   multi-gateway claims auditable.
-2. **Delete by `(bucket, key)`, rejected.** The key can be republished between
-   scan and execution. An immutable `object_versions` row identity and sequence
-   are required to keep an action from touching the successor.
-3. **Direct `pin_rm`, rejected.** CIDs are shared across object rows, retained
-   versions, and pinning ownership. Lifecycle deletion changes metadata and
-   uses existing guarded lease handling; it does not physically unpin content.
-4. **Partial acceptance of future actions, rejected.** Silently retaining only
-   expiration from an otherwise invalid document would leave clients believing
-   a transition or multipart abort was configured.
+Lifecycle actions record the rule, configuration revision and immutable S3
+version or marker identity. A rule change invalidates obsolete actions without
+impacting backup provider work. Expiration updates the affected S3 metadata and
+references only; it doesn't physically unpin shared Kubo content.
 
 ## S3 API Contract
 
@@ -123,10 +88,9 @@ AWS. When supplied, both the age and newer-version thresholds must be exceeded.
 These numbers apply to public retained content versions and delete markers,
 ordered by immutable sequence, not to hidden legacy object rows.
 
-The following elements make the entire PUT invalid: `Transition`,
-`NoncurrentVersionTransition`, and `AbortIncompleteMultipartUpload`. All
-unsupported storage classes are therefore rejected, including GLACIER and
-archive names. No transition is represented as metadata in this phase.
+An unsupported action or storage class rejects the entire PUT. See the
+[lifecycle design](2026-08-26-lifecycle-program-design.md) for the supported
+transition and incomplete multipart abort actions.
 
 The validator builds one internal canonical model before any database write.
 Canonical JSON orders object keys and rule fields deterministically, preserves
@@ -243,12 +207,10 @@ markers as zero-byte entries with no tags, so tag filters never match them. It
 considers only public `object_versions` records and
 their associated `objects` content. It excludes ambiguous legacy rows.
 
-When several rules select a target at one due boundary, the evaluator and
-worker apply AWS-compatible precedence: exact permanent noncurrent deletion
-wins; a future transition would outrank current-marker creation, but is absent
-in this phase; current expiration is last. Within an action type, the earliest
-due time wins. The unique idempotency key and a database unique constraint make
-scan replay harmless.
+When several rules select a target, permanent deletion takes precedence over
+transition, followed by creation of a current delete marker. Within an action
+category, the earliest due time wins. A unique action key makes scan replay
+idempotent.
 
 ## Execution and Version Semantics
 
@@ -398,8 +360,6 @@ acceptance.
 
 ## Non-goals
 
-- `Transition`, `NoncurrentVersionTransition`, and every storage class.
-- `AbortIncompleteMultipartUpload`, which is the next program project.
 - Metadata-only transitions, Pinata or Filebase as a cold tier, Glacier restore,
   or tiering of remote pins.
 - CORS, Object Lock, legal holds, retention, MFA Delete, replication, IAM, or
@@ -412,8 +372,8 @@ acceptance.
 
 1. The s3s 0.14 trait methods named in this document expose atomic PUT, GET,
    and DELETE lifecycle configuration behavior with S3 XML errors.
-2. Only the stated expiration subset is accepted. Every unsupported lifecycle
-   action rejects the full PUT without a partial saved configuration.
+2. The stated expiration actions are accepted. Unsupported actions reject the
+   full PUT without a partial saved configuration.
 3. Both engines retain canonical configuration revisions, bounded scan state,
    durable idempotent actions, claim epochs, and safe retry outcomes.
 4. All eligibility and execution decisions use database time and UTC midnight
@@ -426,10 +386,6 @@ acceptance.
 7. Existing ownership and version-aware guards remain in charge. No lifecycle
    code directly calls `pin_rm`, and shared CID, CID/ETag, and encryption
    invariants hold.
-8. Unit, SQLite, PostgreSQL, signed API, migration, concurrency, and required
-   live-client evidence pass before a supported-subset statement is published.
-9. The full program retains `ROADMAP.md:77` as unchecked until all program
-   phases are complete and final evidence has passed.
 
 ## Official Sources
 

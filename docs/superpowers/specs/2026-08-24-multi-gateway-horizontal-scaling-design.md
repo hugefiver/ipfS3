@@ -14,17 +14,14 @@ have no published host ports, gateway readiness is `/ready`, and required
 database, S3, and master-key inputs have no fallback. The default
 `docker-compose.yml` remains the SQLite development topology.
 
-`AppState::new` connects to the configured database and calls
-`store::run_migrations` before the listener binds. Concurrent PostgreSQL
-startup serializes migration execution with a transaction-scoped advisory lock.
+`AppState::new` opens the configured database schema before the listener binds.
+Concurrent PostgreSQL startup serializes empty-schema initialization with a
+transaction-scoped advisory lock.
 
-Every normal gateway process starts both the existing pinning worker and the
-existing durable import worker after binding. Import jobs are already durable:
-they have UUID worker identities, `claim_epoch`, database-clock lease fencing,
-and conditional ownership updates. Pinning work already uses exact conditional
-tokens such as `locked_until`. These properties are the basis for this limited
-shared-database topology; they do not turn provider scheduling into a
-cluster-wide service.
+Both gateway processes start import and pinning workers. Import ownership uses
+worker IDs, `claim_epoch`, database-clock leases, and conditional updates.
+Pinning work is claimed and settled per provider/CID resource using a claim token.
+Provider scheduling remains local to each process.
 
 The serial `tests/e2e.rs` target can point at a
 gateway and Kubo endpoint using environment variables. The production baseline
@@ -63,8 +60,7 @@ load-balancer HA.
 1. Add an opt-in Compose topology that sends all client traffic through one
    Nginx endpoint and runs two identical gateway replicas against the same
    PostgreSQL and Kubo services.
-2. Serialize PostgreSQL automatic migrations at concurrent gateway startup,
-   without changing SQLite or MySQL migration behavior.
+2. Serialize empty PostgreSQL schema initialization at concurrent gateway startup.
 3. Preserve SigV4 request validity, upload and download streaming, object
    consistency, multipart completion, durable import recovery, and the current
    pinning safety fences across either gateway.
@@ -160,7 +156,7 @@ make authentication or encrypted-object handling replica-dependent.
 Both gateways use their normal `AppState` initialization and start both normal
 workers. There is no worker role switch. Import's durable UUID identity,
 `claim_epoch`, and database-clock fencing remain the ownership mechanism. The
-pinning worker retains its exact `locked_until` conditional-token checks. The
+pinning worker settles claims only when the resource's `claim_token` still matches. The
 Compose topology configures no remote providers, so it makes no assertion about
 provider RPS, concurrency, health, or fairness across replicas.
 
@@ -191,33 +187,15 @@ or request-body data. Nginx does not terminate TLS in this scope. Operators who
 need TLS place it at a separately designed boundary and must preserve the
 client's signed Host behavior.
 
-## PostgreSQL migration coordination
+## PostgreSQL schema initialization
 
-`store::run_migrations` keeps the existing direct `Migrator::up(db, None)` path
-for SQLite and MySQL. For PostgreSQL only, it performs this exact sequence:
-
-1. Begin one outer database transaction.
-2. Execute `SET LOCAL lock_timeout = '60s'` in that transaction.
-3. Log the migration-lock waiting category, then execute
-   `SELECT pg_advisory_xact_lock(1229997651, 1395879239)` in the same outer
-   transaction. These two signed integers are the stable product key.
-4. On acquisition, log the acquired category and call SeaORM 1.1.20
-   `Migrator::up(&txn, None)` before ending the outer transaction. SeaORM's
-   PostgreSQL migration path creates its nested transaction or savepoint inside
-   this outer transaction.
-5. Commit the outer transaction. A rollback, lock timeout, query error,
-   migration error, or commit error returns an error and makes gateway startup
-   fail before it binds the HTTP listener.
-
-The timeout bounds migration-lock waiting at 60 seconds. Startup logs may say
-only `waiting`, `acquired`, or a failure category such as setup, timeout,
-migration, or commit. They must not log the database URL, DSN, password, or an
-unredacted database error that can contain either.
-
-The advisory lock coordinates automatic migrations from this application only.
-It is not a replacement for an independent migration service, migration policy
-outside this binary, or PostgreSQL HA. A deployment that runs a separate schema
-writer must coordinate that writer explicitly.
+A gateway that sees an empty schema starts a guarded PostgreSQL transaction,
+acquires `pg_advisory_xact_lock(1229997651, 1395879239)`, and rechecks schema
+state under the lock. It installs the current layout only if the schema is
+still empty. The guarded initialization has a 60-second budget; startup fails
+before binding if initialization fails. An already-current schema opens without
+running DDL. Follow the [offline database upgrade](../../database-storage.md#upgrade-an-existing-database)
+for an older schema before starting either replica.
 
 ## Data and error flow
 
@@ -225,10 +203,9 @@ writer must coordinate that writer explicitly.
    and port. Missing input stops `docker compose config`.
 2. PostgreSQL and Kubo become healthy. Both gateways start concurrently against
    an empty or existing PostgreSQL database.
-3. Each gateway runs startup migration. PostgreSQL admits one outer transaction
-   to the advisory lock; the other waits for no more than 60 seconds. The winner
-   migrates and commits, then the follower observes the completed migration
-   state, commits, and both instances bind and become ready.
+3. On an empty schema, one gateway installs the current layout and commits
+   under the advisory lock. The other observes the committed layout. Both
+   bind and become ready once their schema is current.
 4. A client sends a SigV4 request to the load balancer. Nginx retains the exact
    client Host header and streams the request to one gateway. The gateway uses
    PostgreSQL for metadata and Kubo for content as it does in the single-node
@@ -281,10 +258,8 @@ gateway.
 It also requires the Nginx upstream names, Host preservation, HTTP/1.1,
 unbuffered request and response handling, unlimited body size, the five
 connection and response failover classes, two-attempt bound, proxied readiness,
-and a log format that excludes Authorization and request-body data. It locks the
-PostgreSQL-only migration sequence, the exact advisory-lock key pair, the
-60-second local lock timeout, outer transaction use, fail-closed startup, and
-the unchanged SQLite and MySQL path.
+and a log format that excludes Authorization and request-body data. Schema
+checks cover concurrent initialization and rejection of an older layout at startup.
 
 The unit and source contracts also lock PostgreSQL import renewal SQL: the
 proposed lease timestamp is a bound value in a structural comparison with
@@ -323,15 +298,8 @@ following in order:
 3. Start PostgreSQL and Kubo, then start `gateway-a` and `gateway-b`
    concurrently against an empty PostgreSQL database. Require both direct
    `/ready` endpoints to return `200 READY`.
-4. Query `seaql_migrations` through the loopback PostgreSQL mapping. Require
-   every registered migration marker exactly once, including:
-   `m20250701_000001_init`, `m20260707_000001_decompress_zip`,
-   `m20260720_000001_sse_c_key_fingerprint`,
-   `m20260721_000001_multi_provider_pinning`,
-   `m20260729_000001_ipfs3_import`,
-   `m20260729_000002_postgres_utc_timestamps`,
-   `m20260730_000001_standard_mutation_fence`, and
-   `m20260813_000001_postgres_json_columns`.
+4. Query `seaql_migrations` through the loopback PostgreSQL mapping. The
+   fresh database must contain only the current schema baseline marker.
 5. Through direct endpoints, create a bucket and object on A, then read, list,
    head, and delete that object on B.
 6. Start multipart upload and upload one part through A, upload a later part
