@@ -375,6 +375,14 @@ pub async fn read_targets<C: ConnectionTrait>(
     if batch.epoch != claim.epoch || batch.worker.as_deref() != Some(&claim.worker) {
         return Err(stale());
     }
+    targets_for_snapshot(db, claim, &batch).await
+}
+
+async fn targets_for_snapshot<C: ConnectionTrait>(
+    db: &C,
+    claim: &Claim,
+    batch: &Snapshot,
+) -> AppResult<Vec<StandardMutationGuard>> {
     let rows = db.query_all(statement(db,
         "SELECT object_key,mutation_id,expected_generation,epoch FROM zip_v2_targets WHERE batch_id=? ORDER BY object_key",
         "SELECT object_key,mutation_id,expected_generation,epoch FROM zip_v2_targets WHERE batch_id=$1 ORDER BY object_key",
@@ -416,7 +424,7 @@ pub async fn verify_in_transaction(
     if batch.state != "admitted" {
         return Err(stale());
     }
-    let guards = read_targets(tx, claim).await?;
+    let guards = targets_for_snapshot(tx, claim, &batch).await?;
     let keys = guards.iter().map(|g| g.key.clone()).collect::<Vec<_>>();
     ownership::verify_zip_output_guards_in_transaction(
         tx,
@@ -782,7 +790,7 @@ pub async fn renew(db: &DatabaseConnection, claim: &Claim, lease_seconds: i64) -
         return Ok(false);
     }
     if batch.state == "admitted" {
-        let guards = read_targets(&tx, claim).await;
+        let guards = targets_for_snapshot(&tx, claim, &batch).await;
         let renewed = match guards {
             Ok(guards) => {
                 let keys = guards.iter().map(|g| g.key.clone()).collect::<Vec<_>>();
@@ -836,7 +844,7 @@ pub async fn fence_if_lost(db: &DatabaseConnection, claim: &Claim) -> AppResult<
     {
         return Ok(false);
     }
-    let guards = read_targets(&tx, claim).await;
+    let guards = targets_for_snapshot(&tx, claim, &batch).await;
     let verified = match guards {
         Ok(guards) => {
             let keys = guards.iter().map(|g| g.key.clone()).collect::<Vec<_>>();
@@ -876,7 +884,7 @@ pub async fn complete_in_transaction(
         return Err(invalid());
     }
     let batch = live(tx, claim).await?;
-    let guards = verify_in_transaction(tx, claim).await?;
+    let guards = targets_for_snapshot(tx, claim, &batch).await?;
     let keys = guards.iter().map(|g| g.key.clone()).collect::<Vec<_>>();
     let now = database_now(tx).await?;
     let changed = tx.execute(statement(tx,

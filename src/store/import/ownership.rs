@@ -1969,7 +1969,6 @@ pub(crate) async fn complete_standard_mutation_in_transaction<C: ConnectionTrait
     guard: &StandardMutationGuard,
     now: DateTime<Utc>,
 ) -> AppResult<()> {
-    verify_mutation_lease(txn, guard).await?;
     if !clear_standard_mutation_in_transaction(txn, guard, now, true).await? {
         return Err(AppError::StaleContentMutation);
     }
@@ -2014,6 +2013,9 @@ async fn clear_standard_mutation_in_transaction<C: ConnectionTrait>(
         })
         .exec(txn)
         .await?;
+    if require_active && cleared.rows_affected == 0 {
+        return Ok(false);
+    }
     standard_mutation_lease::Entity::delete_many()
         .filter(mutation_lease_identity(guard))
         .exec(txn)
