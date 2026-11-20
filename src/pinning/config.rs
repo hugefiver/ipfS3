@@ -175,6 +175,8 @@ pub type ProviderLimitMap = BTreeMap<String, ProviderLimits>;
 #[derive(Debug, Clone)]
 pub struct ValidatedProvider {
     pub name: String,
+    /// Original configuration name; `name` becomes the shared allocation key after normalization.
+    pub config_name: String,
     pub identity: ProviderIdentity,
     pub kind: ProviderKind,
     pub token: Option<SecretToken>,
@@ -618,6 +620,7 @@ impl ValidatedPinningConfig {
 
         Ok(ValidatedProvider {
             name: provider.name.clone(),
+            config_name: provider.name.clone(),
             identity,
             kind,
             token,

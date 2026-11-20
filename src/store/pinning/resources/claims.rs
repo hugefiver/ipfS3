@@ -18,6 +18,7 @@ pub struct Claim {
     pub action: Action,
     pub handle: Option<String>,
     pub attempt: i32,
+    pub(crate) eligible_at_micros: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -40,12 +41,17 @@ pub async fn settle(
     settle_dispatch(db, claim, outcome, now).await.map(|_| ())
 }
 
+pub(crate) struct Settlement {
+    pub applied: bool,
+    pub due_delete: bool,
+}
+
 pub(crate) async fn settle_dispatch(
     db: &DatabaseConnection,
     claim: &Claim,
     outcome: Outcome,
     now: DateTime<Utc>,
-) -> AppResult<bool> {
+) -> AppResult<Settlement> {
     let tx = db.begin().await?;
     let mut values = vec![
         claim.provider.clone().into(),
@@ -81,7 +87,8 @@ pub(crate) async fn settle_dispatch(
         }
     };
     let result=tx.execute(stmt(&tx,&format!("UPDATE pin_resources SET {update},claim_until=NULL WHERE provider=$1 AND cid=$2 AND claim_token=$3"),values)).await?;
-    let due_delete = if result.rows_affected() != 0 {
+    let applied = result.rows_affected() != 0;
+    let due_delete = if applied {
         if advance {
             super::failover::advance(&tx, &claim.provider, &claim.cid, now).await?;
         }
@@ -90,5 +97,8 @@ pub(crate) async fn settle_dispatch(
         false
     };
     tx.commit().await?;
-    Ok(due_delete)
+    Ok(Settlement {
+        applied,
+        due_delete,
+    })
 }

@@ -349,7 +349,16 @@ impl PinningCoordinator {
     }
 
     pub fn start(self: &Arc<Self>, store: Store, parent: CancellationToken) -> PinningWorkerHandle {
-        crate::pinning::worker::start(self.clone(), store, parent)
+        self.start_with_metrics(store, parent, None)
+    }
+
+    pub fn start_with_metrics(
+        self: &Arc<Self>,
+        store: Store,
+        parent: CancellationToken,
+        metrics: Option<Arc<crate::metrics::Metrics>>,
+    ) -> PinningWorkerHandle {
+        crate::pinning::worker::start(self.clone(), store, parent, metrics)
     }
 }
 

@@ -101,6 +101,38 @@ async fn noop_backlog(cids: &[String]) -> (Store, Arc<PinningCoordinator>) {
 }
 
 #[tokio::test]
+async fn provider_ack_is_observed_even_if_database_settlement_fails() {
+    let (store, coordinator) = noop_backlog(&[cid(1)]).await;
+    let now = Utc::now();
+    let claim = resources::claim(
+        store.db(),
+        "noop",
+        &coordinator.provider_limits()["noop"],
+        now,
+        now + TimeDelta::minutes(5),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    store.db().execute_unprepared("CREATE TRIGGER reject_settlement BEFORE UPDATE OF handle ON pin_resources BEGIN SELECT RAISE(ABORT,'writeback failed'); END").await.unwrap();
+    let metrics = Arc::new(Metrics::new(coordinator.effective_config()));
+    perform(
+        store,
+        coordinator.provider("noop").unwrap(),
+        claim,
+        Some(metrics.pin_for("noop")),
+    )
+    .await;
+    let text = metrics.render();
+    assert!(text.contains(
+        "ipfs_s3_pin_provider_duration_seconds_count{provider=\"noop\",action=\"submit\",outcome=\"submitted\"} 1\n"
+    ));
+    assert!(text.contains(
+        "ipfs_s3_pin_settlement_duration_seconds_count{provider=\"noop\",action=\"submit\",outcome=\"error\"} 1\n"
+    ));
+}
+
+#[tokio::test]
 async fn ack_without_demand_wakes_cleanup_then_refills_the_freed_quota() {
     let cids = (0..11).map(cid).collect::<Vec<_>>();
     let (store, coordinator) = noop_backlog(&cids).await;
@@ -111,7 +143,7 @@ async fn ack_without_demand_wakes_cleanup_then_refills_the_freed_quota() {
         .db()
         .execute(Statement::from_sql_and_values(
             DatabaseBackend::Sqlite,
-            "UPDATE pin_resources SET next_at=1 WHERE cid=?",
+            "UPDATE pin_resources SET next_at=next_at+1 WHERE cid=?",
             [waiting.clone().into()],
         ))
         .await
@@ -149,7 +181,7 @@ async fn repeated_work_hints_do_not_starve_a_fitting_candidate_after_an_oversize
         .db()
         .execute(Statement::from_sql_and_values(
             DatabaseBackend::Sqlite,
-            "UPDATE pin_resources SET logical_size=1,next_at=1 WHERE cid=?",
+            "UPDATE pin_resources SET logical_size=1,next_at=next_at+1 WHERE cid=?",
             [fit.clone().into()],
         ))
         .await
@@ -269,7 +301,11 @@ async fn canonical_resource_uploads_with_original_cidv0_unixfs_profile() {
     let worker = tokio::spawn(async move {
         dispatch::run(
             worker_store,
-            vec![dispatch::Lane::new(Arc::new(provider), Duration::ZERO)],
+            vec![dispatch::Lane::new(
+                Arc::new(provider),
+                Duration::ZERO,
+                None,
+            )],
             &BTreeMap::from([("rpc".to_owned(), limits)]),
             1,
             Duration::from_secs(60),
@@ -365,6 +401,7 @@ async fn queued_ack_and_exact_delete_complete_while_another_post_is_stalled() {
         content_mode: ContentMode::Object,
         duration: LeaseDuration::parse("1h").unwrap(),
     };
+    let eligible_at = Utc::now() - TimeDelta::seconds(1);
     let attach = async |key: &str| {
         let tx = store.db().begin().await.unwrap();
         resources::attach(
@@ -376,7 +413,7 @@ async fn queued_ack_and_exact_delete_complete_while_another_post_is_stalled() {
             },
             &intent,
             coordinator.provider_limits(),
-            Utc::now(),
+            eligible_at,
         )
         .await
         .unwrap();
@@ -388,12 +425,17 @@ async fn queued_ack_and_exact_delete_complete_while_another_post_is_stalled() {
         .db()
         .execute(Statement::from_sql_and_values(
             DatabaseBackend::Sqlite,
-            "UPDATE pin_resources SET next_at=1 WHERE cid=?",
+            "UPDATE pin_resources SET next_at=next_at+1 WHERE cid=?",
             [good.clone().into()],
         ))
         .await
         .unwrap();
-    let worker = coordinator.start(store.clone(), CancellationToken::new());
+    let metrics = Arc::new(Metrics::new(coordinator.effective_config()));
+    let worker = coordinator.start_with_metrics(
+        store.clone(),
+        CancellationToken::new(),
+        Some(metrics.clone()),
+    );
     let first = tokio::time::timeout(Duration::from_secs(5), arrivals.recv())
         .await
         .unwrap()
@@ -452,4 +494,28 @@ async fn queued_ack_and_exact_delete_complete_while_another_post_is_stalled() {
     .await
     .unwrap();
     server.verify().await;
+    let text = metrics.render();
+    for sample in [
+        "ipfs_s3_pin_dispatches_total{provider=\"backup\",action=\"submit\"} 3",
+        "ipfs_s3_pin_queue_wait_seconds_count{provider=\"backup\",action=\"submit\"} 3",
+        "ipfs_s3_pin_queue_wait_seconds_count{provider=\"backup\",action=\"delete\"} 1",
+        "ipfs_s3_pin_provider_duration_seconds_count{provider=\"backup\",action=\"submit\",outcome=\"submitted\"} 1",
+        "ipfs_s3_pin_provider_duration_seconds_count{provider=\"backup\",action=\"submit\",outcome=\"unknown\"} 1",
+        "ipfs_s3_pin_provider_duration_seconds_count{provider=\"backup\",action=\"delete\",outcome=\"deleted\"} 1",
+        "ipfs_s3_pin_settlement_duration_seconds_count{provider=\"backup\",action=\"submit\",outcome=\"applied\"} 2",
+    ] {
+        assert!(text.lines().any(|line| line == sample), "{text}");
+    }
+    let wait = text
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix(
+                "ipfs_s3_pin_queue_wait_seconds_sum{provider=\"backup\",action=\"submit\"} ",
+            )
+        })
+        .unwrap()
+        .parse::<f64>()
+        .unwrap();
+    assert!(wait >= 3.0, "{text}");
+    assert!(!text.contains(&good) && !text.contains("request-42"));
 }

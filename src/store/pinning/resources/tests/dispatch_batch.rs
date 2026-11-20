@@ -48,6 +48,7 @@ async fn sqlite_prefetch_is_discardable_and_one_transaction_claims_only_free_slo
         )
         .await
         .unwrap()
+        .due_delete
     );
     let row = db
         .query_one(stmt(

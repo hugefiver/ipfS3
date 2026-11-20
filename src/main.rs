@@ -14,6 +14,7 @@ use ipfs_s3_gateway::auth::GatewayAuth;
 use ipfs_s3_gateway::config::Config;
 use ipfs_s3_gateway::import::{downloader::SourceDownloader, pipeline::ImportCoordinator};
 use ipfs_s3_gateway::lifecycle::worker::start_worker_with_tiers;
+use ipfs_s3_gateway::metrics::Metrics;
 use ipfs_s3_gateway::residency::backfill::start_worker as start_residency_backfill_worker;
 use ipfs_s3_gateway::s3;
 use ipfs_s3_gateway::s3::handler::S3Impl;
@@ -109,13 +110,14 @@ async fn handle_s3_error(_err: HttpError) -> HttpResponse<S3Body> {
 
 #[cfg(test)]
 fn gateway_app(state: Arc<AppState>, imports: Arc<ImportCoordinator>) -> Router {
-    gateway_app_with_root_default(state, imports, true)
+    gateway_app_with_root_default(state, imports, true, None)
 }
 
 fn gateway_app_with_root_default(
     state: Arc<AppState>,
     imports: Arc<ImportCoordinator>,
     root_default: bool,
+    metrics: Option<Arc<Metrics>>,
 ) -> Router {
     let s3_impl = S3Impl::new(state.clone());
     let gateway_auth = GatewayAuth::new(state.clone());
@@ -132,7 +134,7 @@ fn gateway_app_with_root_default(
         builder.build()
     };
 
-    Router::new()
+    let app = Router::new()
         .route("/health", get(health_check))
         .route("/ready", get(ready_handler))
         .fallback_service(HandleError::new(s3_service, handle_s3_error))
@@ -144,7 +146,15 @@ fn gateway_app_with_root_default(
             state.clone(),
             ipfs_s3_gateway::cors::http::bucket_cors,
         ))
-        .with_state(state)
+        .with_state(state);
+    if let Some(metrics) = metrics {
+        app.layer(axum::middleware::from_fn_with_state(
+            metrics,
+            telemetry::measure_s3,
+        ))
+    } else {
+        app
+    }
 }
 
 async fn run_gateway() -> anyhow::Result<()> {
@@ -165,19 +175,32 @@ async fn run_gateway() -> anyhow::Result<()> {
     let downloader = SourceDownloader::production(Arc::new(import_config.clone()));
     let imports = ImportCoordinator::new(import_config, downloader);
 
+    let exporter = if let Some(bind) = cfg.metrics.bind {
+        let listener = tokio::net::TcpListener::bind(bind).await?;
+        tracing::info!(address = %listener.local_addr()?, "metrics listener bound");
+        Some((
+            listener,
+            Arc::new(Metrics::new(state.pinning.effective_config())),
+        ))
+    } else {
+        None
+    };
+    let metrics = exporter.as_ref().map(|(_, metrics)| Arc::clone(metrics));
     let app = gateway_app_with_root_default(
         state.clone(),
         imports.clone(),
         cfg.decompress_zip.unixfs_directory_root,
+        metrics.clone(),
     );
 
     let signal = shutdown::ShutdownSignal::install()?;
     let listener = tokio::net::TcpListener::bind(cfg.server.bind).await?;
     tracing::info!("listening on {}", cfg.server.bind);
     let shutdown = tokio_util::sync::CancellationToken::new();
-    let pinning_worker = state
-        .pinning
-        .start(state.store.clone(), shutdown.child_token());
+    let pinning_worker =
+        state
+            .pinning
+            .start_with_metrics(state.store.clone(), shutdown.child_token(), metrics);
     let import_worker = imports.start(state.clone(), shutdown.child_token());
     let lifecycle_worker = start_worker_with_tiers(
         state.store.clone(),
@@ -198,6 +221,19 @@ async fn run_gateway() -> anyhow::Result<()> {
     );
     let server =
         axum::serve(listener, app).with_graceful_shutdown(shutdown.clone().cancelled_owned());
+    let metrics_shutdown = shutdown.clone();
+    let servers = async move {
+        let scrape = async move {
+            if let Some((listener, metrics)) = exporter {
+                axum::serve(listener, telemetry::metrics_app(metrics))
+                    .with_graceful_shutdown(metrics_shutdown.cancelled_owned())
+                    .await?;
+            }
+            Ok(())
+        };
+        tokio::try_join!(async move { server.await }, scrape)?;
+        Ok(())
+    };
     let workers = async move {
         tokio::join!(
             pinning_worker.shutdown(shutdown::WORKER_GRACE),
@@ -208,7 +244,7 @@ async fn run_gateway() -> anyhow::Result<()> {
         );
     };
     let result = shutdown::drain(
-        async move { server.await },
+        servers,
         signal.wait(),
         shutdown,
         workers,

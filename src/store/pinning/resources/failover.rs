@@ -25,9 +25,9 @@ pub(super) async fn advance(
         let mut destination = provider;
         let mut remaining = "[]".to_owned();
         for (index, next) in candidates.iter().enumerate() {
-            tx.execute(stmt(tx,&format!("INSERT INTO pin_resources(provider,cid,source_cid,logical_size,status,action)
-                 SELECT $3,cid,COALESCE(source_cid,cid),logical_size,'waiting','submit' FROM pin_resources WHERE provider=$1 AND cid=$2 {}",super::batch::ATTACH_RESOURCE),
-                 vec![provider.into(),cid.into(),next.clone().into()])).await?;
+            tx.execute(stmt(tx,&format!("INSERT INTO pin_resources(provider,cid,source_cid,logical_size,status,action,next_at)
+                 SELECT $3,cid,COALESCE(source_cid,cid),logical_size,'waiting','submit',$4 FROM pin_resources WHERE provider=$1 AND cid=$2 {}",super::batch::ATTACH_RESOURCE),
+                 vec![provider.into(),cid.into(),next.clone().into(),now.timestamp_micros().into()])).await?;
             let resource = tx
                 .query_one(stmt(
                     tx,

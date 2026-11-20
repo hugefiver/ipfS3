@@ -1,4 +1,14 @@
-use axum::{extract::Request, middleware::Next, response::Response};
+use std::{sync::Arc, time::Instant};
+
+use axum::{
+    Router,
+    extract::{Request, State},
+    http::header,
+    middleware::Next,
+    response::Response,
+    routing::get,
+};
+use ipfs_s3_gateway::metrics::Metrics;
 use tracing_subscriber::{
     Layer as _, filter::filter_fn, layer::SubscriberExt as _, util::SubscriberInitExt as _,
 };
@@ -47,6 +57,36 @@ pub(crate) async fn record_request_status(request: Request, next: Next) -> Respo
         "request completed"
     );
     response
+}
+
+pub(crate) async fn measure_s3(
+    State(metrics): State<Arc<Metrics>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if matches!(request.uri().path(), "/health" | "/ready") {
+        return next.run(request).await;
+    }
+    let method = request.method().clone();
+    let started = Instant::now();
+    let response = next.run(request).await;
+    metrics.request(&method, response.status(), started.elapsed());
+    response
+}
+
+pub(crate) fn metrics_app(metrics: Arc<Metrics>) -> Router {
+    Router::new().route(
+        "/metrics",
+        get(move || async move {
+            (
+                [(
+                    header::CONTENT_TYPE,
+                    "text/plain; version=0.0.4; charset=utf-8",
+                )],
+                metrics.render(),
+            )
+        }),
+    )
 }
 
 fn is_application_target(target: &str) -> bool {

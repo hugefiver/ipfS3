@@ -161,7 +161,21 @@ pub(super) async fn run(
             let i = indices[&claim.provider];
             let lane = &mut lanes[i];
             lane.look_ahead = false;
-            let request = perform(store.clone(), lane.provider.clone(), claim);
+            if let Some(metrics) = &lane.metrics {
+                // Legacy immediate schedules used zero instead of a timestamp.
+                let wait = (claim.eligible_at_micros > 0).then(|| {
+                    Duration::from_micros(
+                        (Utc::now().timestamp_micros() - claim.eligible_at_micros).max(0) as u64,
+                    )
+                });
+                metrics.dispatch(claim.action, wait);
+            }
+            let request = perform(
+                store.clone(),
+                lane.provider.clone(),
+                claim,
+                lane.metrics.clone(),
+            );
             tasks.spawn(async move { (i, request.await) });
             lane.eligible_at = Instant::now() + lane.interval;
         }
@@ -193,6 +207,7 @@ pub(super) async fn run(
 
 pub(super) struct Lane {
     provider: Arc<dyn PinningProvider>,
+    metrics: Option<Arc<PinMetrics>>,
     interval: Duration,
     eligible_at: Instant,
     scan_at: Instant,
@@ -204,10 +219,15 @@ pub(super) struct Lane {
 }
 
 impl Lane {
-    pub(super) fn new(provider: Arc<dyn PinningProvider>, interval: Duration) -> Self {
+    pub(super) fn new(
+        provider: Arc<dyn PinningProvider>,
+        interval: Duration,
+        metrics: Option<Arc<PinMetrics>>,
+    ) -> Self {
         let now = Instant::now();
         Self {
             provider,
+            metrics,
             interval,
             eligible_at: now,
             scan_at: now,

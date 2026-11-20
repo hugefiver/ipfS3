@@ -5,6 +5,7 @@ use tokio::{task::JoinHandle, time::Instant};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
+    metrics::{Metrics, PinMetrics},
     pinning::{
         coordinator::PinningCoordinator,
         provider::{
@@ -44,6 +45,7 @@ pub(crate) fn start(
     coordinator: Arc<PinningCoordinator>,
     store: Store,
     parent: CancellationToken,
+    metrics: Option<Arc<Metrics>>,
 ) -> PinningWorkerHandle {
     let cancellation = parent.child_token();
     let stop = cancellation.clone();
@@ -57,6 +59,7 @@ pub(crate) fn start(
                 dispatch::Lane::new(
                     coordinator.provider(name).unwrap(),
                     coordinator.request_interval(name),
+                    metrics.as_ref().map(|m| m.pin_for(name)),
                 )
             })
             .collect();
@@ -68,7 +71,7 @@ pub(crate) fn start(
                 config.worker_concurrency,
                 interval,
                 coordinator.subscribe_pin_work(),
-                stop.clone()
+                stop.clone(),
             ),
             expire_references(store, interval, stop, &coordinator),
         );
@@ -110,19 +113,28 @@ enum Rescan {
     All,
 }
 
-async fn perform(store: Store, provider: Arc<dyn PinningProvider>, claim: Claim) -> Rescan {
-    let log_timing = tracing::enabled!(tracing::Level::DEBUG);
+async fn perform(
+    store: Store,
+    provider: Arc<dyn PinningProvider>,
+    claim: Claim,
+    metrics: Option<Arc<PinMetrics>>,
+) -> Rescan {
+    let timed = metrics.is_some() || tracing::enabled!(tracing::Level::DEBUG);
     tracing::debug!(name: "pin_dispatched", provider=%claim.provider, cid=%claim.cid, source_cid=%claim.source_cid, action=?claim.action, attempt=claim.attempt, "pin action dispatched");
-    let provider_started = log_timing.then(Instant::now);
+    let provider_started = timed.then(Instant::now);
     let outcome = execute(provider.as_ref(), &claim).await;
-    let elapsed_us = provider_started.map(|start| start.elapsed().as_micros() as u64);
+    let elapsed = provider_started.map(|start| start.elapsed());
+    if let (Some(metrics), Some(elapsed)) = (&metrics, elapsed) {
+        metrics.provider(claim.action, &outcome, elapsed);
+    }
+    let elapsed_us = elapsed.map(|d| d.as_micros() as u64);
     tracing::debug!(name: "pin_provider_complete", provider=%claim.provider, cid=%claim.cid, action=?claim.action, attempt=claim.attempt, elapsed_us, "pin provider action finished");
-    let settle_started = log_timing.then(Instant::now);
+    let settle_started = timed.then(Instant::now);
     let mut cleanup = None;
     for attempt in 0..3 {
         match resources::settle_dispatch(store.db(), &claim, outcome.clone(), Utc::now()).await {
-            Ok(due_delete) => {
-                cleanup = Some(due_delete);
+            Ok(settlement) => {
+                cleanup = Some(settlement);
                 break;
             }
             Err(crate::error::AppError::Database(_)) if attempt < 2 => {
@@ -134,7 +146,12 @@ async fn perform(store: Store, provider: Arc<dyn PinningProvider>, claim: Claim)
             }
         }
     }
-    let elapsed_us = settle_started.map(|start| start.elapsed().as_micros() as u64);
+    let elapsed = settle_started.map(|start| start.elapsed());
+    if let (Some(metrics), Some(elapsed)) = (&metrics, elapsed) {
+        metrics.settlement(claim.action, cleanup.as_ref().map(|s| s.applied), elapsed);
+    }
+    let elapsed_us = elapsed.map(|d| d.as_micros() as u64);
+    let cleanup = cleanup.map(|s| s.due_delete);
     tracing::debug!(name: "pin_settle_complete", provider=%claim.provider, cid=%claim.cid, action=?claim.action, attempt=claim.attempt, elapsed_us, settled=cleanup.is_some(), "pin writeback finished");
     match (cleanup, claim.action, outcome) {
         (Some(true), _, _) => Rescan::Cleanup,

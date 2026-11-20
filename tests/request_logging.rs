@@ -176,6 +176,107 @@ async fn authenticated_delete_objects_failure_logs_only_a_bounded_class() {
     }
 }
 
+#[tokio::test]
+async fn prometheus_listener_counts_s3_through_cors_and_leaves_bucket_routable() {
+    let temp = tempfile::tempdir().unwrap();
+    let stdout = temp.path().join("stdout.log");
+    let stderr = temp.path().join("stderr.log");
+    let client = reqwest::Client::new();
+    for enabled in [false, true] {
+        let scrape = reserve_loopback_address();
+        if enabled {
+            fs::write(
+                temp.path().join("config.toml"),
+                format!("[metrics]\nbind = '{scrape}'\n"),
+            )
+            .unwrap();
+        }
+        let address = reserve_loopback_address();
+        let mut process =
+            spawn_gateway(address, &temp, "warn", "sqlite::memory:", &stdout, &stderr);
+        wait_until_listening(address, &mut process.0, &stdout, &stderr);
+        let base = format!("http://{address}");
+        for method in [http::Method::PUT, http::Method::GET] {
+            let list = method == http::Method::GET;
+            let response = sigv4::send_sigv4(
+                method,
+                &base,
+                "metrics",
+                "",
+                &[],
+                vec![],
+                HeaderMap::new(),
+                "test",
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            if list {
+                assert!(response.text().await.unwrap().contains("ListBucketResult"));
+            }
+        }
+        if !enabled {
+            continue;
+        }
+        for probe in ["health", "ready"] {
+            assert_eq!(
+                client
+                    .get(format!("{base}/{probe}"))
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::OK
+            );
+        }
+        let cors = client
+            .request(http::Method::OPTIONS, format!("{base}/metrics/private-key"))
+            .header("origin", "https://example.test")
+            .header("access-control-request-method", "GET")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(cors.status(), StatusCode::FORBIDDEN);
+        let denied = client
+            .get(format!("{base}/metrics/private-key"))
+            .send()
+            .await
+            .unwrap();
+        assert!(denied.status().is_client_error());
+        let url = format!("http://{scrape}/metrics");
+        let response = client.get(&url).send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()["content-type"],
+            "text/plain; version=0.0.4; charset=utf-8"
+        );
+        let text = response.text().await.unwrap();
+        for (method, class) in [
+            ("GET", "2xx"),
+            ("PUT", "2xx"),
+            ("OPTIONS", "4xx"),
+            ("GET", "4xx"),
+        ] {
+            let labels = format!(r#"method="{method}",status_class="{class}""#);
+            assert!(
+                text.lines()
+                    .any(|l| l == format!("ipfs_s3_request_duration_seconds_count{{{labels}}} 1")),
+                "{text}"
+            );
+            assert!(text.lines().any(|l| {
+                l.strip_prefix(&format!(
+                    "ipfs_s3_request_duration_seconds_sum{{{labels}}} "
+                ))
+                .is_some_and(|s| s.parse::<f64>().unwrap() > 0.0)
+            }));
+        }
+        assert!(!text.contains("private-key"));
+        assert_eq!(
+            text,
+            client.get(url).send().await.unwrap().text().await.unwrap()
+        );
+    }
+}
+
 fn spawn_gateway(
     address: SocketAddr,
     temp: &tempfile::TempDir,
@@ -187,7 +288,8 @@ fn spawn_gateway(
     GatewayProcess(
         Command::new(env!("CARGO_BIN_EXE_ipfs-s3-gateway"))
             .env("RUST_LOG", rust_log)
-            .env("IPFS_S3_CONFIG", temp.path().join("missing-config.toml"))
+            .env("IPFS_S3_CONFIG", temp.path().join("config.toml"))
+            .env_remove("IPFS_S3_METRICS_BIND")
             .env("IPFS_S3_BIND", address.to_string())
             .env("IPFS_S3_DATABASE_URL", database_url)
             .env(

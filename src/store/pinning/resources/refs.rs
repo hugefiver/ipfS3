@@ -169,7 +169,7 @@ async fn attach_targets<'a>(
                 .or_insert((expiry, remaining.clone()));
         }
     }
-    writes.flush(tx).await
+    writes.flush(tx, now.timestamp_micros()).await
 }
 
 pub async fn manual(

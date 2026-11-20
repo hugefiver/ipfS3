@@ -17,6 +17,7 @@ pub mod error;
 pub mod import;
 pub mod kubo;
 pub mod lifecycle;
+pub mod metrics;
 pub mod pinning;
 pub mod residency;
 pub mod s3;

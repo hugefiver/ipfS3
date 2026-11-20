@@ -337,6 +337,7 @@ async fn lost_post_never_reposts_and_late_ack_tracks_demand_reversals() {
         )
         .await
         .unwrap()
+        .due_delete
     );
     let remove = next(&db, "alpha", 15).await.unwrap();
     assert_eq!(remove.handle.as_deref(), Some("first-upload"));
@@ -353,6 +354,7 @@ async fn lost_post_never_reposts_and_late_ack_tracks_demand_reversals() {
         )
         .await
         .unwrap()
+        .applied
     );
     let tx = db.begin().await.unwrap();
     release_owner(&tx, "unrelated", time(18)).await.unwrap();

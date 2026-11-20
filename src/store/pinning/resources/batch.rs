@@ -11,6 +11,7 @@ pub(super) const ATTACH_RESOURCE: &str = "ON CONFLICT (provider,cid) DO UPDATE S
                 WHEN pin_resources.status='pending' AND pin_resources.action='delete' AND pin_resources.attempt=0 THEN 'accepted' ELSE pin_resources.status END,
     action=CASE WHEN pin_resources.status='cleaned' THEN 'submit'
                 WHEN pin_resources.status='pending' AND pin_resources.action='delete' AND pin_resources.attempt=0 THEN NULL ELSE pin_resources.action END,
+    next_at=CASE WHEN pin_resources.status='cleaned' THEN excluded.next_at ELSE pin_resources.next_at END,
     source_cid=CASE WHEN pin_resources.status='cleaned' OR pin_resources.source_cid IS NULL OR substr(excluded.source_cid,1,2)='Qm'
                     THEN excluded.source_cid ELSE pin_resources.source_cid END,
     logical_size=CASE WHEN pin_resources.status='cleaned' THEN excluded.logical_size ELSE pin_resources.logical_size END
@@ -24,7 +25,7 @@ pub(super) struct RefBatch<'a> {
 }
 
 impl RefBatch<'_> {
-    pub(super) async fn flush(&mut self, tx: &DatabaseTransaction) -> AppResult<()> {
+    pub(super) async fn flush(&mut self, tx: &DatabaseTransaction, now: i64) -> AppResult<()> {
         let resources = std::mem::take(&mut self.resources).into_iter().map(
             |((provider, cid), (size, source_cid))| {
                 vec![
@@ -34,13 +35,14 @@ impl RefBatch<'_> {
                     size.into(),
                     "waiting".into(),
                     "submit".into(),
+                    now.into(),
                 ]
             },
         );
         // Upsert in key order. An unsent removal is cancelled; an attempted removal finishes first.
         insert(
             tx,
-            "pin_resources(provider,cid,source_cid,logical_size,status,action)",
+            "pin_resources(provider,cid,source_cid,logical_size,status,action,next_at)",
             resources,
             ATTACH_RESOURCE,
         )

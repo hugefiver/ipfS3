@@ -13,6 +13,9 @@ pub struct Config {
     #[serde(default = "default_server_config")]
     pub server: ServerConfig,
 
+    #[serde(default)]
+    pub metrics: MetricsConfig,
+
     #[serde(default = "default_kubo_config")]
     pub kubo: KuboConfig,
 
@@ -58,6 +61,11 @@ pub struct Config {
 pub struct ServerConfig {
     #[serde(default = "default_bind")]
     pub bind: SocketAddr,
+}
+
+#[derive(Debug, Default, Deserialize, Clone)]
+pub struct MetricsConfig {
+    pub bind: Option<SocketAddr>,
 }
 
 fn default_bind() -> SocketAddr {
@@ -418,6 +426,7 @@ impl Config {
     fn build_default() -> Self {
         Self {
             server: default_server_config(),
+            metrics: MetricsConfig::default(),
             kubo: default_kubo_config(),
             cold_kubo: None,
             storage: default_storage_config(),
@@ -445,6 +454,7 @@ impl Config {
     ///    `config.toml`).
     /// 3. Individual environment variables:
     ///    - `IPFS_S3_BIND`
+    ///    - `IPFS_S3_METRICS_BIND` (optional independent listener)
     ///    - `IPFS_S3_KUBO_RPC_URL`
     ///    - `IPFS_S3_COLD_KUBO_RPC_URL` (optional independent node)
     ///    - `IPFS_S3_DATABASE_URL`
@@ -476,6 +486,9 @@ impl Config {
     {
         if let Some(bind) = get_env("IPFS_S3_BIND") {
             self.server.bind = bind.parse()?;
+        }
+        if let Some(bind) = get_env("IPFS_S3_METRICS_BIND") {
+            self.metrics.bind = Some(bind.parse()?);
         }
         if let Some(rpc_url) = get_env("IPFS_S3_KUBO_RPC_URL") {
             self.kubo.rpc_url = rpc_url;
@@ -578,6 +591,26 @@ mod tests {
             .unwrap();
         assert_eq!(config.kubo.rpc_url, hot);
         assert_eq!(config.cold_kubo.unwrap().rpc_url, "http://cold:5001");
+    }
+
+    #[test]
+    fn metrics_bind_is_optional_and_overridable() {
+        assert!(Config::build_default().metrics.bind.is_none());
+        let mut config: Config = toml::from_str("[metrics]\nbind = '127.0.0.1:9190'").unwrap();
+        assert_eq!(config.metrics.bind, Some("127.0.0.1:9190".parse().unwrap()));
+        config
+            .apply_env_overrides(|name| {
+                (name == "IPFS_S3_METRICS_BIND").then(|| "127.0.0.1:9191".into())
+            })
+            .unwrap();
+        assert_eq!(config.metrics.bind, Some("127.0.0.1:9191".parse().unwrap()));
+        assert!(
+            config
+                .apply_env_overrides(
+                    |name| (name == "IPFS_S3_METRICS_BIND").then(|| "invalid".into())
+                )
+                .is_err()
+        );
     }
 
     #[test]

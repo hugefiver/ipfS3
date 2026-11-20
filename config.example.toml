@@ -1,6 +1,11 @@
 [server]
 bind = "0.0.0.0:9000"
 
+# Optional private Prometheus listener at GET /metrics. Disabled when omitted.
+# IPFS_S3_METRICS_BIND overrides this address. The S3 port remains unchanged.
+# [metrics]
+# bind = "127.0.0.1:9090"
+
 [kubo]
 rpc_url = "http://127.0.0.1:5001"
 

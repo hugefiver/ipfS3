@@ -34,6 +34,7 @@ pub(super) fn new_claim(row: &QueryResult, action: Action) -> AppResult<Claim> {
         source_cid: row.try_get("", "source_cid")?,
         action,
         handle: row.try_get("", "handle")?,
+        eligible_at_micros: row.try_get("", "eligible_at")?,
         attempt: row.try_get::<i32>("", "attempt")? + 1,
         token: uuid::Uuid::new_v4().to_string(),
     })
@@ -73,7 +74,7 @@ pub(super) async fn due_deletes(
         let n = values.len();
         values.push((*budget as i64).into());
         let cap = values.len();
-        scans.push(format!("SELECT * FROM (SELECT {FIELDS},next_at FROM pin_resources p WHERE provider=${n} AND {DELETE}
+        scans.push(format!("SELECT * FROM (SELECT {FIELDS},next_at,CASE WHEN claim_token IS NOT NULL AND claim_until>next_at THEN claim_until ELSE next_at END AS eligible_at FROM pin_resources p WHERE provider=${n} AND {DELETE}
             ORDER BY next_at,cid LIMIT ${cap}{}) AS deletes_{n}", row_lock(tx)));
     }
     let sql = format!(
@@ -178,7 +179,7 @@ pub(super) async fn waiting<'a>(
     if rows.is_empty() {
         return Ok(BTreeMap::new());
     }
-    let sql=format!("WITH wanted(provider,cid,ord) AS (VALUES {}) SELECT {FIELDS},p.logical_size,CAST(w.ord AS INTEGER) AS ord
+    let sql=format!("WITH wanted(provider,cid,ord) AS (VALUES {}) SELECT {FIELDS},p.next_at AS eligible_at,p.logical_size,CAST(w.ord AS INTEGER) AS ord
         FROM wanted w JOIN pin_resources p ON p.provider=w.provider AND p.cid=w.cid WHERE {SUBMIT}{}",rows.join(","),row_lock(tx));
     tx.query_all(stmt(tx, &sql, values))
         .await?
