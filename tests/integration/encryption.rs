@@ -14,7 +14,7 @@ use crate::support::sigv4::presign_sigv4_query;
 use base64::Engine as _;
 use chrono::Utc;
 use http::{HeaderMap, HeaderValue, StatusCode};
-use ipfs_s3_gateway::store;
+use ipfs_s3_gateway::{crypto::chunker::CHUNK_SIZE, store};
 use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
 use std::collections::HashMap;
 
@@ -47,6 +47,21 @@ fn fixed_sse_c_ciphertext(key: [u8; 32], nonce: [u8; 12], plaintext: &[u8]) -> V
     .to_vec()
 }
 
+fn framed_sse_c_ciphertext(plaintext: &[u8]) -> Vec<u8> {
+    if plaintext.len() <= CHUNK_SIZE {
+        return fixed_sse_c_ciphertext([7; 32], [0x5a; 12], plaintext);
+    }
+    plaintext
+        .chunks(CHUNK_SIZE)
+        .enumerate()
+        .flat_map(|(index, frame)| {
+            let mut nonce = [0x5a; 12];
+            nonce[..8].copy_from_slice(&(index as u64).to_le_bytes());
+            fixed_sse_c_ciphertext([7; 32], nonce, frame)
+        })
+        .collect()
+}
+
 async fn seed_sse_c_object(
     harness: &TestHarness,
     key: &str,
@@ -55,7 +70,7 @@ async fn seed_sse_c_object(
     fingerprinted: bool,
     recorded_size: i64,
 ) {
-    harness.set_cat_body(cid, fixed_sse_c_ciphertext([7; 32], [0x5a; 12], plaintext));
+    harness.set_cat_body(cid, framed_sse_c_ciphertext(plaintext));
     let object_key = ipfs_s3_gateway::crypto::ObjectKey { bytes: [7; 32] };
     let fingerprint =
         fingerprinted.then(|| harness.state.master_key.sse_c_key_fingerprint(&object_key));
@@ -814,10 +829,35 @@ async fn v03_plaintext_get_and_head_range_matrix() {
     assert!(head.bytes().await.expect("ranged HEAD body").is_empty());
 }
 
+async fn assert_cat_ranges(harness: &TestHarness, cid: &str, expected: &[Option<(usize, usize)>]) {
+    let requests = harness
+        .kubo
+        .received_requests()
+        .await
+        .expect("Kubo request log");
+    let cats: Vec<_> = requests
+        .iter()
+        .filter(|r| r.url.path() == "/api/v0/cat")
+        .collect();
+    assert_eq!(cats.len(), expected.len());
+    for (request, range) in cats.into_iter().zip(expected) {
+        let query: HashMap<_, _> = request.url.query_pairs().collect();
+        assert_eq!(query["arg"], cid);
+        match range {
+            Some((offset, length)) => {
+                assert_eq!(query["offset"].parse::<usize>().unwrap(), *offset);
+                assert_eq!(query["length"].parse::<usize>().unwrap(), *length);
+            }
+            None => assert!(!query.contains_key("offset") && !query.contains_key("length")),
+        }
+    }
+}
+
 #[tokio::test]
 async fn v03_sse_s3_put_get_and_range_matrix() {
     let cid = "QmV03SseS3";
-    let plaintext = b"0123456789abcdef".to_vec();
+    let key = "sse-s3-range.bin";
+    let plaintext: Vec<_> = (0..3 * CHUNK_SIZE + 17).map(|i| (i % 251) as u8).collect();
     let harness = start_harness(scripted(&[cid], vec![])).await;
     let mut encryption_headers = HeaderMap::new();
     encryption_headers.insert(
@@ -825,18 +865,11 @@ async fn v03_sse_s3_put_get_and_range_matrix() {
         HeaderValue::from_static("AES256"),
     );
 
-    let put = signed_put(
-        &harness,
-        "sse-s3-range.bin",
-        &[],
-        plaintext.clone(),
-        encryption_headers,
-    )
-    .await;
+    let put = signed_put(&harness, key, &[], plaintext.clone(), encryption_headers).await;
     assert_eq!(put.status(), StatusCode::OK);
     assert_put_cid_headers(&put, cid);
     assert_eq!(put.headers()["x-amz-server-side-encryption"], "AES256");
-    let ciphertext = harness
+    let mut ciphertext = harness
         .captured_add_file_bytes()
         .into_iter()
         .next()
@@ -845,70 +878,71 @@ async fn v03_sse_s3_put_get_and_range_matrix() {
         ciphertext, plaintext,
         "SSE-S3 Kubo add must receive ciphertext"
     );
-    harness.set_cat_body(cid, ciphertext);
+    harness.set_cat_body(cid, ciphertext.clone());
 
-    let full = signed_get(&harness, "sse-s3-range.bin").await;
+    let full = signed_get(&harness, key).await;
     assert_eq!(full.status(), StatusCode::OK);
     assert_eq!(
         full.bytes().await.expect("full SSE-S3 GET body").as_ref(),
         plaintext
     );
 
+    let first = 2 * CHUNK_SIZE - 2;
+    let last = first + 5;
     let mut range_headers = HeaderMap::new();
-    range_headers.insert(http::header::RANGE, HeaderValue::from_static("bytes=4-9"));
-    let ranged = signed_get_with_headers(&harness, "sse-s3-range.bin", range_headers).await;
+    range_headers.insert(
+        http::header::RANGE,
+        HeaderValue::from_str(&format!("bytes={first}-{last}")).unwrap(),
+    );
+    let ranged = signed_get_with_headers(&harness, key, range_headers.clone()).await;
     assert_eq!(ranged.status(), StatusCode::PARTIAL_CONTENT);
     assert_eq!(ranged.headers()[http::header::CONTENT_LENGTH], "6");
     assert_eq!(
         ranged.headers()[http::header::CONTENT_RANGE],
-        "bytes 4-9/16"
+        format!("bytes {first}-{last}/{}", plaintext.len())
     );
     assert_eq!(
-        ranged
-            .bytes()
-            .await
-            .expect("ranged SSE-S3 GET body")
-            .as_ref(),
-        b"456789"
+        ranged.bytes().await.unwrap().as_ref(),
+        &plaintext[first..=last]
     );
 
-    let cat_requests = harness
-        .kubo
-        .received_requests()
-        .await
-        .expect("Kubo request log")
-        .into_iter()
-        .filter(|request| request.url.path() == "/api/v0/cat")
-        .collect::<Vec<_>>();
-    assert_eq!(
-        cat_requests.len(),
-        2,
-        "full and ranged SSE-S3 GET cat once each"
+    let frame_len = CHUNK_SIZE + 28;
+    ciphertext[3 * frame_len - 1] ^= 1;
+    harness.set_cat_body(cid, ciphertext);
+    let url = presign_sigv4_query(
+        &reqwest::Method::GET,
+        &harness.endpoint,
+        &harness.bucket,
+        key,
+        &[],
+        "test",
+        "test",
+        None,
+        60,
+        Utc::now(),
     );
-    for request in cat_requests {
-        assert_eq!(
-            request
-                .url
-                .query_pairs()
-                .find(|(name, _)| name == "arg")
-                .map(|(_, value)| value.into_owned())
-                .as_deref(),
-            Some(cid)
-        );
+    if let Ok(response) = reqwest::Client::new()
+        .get(url)
+        .headers(range_headers)
+        .send()
+        .await
+    {
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
         assert!(
-            request
-                .url
-                .query_pairs()
-                .all(|(name, _)| !matches!(name.as_ref(), "bytes" | "offset" | "length")),
-            "encrypted GET must fully cat, decrypt, then slice"
+            response.bytes().await.is_err(),
+            "corrupt selected frame must interrupt the body"
         );
     }
+    let covered_range = Some((frame_len, 2 * frame_len));
+    assert_cat_ranges(&harness, cid, &[None, covered_range, covered_range]).await;
 }
 
 #[tokio::test]
 async fn v03_sse_c_put_get_and_wrong_key_range_matrix() {
     let cid = "QmV03SseC";
-    let plaintext = b"0123456789abcdef".to_vec();
+    let tail = b"short final frame";
+    let mut plaintext = vec![0x5a; 2 * CHUNK_SIZE];
+    plaintext.extend_from_slice(tail);
     let harness = start_harness(scripted(&[cid], vec![])).await;
 
     let put = signed_put(
@@ -947,26 +981,28 @@ async fn v03_sse_c_put_get_and_wrong_key_range_matrix() {
         plaintext
     );
 
+    let suffix = HeaderValue::from_static("bytes=-6");
     let mut correct_range_headers = sse_c_headers_for([7; 32]);
-    correct_range_headers.insert(http::header::RANGE, HeaderValue::from_static("bytes=3-8"));
+    correct_range_headers.insert(http::header::RANGE, suffix.clone());
     let ranged = signed_get_with_headers(&harness, "sse-c-range.bin", correct_range_headers).await;
     assert_eq!(ranged.status(), StatusCode::PARTIAL_CONTENT);
     assert_eq!(ranged.headers()[http::header::CONTENT_LENGTH], "6");
     assert_eq!(
         ranged.headers()[http::header::CONTENT_RANGE],
-        "bytes 3-8/16"
+        format!(
+            "bytes {}-{}/{}",
+            plaintext.len() - 6,
+            plaintext.len() - 1,
+            plaintext.len()
+        )
     );
     assert_eq!(
-        ranged
-            .bytes()
-            .await
-            .expect("ranged SSE-C GET body")
-            .as_ref(),
-        b"345678"
+        ranged.bytes().await.unwrap().as_ref(),
+        &plaintext[plaintext.len() - 6..]
     );
 
     let mut wrong_range_headers = sse_c_headers_for([8; 32]);
-    wrong_range_headers.insert(http::header::RANGE, HeaderValue::from_static("bytes=3-8"));
+    wrong_range_headers.insert(http::header::RANGE, suffix);
     let wrong_key = signed_get_with_headers(&harness, "sse-c-range.bin", wrong_range_headers).await;
     assert_eq!(wrong_key.status(), StatusCode::FORBIDDEN);
     let wrong_body = wrong_key.text().await.expect("wrong-key SSE-C error body");
@@ -975,9 +1011,15 @@ async fn v03_sse_c_put_get_and_wrong_key_range_matrix() {
         "wrong-key SSE-C response: {wrong_body}"
     );
     assert!(
-        !wrong_body.contains(std::str::from_utf8(&plaintext).expect("plaintext is UTF-8")),
+        !wrong_body.contains(std::str::from_utf8(tail).unwrap()),
         "wrong-key SSE-C error must not leak plaintext: {wrong_body}"
     );
+    assert_cat_ranges(
+        &harness,
+        cid,
+        &[None, Some((2 * (CHUNK_SIZE + 28), tail.len() + 28))],
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -1278,6 +1320,56 @@ async fn legacy_sse_c_get_claims_after_exact_authentication_and_streams_second_c
             .unwrap();
     assert!(object.sse_c_key_fingerprint.is_some());
     assert_eq!(kubo_call_counts(&harness).await, (0, 2, 0, 0));
+}
+
+#[tokio::test]
+async fn legacy_sse_c_range_authenticates_full_object_before_one_time_claim() {
+    let key = "legacy-range.bin";
+    let cid = "QmLegacyRange";
+    let mut plaintext = vec![0x5a; CHUNK_SIZE];
+    plaintext.extend_from_slice(b"unselected tail");
+    let harness = start_harness(scripted(&[], vec![])).await;
+    seed_sse_c_object(
+        &harness,
+        key,
+        cid,
+        &plaintext,
+        false,
+        plaintext.len() as i64,
+    )
+    .await;
+    let ciphertext = framed_sse_c_ciphertext(&plaintext);
+    let mut corrupt_tail = ciphertext.clone();
+    *corrupt_tail.last_mut().unwrap() ^= 1;
+    harness.set_cat_body(cid, corrupt_tail);
+
+    let mut headers = sse_c_headers_for([7; 32]);
+    headers.insert(http::header::RANGE, HeaderValue::from_static("bytes=1-3"));
+    let rejected = signed_get_with_headers(&harness, key, headers.clone()).await;
+    assert_s3_error(rejected, StatusCode::FORBIDDEN, "AccessDenied", "").await;
+    assert!(
+        store::object::get_latest(harness.state.store.db(), &harness.bucket, key)
+            .await
+            .unwrap()
+            .sse_c_key_fingerprint
+            .is_none()
+    );
+
+    harness.set_cat_body(cid, ciphertext);
+    for _ in 0..2 {
+        let ranged = signed_get_with_headers(&harness, key, headers.clone()).await;
+        assert_eq!(ranged.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(ranged.bytes().await.unwrap().as_ref(), b"ZZZ");
+    }
+    assert!(
+        store::object::get_latest(harness.state.store.db(), &harness.bucket, key)
+            .await
+            .unwrap()
+            .sse_c_key_fingerprint
+            .is_some()
+    );
+    let first_frame = Some((0, CHUNK_SIZE + 28));
+    assert_cat_ranges(&harness, cid, &[None, None, first_frame, first_frame]).await;
 }
 
 #[tokio::test]

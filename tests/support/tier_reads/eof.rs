@@ -299,7 +299,7 @@ pub(super) async fn assert_fixed_length_gets_wait_for_kubo_eof() {
             headers: sse_s3_range,
             expected_status: StatusCode::PARTIAL_CONTENT,
             expected_body: &plaintext[7..11],
-            expected_kubo_range: None,
+            expected_kubo_range: Some((0, (CHUNK_SIZE + 28) as u64)),
         },
         ErrorCase {
             name: "fingerprinted SSE-C full GET",
@@ -317,7 +317,7 @@ pub(super) async fn assert_fixed_length_gets_wait_for_kubo_eof() {
             headers: sse_c_range,
             expected_status: StatusCode::PARTIAL_CONTENT,
             expected_body: &plaintext[7..11],
-            expected_kubo_range: None,
+            expected_kubo_range: Some((0, (CHUNK_SIZE + 28) as u64)),
         },
         ErrorCase {
             name: "empty fingerprinted SSE-C full GET",

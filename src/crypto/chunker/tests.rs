@@ -191,6 +191,27 @@ async fn decrypt_stream_rejects_wrong_key_and_truncated_tail_without_plaintext()
 }
 
 #[tokio::test]
+async fn encrypted_range_rejects_missing_or_incomplete_selected_frame() {
+    let key = Arc::new(ObjectKey { bytes: [0x38; 32] });
+    let boundary = CHUNK_SIZE as u64;
+    let encrypted = encrypt_chunk(&key, &[0x61; 12], b"tail").unwrap();
+    let short_but_authenticated = encrypt_chunk(&key, &[0x62; 12], b"t").unwrap();
+    for body in [
+        Vec::new(),
+        vec![encrypted.slice(..encrypted.len() - 1)],
+        vec![short_but_authenticated],
+    ] {
+        let range = EncryptedRange::new(boundary + 4, boundary, boundary + 1);
+        let results = range
+            .decrypt(input(body), key.clone())
+            .collect::<Vec<_>>()
+            .await;
+        assert_eq!(results.len(), 1);
+        assert!(results[0].is_err(), "no plaintext from an incomplete frame");
+    }
+}
+
+#[tokio::test]
 async fn decrypt_stream_authenticates_each_frame_before_delivery() {
     let key = Arc::new(ObjectKey { bytes: [0x38; 32] });
     let full = vec![0x23; CHUNK_SIZE];

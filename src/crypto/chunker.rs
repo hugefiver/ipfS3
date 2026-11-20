@@ -6,6 +6,7 @@ use crate::error::AppError;
 use super::aes_gcm::{CHUNK_OVERHEAD, ChunkCipher};
 
 pub const CHUNK_SIZE: usize = 256 * 1024;
+const CIPHER_CHUNK: usize = CHUNK_SIZE + CHUNK_OVERHEAD;
 
 /// Collect a byte stream into chunks of CHUNK_SIZE.
 pub fn chunk_stream<S, E>(stream: S) -> impl Stream<Item = Result<Bytes, E>>
@@ -92,7 +93,6 @@ where
     // CHUNK_SIZE + 28 bytes (for full chunks). The last chunk may be smaller.
     // HTTP/TCP packet boundaries do NOT align with chunk boundaries, so we must
     // buffer and split at CIPHER_CHUNK boundaries before decrypting.
-    const CIPHER_CHUNK: usize = CHUNK_SIZE + CHUNK_OVERHEAD;
     async_stream::stream! {
         let cipher = ChunkCipher::new(&ok);
         let mut framed = std::pin::pin!(frame_stream(stream, CIPHER_CHUNK));
@@ -107,6 +107,67 @@ where
                         yield Err(AppError::Internal(error.to_string()));
                     }
                 }
+            }
+        }
+    }
+}
+
+/// Complete cipher frames covering a checked, nonempty plaintext range.
+pub(crate) struct EncryptedRange {
+    ciphertext: (u64, u64),
+    covered_plaintext_len: u64,
+    start: u64,
+    end: u64,
+}
+
+impl EncryptedRange {
+    pub(crate) fn new(total_size: u64, start: u64, end: u64) -> Self {
+        let chunk = CHUNK_SIZE as u64;
+        let first = start / chunk;
+        let last_exclusive = end.div_ceil(chunk);
+        let frame_start = first * chunk;
+        let frame_end = (last_exclusive * chunk).min(total_size);
+        Self {
+            ciphertext: (
+                first * CIPHER_CHUNK as u64,
+                frame_end + last_exclusive * CHUNK_OVERHEAD as u64,
+            ),
+            covered_plaintext_len: frame_end - frame_start,
+            start: start - frame_start,
+            end: end - frame_start,
+        }
+    }
+
+    pub(crate) fn ciphertext_bounds(&self) -> (u64, u64) {
+        self.ciphertext
+    }
+
+    pub(crate) fn decrypt<S, E>(
+        self,
+        stream: S,
+        key: std::sync::Arc<super::key::ObjectKey>,
+    ) -> impl Stream<Item = Result<Bytes, AppError>>
+    where
+        S: Stream<Item = Result<Bytes, E>> + Unpin,
+        E: Into<Box<dyn std::error::Error + Send + Sync>> + Send + 'static,
+    {
+        async_stream::try_stream! {
+            let mut decrypted = std::pin::pin!(decrypt_chunk_stream(stream, key));
+            let mut frame_start = 0;
+            while let Some(frame) = decrypted.next().await {
+                let bytes = frame?;
+                let expected_len = (self.covered_plaintext_len - frame_start).min(CHUNK_SIZE as u64);
+                if expected_len == 0 || bytes.len() as u64 != expected_len {
+                    Err(AppError::kubo_rpc_detail("unexpected ciphertext range frame size"))?;
+                }
+                let frame_end = frame_start + expected_len;
+                let start = (self.start.max(frame_start) - frame_start) as usize;
+                let end = (self.end.min(frame_end) - frame_start) as usize;
+                yield bytes.slice(start..end);
+                frame_start = frame_end;
+            }
+            if frame_start != self.covered_plaintext_len {
+                Err(AppError::kubo_rpc_detail("incomplete ciphertext range"))?;
             }
         }
     }

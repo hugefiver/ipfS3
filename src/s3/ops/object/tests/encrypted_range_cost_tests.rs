@@ -1,4 +1,5 @@
 use super::*;
+use crate::crypto::chunker::CHUNK_SIZE;
 use std::{
     sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant},
@@ -6,7 +7,7 @@ use std::{
 
 fn ciphertext_fixture(size: usize) -> (Arc<crate::crypto::ObjectKey>, Vec<Bytes>) {
     let key = Arc::new(crate::crypto::ObjectKey { bytes: [0x42; 32] });
-    let plaintext = vec![0x5a; crate::crypto::chunker::CHUNK_SIZE];
+    let plaintext = vec![0x5a; CHUNK_SIZE];
     let chunks = (0..size)
         .step_by(plaintext.len())
         .enumerate()
@@ -35,15 +36,26 @@ struct RangeWork {
 async fn measure_range(
     key: Arc<crate::crypto::ObjectKey>,
     chunks: &[Bytes],
+    size: u64,
     range: (u64, u64),
 ) -> RangeWork {
     let read = Arc::new(AtomicU64::new(0));
     let observed = read.clone();
-    let input = futures_util::stream::iter(chunks.to_vec()).map(move |chunk| {
+    let encrypted_range = EncryptedRange::new(size, range.0, range.1);
+    let (offset, end) = encrypted_range.ciphertext_bounds();
+    let stride = chunks[0].len() as u64;
+    let selected = chunks[(offset / stride) as usize..end.div_ceil(stride) as usize].to_vec();
+    let input = futures_util::stream::iter(selected).map(move |chunk| {
         observed.fetch_add(chunk.len() as u64, Ordering::Relaxed);
         Ok::<_, std::io::Error>(chunk)
     });
-    let mut body = encrypted_object_body(input, key, Some(range), "authentication failed");
+    let mut body = encrypted_object_body(
+        input,
+        key,
+        Some(encrypted_range),
+        None,
+        "authentication failed",
+    );
     let started = Instant::now();
     let mut first_byte = None;
     let mut first_byte_read_bytes = 0;
@@ -60,10 +72,7 @@ async fn measure_range(
     let completed = started.elapsed();
     let read_bytes = read.load(Ordering::Relaxed);
     assert_eq!(returned_bytes, range.1 - range.0);
-    assert_eq!(
-        read_bytes,
-        chunks.iter().map(|chunk| chunk.len() as u64).sum::<u64>()
-    );
+    assert_eq!(read_bytes, end - offset);
     RangeWork {
         read_bytes,
         first_byte_read_bytes,
@@ -74,17 +83,21 @@ async fn measure_range(
 }
 
 #[tokio::test]
-async fn encrypted_range_success_authenticates_all_input_positions() {
-    let boundary = crate::crypto::chunker::CHUNK_SIZE as u64;
+async fn encrypted_range_reads_only_covering_frames() {
+    let boundary = CHUNK_SIZE as u64;
+    let full_frame = boundary + 28;
+    let final_frame = 7 + 28;
     let size = boundary * 4 + 7;
     let (key, chunks) = ciphertext_fixture(size as usize);
-    for range in [(0, 4), (boundary - 2, boundary + 2), (size - 4, size)] {
-        let work = measure_range(key.clone(), &chunks, range).await;
-        if range.0 == 0 || range.1 == size {
-            assert_eq!(work.first_byte_read_bytes, work.read_bytes);
-        } else {
-            assert!(work.first_byte_read_bytes < work.read_bytes);
-        }
+    for (range, expected_read, expected_first_byte_read) in [
+        ((0, 4), full_frame, full_frame),
+        ((boundary - 2, boundary), full_frame, full_frame),
+        ((boundary - 2, boundary + 2), 2 * full_frame, full_frame),
+        ((size - 4, size), final_frame, final_frame),
+    ] {
+        let work = measure_range(key.clone(), &chunks, size, range).await;
+        assert_eq!(work.read_bytes, expected_read);
+        assert_eq!(work.first_byte_read_bytes, expected_first_byte_read);
     }
 }
 
@@ -93,14 +106,14 @@ async fn encrypted_range_success_authenticates_all_input_positions() {
 async fn encrypted_range_body_cost() {
     for size in [8 * 1024 * 1024, 64 * 1024 * 1024] {
         let (key, chunks) = ciphertext_fixture(size);
-        let boundary = crate::crypto::chunker::CHUNK_SIZE as u64;
+        let boundary = CHUNK_SIZE as u64;
         for (position, range) in [
             ("head", (0, 4096)),
             ("cross_chunk", (boundary - 2048, boundary + 2048)),
             ("tail", (size as u64 - 4096, size as u64)),
         ] {
             for sample in 0..3 {
-                let work = measure_range(key.clone(), &chunks, range).await;
+                let work = measure_range(key.clone(), &chunks, size as u64, range).await;
                 eprintln!(
                     "encrypted_range_body plaintext_bytes={size} position={position} sample={sample} ciphertext_read={} response_bytes={} read_before_first_byte={} first_byte_us={} completion_us={}",
                     work.read_bytes,

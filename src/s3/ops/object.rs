@@ -9,6 +9,7 @@ use s3s::dto::*;
 use s3s::{S3Request, S3Response, S3Result};
 
 use crate::crypto::EncryptionMode;
+use crate::crypto::chunker::{EncryptedRange, decrypt_chunk_stream};
 use crate::error::AppError;
 use crate::pinning::decision::{DecisionEffect, DecisionOrigin, ExtensionDecision, WarningCode};
 use crate::pinning::policy::{PublicationContext, PublicationPolicy};
@@ -691,23 +692,26 @@ async fn authenticate_sse_c_object(
 fn encrypted_object_body<S>(
     cat: S,
     key: Arc<crate::crypto::ObjectKey>,
-    range: Option<(u64, u64)>,
+    range: Option<EncryptedRange>,
+    empty_range_end: Option<u64>,
     authentication_error: &'static str,
 ) -> StreamingBlob
 where
     S: Stream<Item = Result<Bytes, std::io::Error>> + Send + Sync + Unpin + 'static,
 {
     let stream = async_stream::stream! {
-        let decrypted = crate::crypto::chunker::decrypt_chunk_stream(cat, key);
+        let decrypted = match range {
+            Some(range) => range.decrypt(cat, key).left_stream(),
+            None => decrypt_chunk_stream(cat, key).right_stream(),
+        };
         tokio::pin!(decrypted);
-        let mut plaintext_offset = 0_u64;
-        // For ranges, retaining only the final selected slice ensures fixed
-        // Content-Length cannot complete until every later cipher chunk has
-        // authenticated. `Bytes::slice` retains at most one plaintext chunk.
-        let mut pending_selected = None;
+        let mut discard_remaining = empty_range_end;
         while let Some(chunk) = decrypted.next().await {
-            let bytes = match chunk {
-                Ok(bytes) => bytes,
+            match chunk {
+                Ok(bytes) => match &mut discard_remaining {
+                    Some(remaining) => *remaining = remaining.saturating_sub(bytes.len() as u64),
+                    None => yield Ok(bytes),
+                },
                 Err(crate::error::AppError::Crypto(_)) => {
                     yield Err(std::io::Error::new(
                         std::io::ErrorKind::PermissionDenied,
@@ -721,50 +725,13 @@ where
                     ));
                     return;
                 }
-            };
-            let chunk_len = match u64::try_from(bytes.len()) {
-                Ok(chunk_len) => chunk_len,
-                Err(_) => {
-                    yield Err(std::io::Error::other("decrypted object size exceeds limit"));
-                    return;
-                }
-            };
-            let chunk_end = match plaintext_offset.checked_add(chunk_len) {
-                Some(chunk_end) => chunk_end,
-                None => {
-                    yield Err(std::io::Error::other("decrypted object size exceeds limit"));
-                    return;
-                }
-            };
-
-            if let Some((start, end)) = range {
-                let selected_start = start.max(plaintext_offset);
-                let selected_end = end.min(chunk_end);
-                if selected_start < selected_end {
-                    let local_start = (selected_start - plaintext_offset) as usize;
-                    let local_end = (selected_end - plaintext_offset) as usize;
-                    let selected = bytes.slice(local_start..local_end);
-                    if let Some(previous) = pending_selected.replace(selected) {
-                        yield Ok(previous);
-                    }
-                }
-            } else {
-                yield Ok(bytes);
             }
-            plaintext_offset = chunk_end;
         }
-
-        if let Some((_, end)) = range
-            && plaintext_offset < end
-        {
+        if discard_remaining.is_some_and(|remaining| remaining != 0) {
             yield Err(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
-                "requested range exceeds available decrypted data",
+                crate::error::INTERNAL_STORAGE_BACKEND_ERROR,
             ));
-            return;
-        }
-        if let Some(final_selected) = pending_selected {
-            yield Ok(final_selected);
         }
     };
     StreamingBlob::wrap(stream)
@@ -1030,20 +997,18 @@ pub async fn get_object(
 
     let has_range = req.input.range.is_some();
     let is_sse_c = obj.encrypted && obj.key_wrap.is_none();
-    let mut sse_c_auth = if is_sse_c {
-        Some(
-            authenticate_sse_c_object(
-                state,
-                &obj,
-                &selected.read_client,
-                extract_sse_c_headers(&req.headers)?,
-            )
-            .await?,
+    let (sse_c_key, sse_customer_key_md5) = if is_sse_c {
+        let auth = authenticate_sse_c_object(
+            state,
+            &obj,
+            &selected.read_client,
+            extract_sse_c_headers(&req.headers)?,
         )
+        .await?;
+        (Some(auth.key), Some(auth.key_md5))
     } else {
-        None
+        (None, None)
     };
-    let sse_customer_key_md5 = sse_c_auth.as_ref().map(|auth| auth.key_md5.clone());
 
     let range_ref = req.input.range.as_ref();
     let total_size = u64::try_from(obj.size)
@@ -1053,38 +1018,25 @@ pub async fn get_object(
     // Build the response body stream.
     let body: StreamingBlob = if obj.encrypted {
         // Resolve the object key used for decryption.
-        let ok = if let Some(ref wrapped) = obj.key_wrap {
-            // SSE-S3: unwrap with the master key.
-            state
+        let (key, authentication_error) = if let Some(wrapped) = obj.key_wrap.as_ref() {
+            let key = state
                 .master_key
                 .unwrap(wrapped)
-                .map_err(|e| s3s::s3_error!(InternalError, "key unwrap: {e}"))?
+                .map_err(|e| s3s::s3_error!(InternalError, "key unwrap: {e}"))?;
+            (Arc::new(key), "decryption failed")
         } else {
-            return build_sse_c_get_response(
-                &obj,
-                sse_c_auth.take().ok_or_else(|| {
-                    s3s::s3_error!(InternalError, "missing authenticated SSE-C object key")
-                })?,
-                selected.read_client,
-                start,
-                end,
-                has_range,
-                sse_customer_key_md5,
-                version_id,
-                storage_class,
+            (
+                sse_c_key.expect("authenticated SSE-C object key"),
+                "SSE-C object authentication failed",
             )
-            .await;
         };
 
-        let ok_arc = Arc::new(ok);
-        let cat = crate::kubo::cat::stream_cat(&selected.read_client, &obj.cid, None).await?;
-
-        encrypted_object_body(
-            cat,
-            ok_arc,
-            has_range.then_some((start, end)),
-            "decryption failed",
-        )
+        let range = (has_range && start < end).then(|| EncryptedRange::new(total_size, start, end));
+        let ciphertext_bounds = range.as_ref().map(EncryptedRange::ciphertext_bounds);
+        let cat = crate::kubo::cat::stream_cat(&selected.read_client, &obj.cid, ciphertext_bounds)
+            .await?;
+        let empty_range_end = (has_range && start == end).then_some(end);
+        encrypted_object_body(cat, key, range, empty_range_end, authentication_error)
     } else {
         // Plaintext: stream directly from Kubo without collecting into memory.
         let kubo_range = if has_range { Some((start, end)) } else { None };
@@ -1125,49 +1077,7 @@ pub async fn get_object(
         last_modified: Some(Timestamp::from(SystemTime::from(obj.created_at))),
         content_range,
         server_side_encryption,
-        metadata: restore_metadata(&obj.metadata),
-        version_id,
-        storage_class: Some(storage_class),
-        ..Default::default()
-    }))
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn build_sse_c_get_response(
-    obj: &crate::store::entities::object::Model,
-    auth: AuthenticatedSseCObject,
-    read_client: crate::kubo::KuboClient,
-    start: u64,
-    end: u64,
-    has_range: bool,
-    sse_customer_key_md5: Option<String>,
-    version_id: Option<String>,
-    storage_class: StorageClass,
-) -> S3Result<S3Response<GetObjectOutput>> {
-    // Legacy SSE-C objects were fully authenticated before reaching this
-    // response. The response still uses a fresh streaming read so ranges never
-    // require retaining the whole plaintext in memory.
-    let cat = crate::kubo::cat::stream_cat(&read_client, &obj.cid, None).await?;
-    let body = encrypted_object_body(
-        cat,
-        auth.key,
-        has_range.then_some((start, end)),
-        "SSE-C object authentication failed",
-    );
-
-    let body = super::object_body::finish_get_body(body, end.saturating_sub(start)).await?;
-
-    let content_length = end.saturating_sub(start) as i64;
-    let content_range =
-        has_range.then(|| format!("bytes {}-{}/{}", start, end.saturating_sub(1), obj.size));
-    Ok(S3Response::new(GetObjectOutput {
-        body: Some(body),
-        content_length: Some(content_length),
-        content_type: obj.content_type.clone(),
-        e_tag: Some(ETag::Strong(obj.etag.clone())),
-        last_modified: Some(Timestamp::from(SystemTime::from(obj.created_at))),
-        content_range,
-        sse_customer_algorithm: Some("AES256".to_owned()),
+        sse_customer_algorithm: is_sse_c.then(|| "AES256".to_owned()),
         sse_customer_key_md5,
         metadata: restore_metadata(&obj.metadata),
         version_id,
@@ -3208,25 +3118,23 @@ mod tests {
             .filter(|request| request.url.path() == "/api/v0/cat")
             .collect();
         assert_eq!(cats.len(), 4);
-        for request in cats {
-            assert!(
-                request
-                    .url
-                    .query_pairs()
-                    .any(|(key, value)| key == "offline" && value == "true")
-            );
-            assert!(
-                request
-                    .url
-                    .query_pairs()
-                    .all(|(key, _)| key != "offset" && key != "length"),
-                "encrypted Range still decrypts full ciphertext before slicing"
-            );
+        for (index, request) in cats.into_iter().enumerate() {
+            let query: HashMap<_, _> = request.url.query_pairs().collect();
+            assert_eq!(query["offline"], "true");
+            if index % 2 == 0 {
+                assert!(!query.contains_key("offset") && !query.contains_key("length"));
+            } else {
+                assert_eq!(query["offset"], "0");
+                assert_eq!(query["length"], "32");
+            }
         }
     }
 
     #[tokio::test]
-    async fn encrypted_range_streams_selected_bytes_and_drains_tail_authentication() {
+    async fn encrypted_range_skips_corrupt_unselected_tail_but_full_get_rejects_it() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, ResponseTemplate};
+
         let hot = wiremock::MockServer::start().await;
         let state = pinning_state(hot.uri(), "request", "one", "").await;
         let key = state.master_key.generate_object_key();
@@ -3253,6 +3161,19 @@ mod tests {
             Vec::new(),
         )
         .await;
+        let first_cipher_len = ciphertext.len() - corrupt_tail.len();
+        Mock::given(method("POST"))
+            .and(path("/api/v0/cat"))
+            .and(query_param("arg", TEST_CID))
+            .and(query_param("offset", "0"))
+            .and(query_param("length", first_cipher_len.to_string()))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_bytes(ciphertext[..first_cipher_len].to_vec()),
+            )
+            .with_priority(1)
+            .expect(1)
+            .mount(&hot)
+            .await;
         mount_cat_body(&hot, TEST_CID, ciphertext).await;
         let mut request = get_object_request("encrypted-range.bin", None, http::HeaderMap::new());
         request.input.range = Some(Range::Int {
@@ -3263,12 +3184,21 @@ mod tests {
         let response = get_object(&state, request)
             .await
             .expect("encrypted range response");
-        let mut body = response.output.body.expect("encrypted range body");
+        assert_eq!(read_get_body(response).await, first_plaintext[..4]);
+
+        let full = get_object(
+            &state,
+            get_object_request("encrypted-range.bin", None, http::HeaderMap::new()),
+        )
+        .await
+        .expect("encrypted full response");
+        let mut body = full.output.body.expect("encrypted full body");
+        assert_eq!(body.next().await.unwrap().unwrap(), first_plaintext);
         let tail_error = body
             .next()
             .await
-            .expect("the unselected tail must be authenticated before the final selected bytes")
-            .expect_err("corrupt tail must fail before completing Content-Length");
+            .unwrap()
+            .expect_err("corrupt tail must fail a full GET");
         assert_eq!(
             tail_error
                 .downcast_ref::<std::io::Error>()
