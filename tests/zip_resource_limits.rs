@@ -12,7 +12,6 @@ use ipfs_s3_gateway::zip::extract::{
 };
 use ipfs_s3_gateway::zip::response::{ExtractFailure, ExtractedEntry};
 use sea_orm::Database;
-use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -27,7 +26,7 @@ async fn test_state() -> (Arc<AppState>, MockServer) {
         kubo: KuboClient::new(kubo.uri()),
         cold_kubo: None,
         store: Store::new(db),
-        credentials: HashMap::new(),
+        credentials: Default::default(),
         master_key: MasterKey::from_hex(
             "0000000000000000000000000000000000000000000000000000000000000000",
         )

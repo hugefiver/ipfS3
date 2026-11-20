@@ -15,6 +15,9 @@ use sea_orm::{ConnectionTrait as _, Database};
 #[path = "support/sigv4.rs"]
 mod sigv4;
 
+#[path = "support/local_session_process.rs"]
+mod local_session_process;
+
 const SENTINELS: &[&str] = &[
     "AUTHORIZATION_SECRET_SENTINEL",
     "PRESIGNED_QUERY_SENTINEL",
@@ -290,6 +293,7 @@ fn spawn_gateway(
             .env("RUST_LOG", rust_log)
             .env("IPFS_S3_CONFIG", temp.path().join("config.toml"))
             .env_remove("IPFS_S3_METRICS_BIND")
+            .env_remove("IPFS_S3_SESSION_SIGNING_KEY")
             .env("IPFS_S3_BIND", address.to_string())
             .env("IPFS_S3_DATABASE_URL", database_url)
             .env(

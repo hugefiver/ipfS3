@@ -119,7 +119,7 @@ async fn test_state_with_kubo(kubo: KuboClient) -> Arc<AppState> {
         kubo,
         cold_kubo: None,
         store: Store::new(db),
-        credentials: HashMap::new(),
+        credentials: Default::default(),
         master_key: MasterKey::from_hex(
             "0000000000000000000000000000000000000000000000000000000000000000",
         )

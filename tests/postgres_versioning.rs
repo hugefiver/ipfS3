@@ -1104,7 +1104,8 @@ async fn postgres_synchronized_publish_exact_delete_tag_serializes_without_deadl
         kubo: KuboClient::new("http://127.0.0.1:5001".to_owned()),
         cold_kubo: None,
         store: Store::new(tagger),
-        credentials: HashMap::from([("test".to_owned(), s3s::auth::SecretKey::from("test"))]),
+        credentials: HashMap::from([("test".to_owned(), s3s::auth::SecretKey::from("test"))])
+            .into(),
         master_key: MasterKey::from_hex(&"0".repeat(64)).expect("zero test master key"),
         pinning: PinningCoordinator::disabled_for_test(),
     });
@@ -1602,7 +1603,8 @@ async fn postgres_http_marker_restore_then_suspended_replacement_preserves_all_v
         kubo: KuboClient::new(kubo.server.uri()),
         cold_kubo: None,
         store: Store::new(fixture.db.clone()),
-        credentials: HashMap::from([("test".to_owned(), s3s::auth::SecretKey::from("test"))]),
+        credentials: HashMap::from([("test".to_owned(), s3s::auth::SecretKey::from("test"))])
+            .into(),
         master_key: MasterKey::from_hex(&"0".repeat(64)).expect("zero test master key"),
         pinning: PinningCoordinator::disabled_for_test(),
     });

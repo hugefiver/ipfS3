@@ -9,11 +9,13 @@ extern crate self as ipfs_s3_gateway;
 #[path = "../tests/support/sql_trace.rs"]
 pub(crate) mod sql_trace;
 
+pub mod access;
 pub mod auth;
 pub mod config;
 pub mod cors;
 pub mod crypto;
 pub mod error;
+pub mod iam;
 pub mod import;
 pub mod kubo;
 pub mod lifecycle;

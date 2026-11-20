@@ -755,7 +755,7 @@ async fn sha256_checksum_is_verified_against_cat_and_zip_trailer_is_required() {
 
 #[tokio::test]
 async fn late_kubo_cat_error_trailer_never_becomes_a_verified_archive() {
-    use std::{collections::HashMap, sync::Arc};
+    use std::sync::Arc;
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
@@ -806,7 +806,9 @@ async fn late_kubo_cat_error_trailer_never_becomes_a_verified_archive() {
         kubo: ipfs_s3_gateway::kubo::KuboClient::new(kubo_url),
         cold_kubo: None,
         store: store::Store::new(db),
-        credentials: HashMap::from([("test".into(), s3s::auth::SecretKey::from("test"))]),
+        credentials: [("test".into(), s3s::auth::SecretKey::from("test"))]
+            .into_iter()
+            .collect(),
         master_key: ipfs_s3_gateway::crypto::key::MasterKey::from_hex(&"0".repeat(64)).unwrap(),
         pinning: ipfs_s3_gateway::pinning::coordinator::PinningCoordinator::disabled_for_test(),
     });

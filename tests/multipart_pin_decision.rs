@@ -135,7 +135,7 @@ async fn state(kubo: &MockServer, mode: OptionalPinControlMode) -> Arc<AppState>
         kubo: KuboClient::new(kubo.uri()),
         cold_kubo: None,
         store: Store::new(db),
-        credentials: HashMap::from([("test".into(), s3s::auth::SecretKey::from("test"))]),
+        credentials: HashMap::from([("test".into(), s3s::auth::SecretKey::from("test"))]).into(),
         master_key: MasterKey::from_hex(&"0".repeat(64)).unwrap(),
         pinning: pinning(PinningConfig::default(), mode),
     })

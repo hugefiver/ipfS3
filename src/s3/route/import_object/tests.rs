@@ -151,7 +151,7 @@ async fn test_state() -> Arc<AppState> {
         kubo: crate::kubo::KuboClient::new("http://127.0.0.1:1".to_owned()),
         cold_kubo: None,
         store: Store::new(db),
-        credentials: HashMap::new(),
+        credentials: Default::default(),
         master_key: crate::crypto::key::MasterKey::from_hex(&"0".repeat(64)).unwrap(),
         pinning: crate::pinning::coordinator::PinningCoordinator::disabled_for_test(),
     })
@@ -537,7 +537,7 @@ async fn warn_submission_persists_skipped_decision_and_replay_keeps_its_warning(
         kubo: base.kubo.clone(),
         cold_kubo: None,
         store: base.store.clone(),
-        credentials: HashMap::new(),
+        credentials: Default::default(),
         master_key: crate::crypto::key::MasterKey::from_hex(&"0".repeat(64)).unwrap(),
         pinning: crate::pinning::coordinator::PinningCoordinator::build_with_kubo_and_mode(
             config,
@@ -655,7 +655,8 @@ async fn signed_import_restarts_worker_with_new_policy_without_replaying_skipped
             kubo: crate::kubo::KuboClient::new(kubo.uri()),
             cold_kubo: None,
             store: Store::new(db),
-            credentials: HashMap::from([("test".into(), s3s::auth::SecretKey::from("test"))]),
+            credentials: HashMap::from([("test".into(), s3s::auth::SecretKey::from("test"))])
+                .into(),
             master_key: crate::crypto::key::MasterKey::from_hex(&"0".repeat(64)).unwrap(),
             pinning,
         })
@@ -854,6 +855,190 @@ async fn signed_import_server_with_root_default(
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     (endpoint, server)
+}
+
+#[tokio::test]
+async fn signed_import_checks_request_tags_and_the_whole_output_prefix_on_admit_and_poll() {
+    let mut state = test_state().await;
+    let config: crate::config::Config = toml::from_str(
+        r#"
+        [[auth.policy]]
+        user = 'test'
+        effect = 'allow'
+        actions = ['ImportObject', 'DecompressZip', 'CreateMultipartUpload']
+        request_tags = { team = 'ingest' }
+
+        [[auth.policy]]
+        user = 'test'
+        effect = 'deny'
+        actions = ['ImportObject', 'DecompressZip', 'CreateMultipartUpload']
+        prefix = 'blocked/private/'
+
+        [[auth.policy]]
+        user = 'test'
+        effect = 'allow'
+        actions = ['GetImportStatus']
+
+        [[auth.policy]]
+        user = 'test'
+        effect = 'deny'
+        actions = ['GetImportStatus']
+        prefix = 'out/private/'
+        "#,
+    )
+    .unwrap();
+    Arc::get_mut(&mut state).unwrap().credentials =
+        crate::auth::GatewayCredentials::from_config(&config).unwrap();
+    let (endpoint, server) =
+        signed_import_server(state.clone(), coordinator(ImportConfig::default())).await;
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        http::header::CONTENT_TYPE,
+        "application/xml".parse().unwrap(),
+    );
+    let submit = |prefix: &'static str, headers: HeaderMap| {
+        let endpoint = &endpoint;
+        async move {
+            sigv4::send_sigv4(
+                Method::POST,
+                endpoint,
+                "bucket",
+                "archive.zip",
+                &[("ipfs3-import", ""), ("decompress-zip", prefix)],
+                cid_xml().into_bytes(),
+                headers,
+                "test",
+            )
+            .await
+        }
+    };
+    assert_eq!(
+        submit("out/", headers.clone()).await.status(),
+        StatusCode::FORBIDDEN
+    );
+    headers.insert("x-amz-tagging", "team=ingest".parse().unwrap());
+    for (method, query) in [
+        (Method::PUT, vec![("decompress-zip", "blocked/")]),
+        (
+            Method::POST,
+            vec![("uploads", ""), ("decompress-zip", "blocked/")],
+        ),
+    ] {
+        let response = sigv4::send_sigv4(
+            method,
+            &endpoint,
+            "bucket",
+            "archive.zip",
+            &query,
+            Vec::new(),
+            headers.clone(),
+            "test",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+    assert_eq!(
+        submit("blocked/", headers.clone()).await.status(),
+        StatusCode::FORBIDDEN
+    );
+    let accepted = submit("out/", headers).await;
+    assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+    let id = accepted.headers()["x-ipfs3-import-job-id"]
+        .to_str()
+        .unwrap();
+    let poll = sigv4::send_sigv4(
+        Method::GET,
+        &endpoint,
+        "bucket",
+        "archive.zip",
+        &[("ipfs3-import", id)],
+        Vec::new(),
+        HeaderMap::new(),
+        "test",
+    )
+    .await;
+    assert_eq!(poll.status(), StatusCode::FORBIDDEN);
+    let db = state.store.db();
+    assert_eq!(import_job::Entity::find().count(db).await.unwrap(), 1);
+    assert_eq!(
+        crate::store::entities::multipart_upload::Entity::find()
+            .count(db)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        crate::store::entities::zip_batch::Entity::find()
+            .count(db)
+            .await
+            .unwrap(),
+        0
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn presigned_import_poll_accepts_sigv4_fields_and_rejects_unknown_business_parameters() {
+    let mut state = test_state().await;
+    let mut config: crate::config::Config = toml::from_str(
+        r#"
+        [[auth.policy]]
+        user = 'test'
+        effect = 'allow'
+        actions = ['ImportObject', 'GetImportStatus']
+        "#,
+    )
+    .unwrap();
+    config.auth.session_signing_key = Some("0f".repeat(32));
+    Arc::get_mut(&mut state).unwrap().credentials =
+        crate::auth::GatewayCredentials::from_config(&config).unwrap();
+    let session = state.credentials.issue_session("test", 300).unwrap();
+    let (endpoint, server) =
+        signed_import_server(state, coordinator(ImportConfig::default())).await;
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        http::header::CONTENT_TYPE,
+        "application/xml".parse().unwrap(),
+    );
+    let submitted = sigv4::send_sigv4(
+        Method::POST,
+        &endpoint,
+        "bucket",
+        "key",
+        &[("ipfs3-import", "")],
+        cid_xml().into_bytes(),
+        headers,
+        "test",
+    )
+    .await;
+    assert_eq!(submitted.status(), StatusCode::ACCEPTED);
+    let id = submitted.headers()["x-ipfs3-import-job-id"]
+        .to_str()
+        .unwrap();
+    for (query, expected) in [
+        (vec![("ipfs3-import", id)], StatusCode::OK),
+        (
+            vec![("ipfs3-import", id), ("X-Amz-Unrecognized", "true")],
+            StatusCode::BAD_REQUEST,
+        ),
+    ] {
+        let url = sigv4::presign_sigv4_query(
+            &Method::GET,
+            &endpoint,
+            "bucket",
+            "key",
+            &query,
+            &session.access_key_id,
+            &session.secret_access_key,
+            Some(&session.session_token),
+            60,
+            chrono::Utc::now(),
+        );
+        let poll = reqwest::get(url).await.unwrap();
+        let status = poll.status();
+        assert_eq!(status, expected, "{}", poll.text().await.unwrap());
+    }
+    server.abort();
 }
 
 async fn assert_prepared_zip_is_unpublished(
@@ -1073,7 +1258,8 @@ async fn signed_zip_root_is_visible_only_after_restarted_worker_commits_receipt_
             kubo: crate::kubo::KuboClient::new(kubo.uri()),
             cold_kubo: None,
             store: Store::new(db),
-            credentials: HashMap::from([("test".into(), s3s::auth::SecretKey::from("test"))]),
+            credentials: HashMap::from([("test".into(), s3s::auth::SecretKey::from("test"))])
+                .into(),
             master_key: crate::crypto::key::MasterKey::from_hex(&"0".repeat(64)).unwrap(),
             pinning: crate::pinning::coordinator::PinningCoordinator::disabled_for_test(),
         })
@@ -1430,7 +1616,7 @@ async fn signed_zip_config_off_persists_disabled_and_never_builds_a_root() {
         kubo: crate::kubo::KuboClient::new(kubo.uri()),
         cold_kubo: None,
         store: Store::new(db),
-        credentials: HashMap::from([("test".into(), s3s::auth::SecretKey::from("test"))]),
+        credentials: HashMap::from([("test".into(), s3s::auth::SecretKey::from("test"))]).into(),
         master_key: crate::crypto::key::MasterKey::from_hex(&"0".repeat(64)).unwrap(),
         pinning: crate::pinning::coordinator::PinningCoordinator::disabled_for_test(),
     });
@@ -1609,7 +1795,8 @@ async fn signed_zip_worker_reports_failed_partial_and_zero_file_roots_without_lo
             kubo: crate::kubo::KuboClient::new(kubo.uri()),
             cold_kubo: None,
             store: Store::new(db),
-            credentials: HashMap::from([("test".into(), s3s::auth::SecretKey::from("test"))]),
+            credentials: HashMap::from([("test".into(), s3s::auth::SecretKey::from("test"))])
+                .into(),
             master_key: crate::crypto::key::MasterKey::from_hex(&"0".repeat(64)).unwrap(),
             pinning: crate::pinning::coordinator::PinningCoordinator::disabled_for_test(),
         });
@@ -1773,7 +1960,7 @@ async fn signed_zip_stale_worker_cannot_build_or_publish_after_target_supersessi
         kubo: crate::kubo::KuboClient::new(kubo.uri()),
         cold_kubo: None,
         store: Store::new(db),
-        credentials: HashMap::from([("test".into(), s3s::auth::SecretKey::from("test"))]),
+        credentials: HashMap::from([("test".into(), s3s::auth::SecretKey::from("test"))]).into(),
         master_key: crate::crypto::key::MasterKey::from_hex(&"0".repeat(64)).unwrap(),
         pinning: crate::pinning::coordinator::PinningCoordinator::disabled_for_test(),
     });

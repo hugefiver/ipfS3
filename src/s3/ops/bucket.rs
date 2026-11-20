@@ -15,10 +15,7 @@ pub async fn create_bucket(
     let bucket = &req.input.bucket;
     let db = state.store.db();
 
-    let owner = req
-        .credentials
-        .as_ref()
-        .map(|credentials| credentials.access_key.as_str());
+    let owner = crate::access::subject(state, &req)?;
     crate::store::bucket::create(db, bucket, owner).await?;
 
     Ok(S3Response::new(CreateBucketOutput::default()))
@@ -96,7 +93,6 @@ pub async fn list_buckets(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
 
     use sea_orm::Database;
 
@@ -112,7 +108,7 @@ mod tests {
             kubo: crate::kubo::KuboClient::new("http://127.0.0.1:5001".to_owned()),
             cold_kubo: None,
             store: crate::store::Store::new(db),
-            credentials: HashMap::new(),
+            credentials: Default::default(),
             master_key: crate::crypto::key::MasterKey::from_hex(
                 "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
             )

@@ -12,7 +12,10 @@ use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
+    access,
     error::AppError,
+    iam::Action,
+    pinning::tags::ObjectTag,
     state::AppState,
     store::{
         self,
@@ -357,13 +360,29 @@ pub(super) async fn complete(
     }) {
         return Err(conflict());
     }
-    if req.headers.contains_key("x-amz-tagging") {
-        let mut tags = super::parse_publication_tags(&req.headers)?;
-        tags.sort_by(|left, right| left.key.cmp(&right.key));
+    let scope = access::scope(state, &req, Some(&intake.bucket))?;
+    if req.headers.contains_key("x-amz-tagging") || !scope.is_unrestricted() {
         let contract: serde_json::Value =
             serde_json::from_str(&admitted.request_contract).map_err(|_| conflict())?;
-        if contract.get("tags") != Some(&serde_json::json!(tags)) {
-            return Err(conflict());
+        if req.headers.contains_key("x-amz-tagging") {
+            let mut tags = super::parse_publication_tags(&req.headers)?;
+            tags.sort_by(|left, right| left.key.cmp(&right.key));
+            if contract.get("tags") != Some(&serde_json::json!(tags)) {
+                return Err(conflict());
+            }
+        }
+        if !scope.is_unrestricted() {
+            let tags: Vec<ObjectTag> =
+                serde_json::from_value(contract.get("tags").cloned().ok_or_else(conflict)?)
+                    .map_err(|_| conflict())?;
+            super::super::authorize_zip(
+                &scope,
+                Action::CompleteMultipartUpload,
+                &intake.archive_key,
+                Some(&intake.target_prefix),
+                Some(&options),
+                Some(&tags),
+            )?;
         }
     }
     if super::has_sse_header(&req.headers) {

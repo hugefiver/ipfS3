@@ -63,7 +63,7 @@ fn parse_path_bucket_key(uri: &Uri) -> S3Result<(String, String)> {
 
 pub(super) fn parse_submit_query(uri: &Uri) -> S3Result<ParsedSubmitQuery> {
     let (bucket, key) = parse_path_bucket_key(uri)?;
-    let query = crate::s3::query::decoded_query_pairs(uri)?;
+    let query = crate::s3::query::authenticated_business_query_pairs(uri)?;
     let mut import_value = None;
     for (name, value) in &query {
         match name.as_str() {
@@ -87,7 +87,7 @@ pub(super) fn parse_status_query(uri: &Uri) -> S3Result<ParsedStatusQuery> {
     let mut job_id = None;
     let mut max_results = None;
     let mut continuation_token = None;
-    for (name, value) in crate::s3::query::decoded_query_pairs(uri)? {
+    for (name, value) in crate::s3::query::authenticated_business_query_pairs(uri)? {
         match name.as_str() {
             "ipfs3-import" if job_id.is_none() => job_id = Some(value),
             "max-results" if max_results.is_none() => max_results = Some(value),

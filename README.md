@@ -9,12 +9,14 @@ An S3-compatible gateway backed by IPFS (Kubo). Translates S3 API calls into Kub
 
 - **S3 API:** Bucket and object CRUD, batch delete, ListObjects v1/v2, multipart uploads, object versioning, per-version tagging and path-style bucket CORS. [s3s](https://github.com/s3s-project/s3s) verifies SigV4 with configured access keys, including presigned GET and PUT.
 - **Lifecycle:** Expiration, incomplete multipart abort, and current/noncurrent `STANDARD` to `STANDARD_IA` transitions to an optional independent cold Kubo. CORS and lifecycle configurations honor `ExpectedBucketOwner` when supplied.
-- **Storage and encryption:** Kubo stores content and the object ETag is its CID. The gateway streams plaintext and AES-256-GCM (SSE-S3 and SSE-C) objects. An encrypted Range streams the selected bytes with bounded plaintext buffering and still reads and authenticates the full ciphertext.
+- **Storage and encryption:** Kubo stores content and the object ETag is its CID. The gateway streams plaintext and AES-256-GCM (SSE-S3 and SSE-C) objects. An encrypted Range fetches the complete ciphertext frames covering the requested bytes, authenticates them, and streams the selected plaintext. On first access, a legacy SSE-C object without a stored key fingerprint still requires full authentication.
 - **Remote backups:** Asynchronous Pinata, Filebase, independent Kubo RPC and IPFS Cluster pinning, with expiring file references, shared resources and provider acknowledgment status.
 - **Import and ZIP:** Signed CID or allowlisted HTTPS imports have durable job status and fenced publication. ZIP extraction supports direct PUT, multipart completion and import, with durable batch results and optional UnixFS directory roots.
 - **Metadata and deployment:** SQLite or PostgreSQL via SeaORM. The two-gateway profile shares PostgreSQL and Kubo; the same-host Cluster profile adds private-swarm pinset replication. See [database initialization and upgrades](docs/database-storage.md).
 
-The gateway uses static credentials. IAM, STS and per-bucket policy authorization are planned; `ExpectedBucketOwner` only compares a supplied value with the bucket owner. Pin-provider dispatch limits do not limit S3 requests. See the [roadmap](ROADMAP.md) for planned request controls, ciphertext chunk fetching and other S3 extensions.
+Static credentials work without additional configuration. Use [local user and bucket policies](docs/local-policies.md) to restrict access and [local session credentials](docs/local-sessions.md) for temporary signed S3 access. `ExpectedBucketOwner` independently compares a supplied value with the bucket owner. Pin-provider dispatch limits do not limit S3 requests.
+
+**Prometheus:** set `IPFS_S3_METRICS_BIND=127.0.0.1:9090` (or `[metrics].bind` in TOML) and scrape `http://127.0.0.1:9090/metrics`. The optional listener serves in-process S3 and pin timings without querying Kubo or the database. It does not reserve a bucket name on the S3 port.
 
 ## Hardening boundaries
 
@@ -884,7 +886,7 @@ signed POST
 ```
 
 **AppState** holds `KuboClient` (reqwest), `Store` (sea-orm
-`DatabaseConnection`), `credentials` (`HashMap`), `master_key` (`MasterKey`),
+`DatabaseConnection`), configured credentials and policies, `master_key` (`MasterKey`),
 and `pinning` (`Arc<PinningCoordinator>`). `ImportCoordinator` is constructed separately from `AppState`, passed to `GatewayRoute`, and starts its durable worker beside the pinning worker.
 
 ## Key Design Decisions

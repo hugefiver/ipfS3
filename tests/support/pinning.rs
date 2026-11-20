@@ -137,7 +137,7 @@ pub async fn start_pinning_harness_with_database(
         kubo: ipfs_s3_gateway::kubo::KuboClient::new(kubo.uri()),
         cold_kubo: None,
         store: Store::new(db),
-        credentials: HashMap::from([("test".into(), s3s::auth::SecretKey::from("test"))]),
+        credentials: HashMap::from([("test".into(), s3s::auth::SecretKey::from("test"))]).into(),
         master_key: ipfs_s3_gateway::crypto::key::MasterKey::from_hex(&"0".repeat(64)).unwrap(),
         pinning: PinningCoordinator::build(validated).unwrap(),
     });

@@ -10,7 +10,8 @@ use s3s::{S3Request, S3Response, S3Result};
 
 use crate::crypto::EncryptionMode;
 use crate::crypto::chunker::{EncryptedRange, decrypt_chunk_stream};
-use crate::error::AppError;
+use crate::error::{AppError, AppResult};
+use crate::iam::{Action, Context, Resource, Scope};
 use crate::pinning::decision::{DecisionEffect, DecisionOrigin, ExtensionDecision, WarningCode};
 use crate::pinning::policy::{PublicationContext, PublicationPolicy};
 use crate::pinning::tags::{ObjectTag, PinControl};
@@ -408,10 +409,9 @@ fn evaluate_publication_policy(
         .map_err(s3s::S3Error::from)
 }
 
-pub(crate) fn principal_id<T>(req: &S3Request<T>) -> S3Result<String> {
-    req.credentials
-        .as_ref()
-        .map(|credentials| credentials.access_key.clone())
+pub(crate) fn principal_id<T>(state: &AppState, req: &S3Request<T>) -> S3Result<String> {
+    crate::access::subject(state, req)?
+        .map(str::to_owned)
         .ok_or_else(|| s3s::s3_error!(AccessDenied, "authenticated principal is required"))
 }
 
@@ -519,10 +519,7 @@ fn inherited_unexecuted_decision(
     Ok((policy, decision))
 }
 
-fn copy_publication_tags(
-    source_tags: Vec<ObjectTag>,
-    headers: &http::HeaderMap,
-) -> S3Result<Vec<ObjectTag>> {
+fn copy_replacement_tags(headers: &http::HeaderMap) -> S3Result<Option<Vec<ObjectTag>>> {
     let directive_header = single_control_header(
         headers,
         "x-amz-tagging-directive",
@@ -546,7 +543,7 @@ fn copy_publication_tags(
                     "x-amz-tagging must be empty when tagging directive is COPY",
                 ));
             }
-            Ok(source_tags)
+            Ok(None)
         }
         "REPLACE" => {
             let header = tagging.ok_or_else(|| {
@@ -558,6 +555,7 @@ fn copy_publication_tags(
                 .to_str()
                 .map_err(|_| invalid_pinning_argument("invalid x-amz-tagging header"))?;
             crate::pinning::tags::parse_tagging_header(value)
+                .map(Some)
                 .map_err(|_| invalid_pinning_argument("invalid x-amz-tagging header"))
         }
         _ => Err(invalid_pinning_argument("invalid tagging directive")),
@@ -741,6 +739,39 @@ where
 // Operations
 // ---------------------------------------------------------------------------
 
+fn object_access_context<'a>(
+    action: Action,
+    key: &'a str,
+    version: Option<&'a str>,
+) -> Context<'a> {
+    Context {
+        action,
+        resource: Resource::Object(key),
+        version,
+        request_tags: None,
+        existing_tags: None,
+    }
+}
+
+fn check_object_policy(
+    scope: &Scope<'_>,
+    context: &Context<'_>,
+    request_tags: Option<&[ObjectTag]>,
+    existing_tags: Option<&[ObjectTag]>,
+) -> AppResult<()> {
+    if scope.is_unrestricted() {
+        return Ok(());
+    }
+    if !scope.allows(&Context {
+        request_tags,
+        existing_tags,
+        ..*context
+    }) {
+        return Err(AppError::AccessDenied("Access Denied".to_owned()));
+    }
+    Ok(())
+}
+
 struct SelectedS3Object {
     object: object::Model,
     version_row_id: String,
@@ -752,16 +783,42 @@ struct SelectedS3Object {
 
 async fn select_s3_object(
     state: &Arc<AppState>,
+    scope: Scope<'_>,
+    action: Action,
     bucket: &str,
     key: &str,
     version_id: Option<&str>,
+    copy_source_tags: bool,
 ) -> S3Result<SelectedS3Object> {
+    let context = object_access_context(action, key, version_id);
+    let needs_existing_tags = scope.needs_existing_tags(&context);
+    if !needs_existing_tags {
+        check_object_policy(&scope, &context, None, None)?;
+    }
     let selector = match version_id {
         Some(version_id) => VersionSelector::Exact(PublicVersionId::parse_s3(version_id)?),
         None => VersionSelector::Current,
     };
-    let db = state.store.db();
-    let snapshot = crate::store::object_version::read_snapshot(db, bucket, key, &selector).await?;
+    let snapshot = crate::store::object_version::read_snapshot_projected(
+        state.store.db(),
+        bucket,
+        key,
+        &selector,
+        copy_source_tags || needs_existing_tags,
+    )
+    .await;
+    if needs_existing_tags {
+        match &snapshot {
+            Ok(snapshot) => check_object_policy(&scope, &context, None, Some(&snapshot.tags))?,
+            Err(
+                AppError::NoSuchBucket(_) | AppError::NoSuchKey(_) | AppError::NoSuchVersion { .. },
+            ) => {
+                check_object_policy(&scope, &context, None, Some(&[]))?;
+            }
+            Err(_) => {}
+        }
+    }
+    let snapshot = snapshot?;
     let resolved = snapshot.version;
     match resolved.kind {
         VersionKind::DeleteMarker => Err(AppError::DeleteMarker {
@@ -817,8 +874,14 @@ pub async fn put_object(
     let key = &req.input.key;
     let content_type = req.input.content_type.clone();
     let db = state.store.db();
-    let principal = principal_id(&req)?;
+    let principal = principal_id(state, &req)?;
     let tags = parse_publication_tags(&req.headers)?;
+    check_object_policy(
+        &state.credentials.policies.scope(&principal, Some(bucket)),
+        &object_access_context(Action::PutObject, key, None),
+        Some(&tags),
+        None,
+    )?;
     crate::zip::options::parse_authenticated_zip_controls(
         &req.headers,
         &crate::s3::query::decoded_query_pairs(&req.uri)?,
@@ -990,7 +1053,16 @@ pub async fn get_object(
 ) -> S3Result<S3Response<GetObjectOutput>> {
     let bucket = &req.input.bucket;
     let key = &req.input.key;
-    let selected = select_s3_object(state, bucket, key, req.input.version_id.as_deref()).await?;
+    let selected = select_s3_object(
+        state,
+        crate::access::scope(state, &req, Some(bucket))?,
+        Action::GetObject,
+        bucket,
+        key,
+        req.input.version_id.as_deref(),
+        false,
+    )
+    .await?;
     let obj = selected.object;
     let version_id = selected.public_version_id;
     let storage_class = StorageClass::from_static(selected.residency.storage_class.as_db_str());
@@ -1092,7 +1164,16 @@ pub async fn head_object(
 ) -> S3Result<S3Response<HeadObjectOutput>> {
     let bucket = &req.input.bucket;
     let key = &req.input.key;
-    let selected = select_s3_object(state, bucket, key, req.input.version_id.as_deref()).await?;
+    let selected = select_s3_object(
+        state,
+        crate::access::scope(state, &req, Some(bucket))?,
+        Action::HeadObject,
+        bucket,
+        key,
+        req.input.version_id.as_deref(),
+        false,
+    )
+    .await?;
     let obj = selected.object;
     let version_id = selected.public_version_id;
     let storage_class = StorageClass::from_static(selected.residency.storage_class.as_db_str());
@@ -1135,61 +1216,54 @@ pub async fn head_object(
     }))
 }
 
+async fn delete_object_item(
+    state: &AppState,
+    principal: &str,
+    bucket: &str,
+    key: &str,
+    version_id: Option<&str>,
+) -> AppResult<crate::store::object_version::DeleteVersionResult> {
+    let selector = match version_id {
+        Some(version_id) => VersionSelector::Exact(PublicVersionId::parse_s3(version_id)?),
+        None => VersionSelector::Current,
+    };
+    let scope = state.credentials.policies.scope(principal, Some(bucket));
+    let context = object_access_context(Action::DeleteObject, key, version_id);
+    crate::store::pinning::publication::delete_version_authorized(
+        state.store.db(),
+        bucket,
+        key,
+        selector,
+        scope.needs_existing_tags(&context),
+        |tags| check_object_policy(&scope, &context, None, tags),
+        chrono::Utc::now(),
+    )
+    .await
+}
+
 pub async fn delete_object(
     state: &Arc<AppState>,
     req: S3Request<DeleteObjectInput>,
 ) -> S3Result<S3Response<DeleteObjectOutput>> {
-    let bucket = &req.input.bucket;
-    let key = &req.input.key;
-    let db = state.store.db();
-    let selector = match req.input.version_id.as_deref() {
-        Some(version_id) => VersionSelector::Exact(PublicVersionId::parse_s3(version_id)?),
-        None => VersionSelector::Current,
-    };
-    if matches!(&selector, VersionSelector::Exact(_))
-        && crate::store::bucket::get_versioning_state(db, bucket).await?
-            == BucketVersioningState::Unversioned
-    {
-        return Err(AppError::InvalidArgument(
-            "version IDs are unavailable for an unversioned bucket".to_owned(),
-        )
-        .into());
-    }
-
-    let mutation_guard = crate::store::import::ownership::admit_content_mutation(
-        db,
-        bucket,
-        key,
-        None,
-        crate::import::SupersedeReason::DeleteObject,
-        chrono::Utc::now(),
+    let result = delete_object_item(
+        state,
+        &principal_id(state, &req)?,
+        &req.input.bucket,
+        &req.input.key,
+        req.input.version_id.as_deref(),
     )
     .await?;
-
-    crate::store::import::ownership::run_mutation(db, &mutation_guard.clone(), |lease| async move {
-        let result = lease
-            .commit(crate::store::pinning::publication::delete_version_guarded(
-                state.store.db(),
-                bucket,
-                key,
-                selector,
-                mutation_guard,
-                chrono::Utc::now(),
-            ))
-            .await?;
-
-        Ok(S3Response::new(DeleteObjectOutput {
-            delete_marker: (result.created_delete_marker || result.deleted_delete_marker)
-                .then_some(true),
-            version_id: result.version_id,
-            ..Default::default()
-        }))
-    })
-    .await
+    Ok(S3Response::new(DeleteObjectOutput {
+        delete_marker: (result.created_delete_marker || result.deleted_delete_marker)
+            .then_some(true),
+        version_id: result.version_id,
+        ..Default::default()
+    }))
 }
 
 fn delete_objects_item_error(error: &AppError) -> (String, String) {
     match error {
+        AppError::AccessDenied(_) => ("AccessDenied".to_owned(), "Access Denied".to_owned()),
         AppError::NoSuchVersion { .. } => {
             ("NoSuchVersion".to_owned(), "version not found".to_owned())
         }
@@ -1221,111 +1295,34 @@ pub async fn delete_objects(
     state: &Arc<AppState>,
     req: S3Request<DeleteObjectsInput>,
 ) -> S3Result<S3Response<DeleteObjectsOutput>> {
-    let DeleteObjectsInput { bucket, delete, .. } = req.input;
+    let DeleteObjectsInput { bucket, delete, .. } = &req.input;
     if delete.objects.len() > 1000 {
         return Err(s3s::s3_error!(
             MalformedXML,
             "DeleteObjects accepts at most 1000 object identifiers"
         ));
     }
+    let principal = principal_id(state, &req)?;
     let db = state.store.db();
 
-    if !crate::store::bucket::exists(db, &bucket).await? {
+    if !crate::store::bucket::exists(db, bucket).await? {
         return Err(s3s::s3_error!(NoSuchBucket, "bucket not found: {}", bucket));
     }
 
     let quiet = delete.quiet.unwrap_or(false);
-    let objects = delete.objects;
     let mut deleted = Vec::new();
     let mut errors = Vec::new();
 
-    for object in objects {
-        let key = object.key;
-        let incoming_version_id = object.version_id;
-        let selector = match incoming_version_id.as_deref() {
-            Some(version_id) => match PublicVersionId::parse_s3(version_id) {
-                Ok(version_id) => VersionSelector::Exact(version_id),
-                Err(error) => {
-                    let (code, message) = delete_objects_item_error(&error);
-                    errors.push(Error {
-                        code: Some(code),
-                        key: Some(key),
-                        message: Some(message),
-                        version_id: incoming_version_id,
-                    });
-                    continue;
-                }
-            },
-            None => VersionSelector::Current,
-        };
-        if matches!(&selector, VersionSelector::Exact(_)) {
-            match crate::store::bucket::get_versioning_state(db, &bucket).await {
-                Ok(BucketVersioningState::Unversioned) => {
-                    let error = AppError::InvalidArgument(
-                        "version IDs are unavailable for an unversioned bucket".to_owned(),
-                    );
-                    let (code, message) = delete_objects_item_error(&error);
-                    errors.push(Error {
-                        code: Some(code),
-                        key: Some(key),
-                        message: Some(message),
-                        version_id: incoming_version_id,
-                    });
-                    continue;
-                }
-                Ok(_) => {}
-                Err(error) => {
-                    log_delete_objects_item_failure("read_versioning", &error);
-                    let (code, message) = delete_objects_item_error(&error);
-                    errors.push(Error {
-                        code: Some(code),
-                        key: Some(key),
-                        message: Some(message),
-                        version_id: incoming_version_id,
-                    });
-                    continue;
-                }
-            }
-        }
-        let guard = match crate::store::import::ownership::admit_content_mutation(
-            db,
-            &bucket,
-            &key,
-            None,
-            crate::import::SupersedeReason::DeleteObject,
-            chrono::Utc::now(),
+    for object in &delete.objects {
+        let key = &object.key;
+        let incoming_version_id = &object.version_id;
+        match delete_object_item(
+            state,
+            &principal,
+            bucket,
+            key,
+            incoming_version_id.as_deref(),
         )
-        .await
-        {
-            Ok(guard) => guard,
-            Err(error) => {
-                log_delete_objects_item_failure("admit", &error);
-                let (code, message) = delete_objects_item_error(&error);
-                errors.push(Error {
-                    code: Some(code),
-                    key: Some(key),
-                    message: Some(message),
-                    version_id: incoming_version_id,
-                });
-                continue;
-            }
-        };
-        match crate::store::import::ownership::run_mutation(db, &guard.clone(), |lease| {
-            let bucket = &bucket;
-            let key = &key;
-            async move {
-                lease
-                    .commit(crate::store::pinning::publication::delete_version_guarded(
-                        state.store.db(),
-                        bucket,
-                        key,
-                        selector,
-                        guard,
-                        chrono::Utc::now(),
-                    ))
-                    .await
-            }
-        })
         .await
         {
             Ok(result) if !quiet => {
@@ -1338,7 +1335,7 @@ pub async fn delete_objects(
                     None
                 };
                 deleted.push(DeletedObject {
-                    key: Some(key),
+                    key: Some(key.clone()),
                     version_id: exact_version_id,
                     delete_marker: (result.created_delete_marker || result.deleted_delete_marker)
                         .then_some(true),
@@ -1347,13 +1344,18 @@ pub async fn delete_objects(
             }
             Ok(_) => {}
             Err(error) => {
-                log_delete_objects_item_failure("delete", &error);
+                if !matches!(
+                    error,
+                    AppError::AccessDenied(_) | AppError::InvalidArgument(_)
+                ) {
+                    log_delete_objects_item_failure("delete", &error);
+                }
                 let (code, message) = delete_objects_item_error(&error);
                 errors.push(Error {
                     code: Some(code),
-                    key: Some(key),
+                    key: Some(key.clone()),
                     message: Some(message),
-                    version_id: incoming_version_id,
+                    version_id: incoming_version_id.clone(),
                 });
             }
         }
@@ -1374,6 +1376,17 @@ pub async fn copy_object(
     let dst_bucket = &req.input.bucket;
     let dst_key = &req.input.key;
     let db = state.store.db();
+    let principal = principal_id(state, &req)?;
+    let replacement_tags = copy_replacement_tags(&req.headers)?;
+    check_object_policy(
+        &state
+            .credentials
+            .policies
+            .scope(&principal, Some(dst_bucket)),
+        &object_access_context(Action::CopyObject, dst_key, None),
+        replacement_tags.as_deref(),
+        None,
+    )?;
 
     let (src_bucket, src_key, src_version_id) = match req.input.copy_source {
         CopySource::Bucket {
@@ -1390,24 +1403,36 @@ pub async fn copy_object(
         }
     };
 
-    let selected_source =
-        select_s3_object(state, &src_bucket, &src_key, src_version_id.as_deref()).await?;
-    let source_decision =
-        crate::store::pinning::decision::read_for_version(db, &selected_source.version_row_id)
-            .await?;
-    if let Some(decision) = &source_decision {
+    let inherit_tags = replacement_tags.is_none();
+    let selected_source = select_s3_object(
+        state,
+        state
+            .credentials
+            .policies
+            .scope(&principal, Some(&src_bucket)),
+        Action::GetObject,
+        &src_bucket,
+        &src_key,
+        src_version_id.as_deref(),
+        inherit_tags,
+    )
+    .await?;
+    let source_decision = if inherit_tags {
+        let decision =
+            crate::store::pinning::decision::read_for_version(db, &selected_source.version_row_id)
+                .await?;
+        if let Some(decision) = &decision {
+            decision
+                .replay_policy(selected_source.tags.clone())
+                .map_err(invalid_pinning_argument)?;
+        }
         decision
-            .replay_policy(selected_source.tags.clone())
-            .map_err(invalid_pinning_argument)?;
-    }
+    } else {
+        None
+    };
     let src_obj = selected_source.object;
     let copy_source_version_id = selected_source.public_version_id;
-    let tags = copy_publication_tags(selected_source.tags, &req.headers)?;
-    let principal = principal_id(&req)?;
-    let inherit_tags = req
-        .headers
-        .get("x-amz-tagging-directive")
-        .is_none_or(|value| value == "COPY");
+    let tags = replacement_tags.unwrap_or(selected_source.tags);
     // Absent source decisions are unknown: validate raw controls but do not
     // interpret them as fresh manual requests under the destination policy.
     let legacy_control = if inherit_tags && source_decision.is_none() {
@@ -2037,6 +2062,7 @@ mod tests {
         TransactionTrait,
     };
 
+    mod access_policy_tests;
     mod copy_hot_receipt_tests;
     mod encrypted_range_cost_tests;
     mod metadata_listing_tests;
@@ -2052,7 +2078,7 @@ mod tests {
             kubo: crate::kubo::KuboClient::new(kubo_uri),
             cold_kubo: None,
             store: crate::store::Store::new(db),
-            credentials: HashMap::new(),
+            credentials: Default::default(),
             master_key: crate::crypto::key::MasterKey::from_hex(
                 "0000000000000000000000000000000000000000000000000000000000000000",
             )
@@ -2143,7 +2169,7 @@ mod tests {
             kubo: crate::kubo::KuboClient::new(kubo_uri.clone()),
             cold_kubo: cold_kubo_uri.map(crate::kubo::KuboClient::new),
             store,
-            credentials: HashMap::new(),
+            credentials: Default::default(),
             master_key: crate::crypto::key::MasterKey::from_hex(
                 "0000000000000000000000000000000000000000000000000000000000000000",
             )
@@ -4103,7 +4129,7 @@ mod tests {
             kubo,
             cold_kubo: None,
             store,
-            credentials,
+            credentials: credentials.into(),
             master_key,
             pinning: crate::pinning::coordinator::PinningCoordinator::disabled_for_test(),
         })
@@ -4174,7 +4200,10 @@ mod tests {
             uri: http::Uri::from_static("/bucket?delete"),
             headers: http::HeaderMap::new(),
             extensions: http::Extensions::new(),
-            credentials: None,
+            credentials: Some(s3s::auth::Credentials {
+                access_key: "test-owner".into(),
+                secret_key: s3s::auth::SecretKey::from("test"),
+            }),
             region: None,
             service: None,
             trailing_headers: None,

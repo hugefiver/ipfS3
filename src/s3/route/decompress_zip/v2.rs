@@ -14,7 +14,9 @@ use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
+    access,
     error::AppError,
+    iam::Action,
     state::AppState,
     store::{
         pinning::publication::{
@@ -764,7 +766,7 @@ pub(super) async fn put(
     let crate::zip::options::ZipOptions::V2(incoming_options) = &controls.options else {
         return Err(failure("ZIP v2 requires negotiated controls"));
     };
-    let principal = crate::s3::ops::object::principal_id(&req)?;
+    let principal = crate::s3::ops::object::principal_id(state, &req)?;
     let found = execution::read_by_identity(
         state.store.db(),
         &principal,
@@ -1352,14 +1354,15 @@ fn legacy_status_response(
 
 pub(super) async fn status(state: &AppState, req: S3Request<Body>) -> S3Result<S3Response<Body>> {
     let (bucket, key) = super::parse_path_bucket_key(&req.uri)?;
-    let query = crate::s3::query::decoded_query_pairs(&req.uri)?;
+    let query = crate::s3::query::authenticated_business_query_pairs(&req.uri)?;
     if query.len() != 1
         || query[0].0 != "ipfs3-zip-batch"
         || uuid::Uuid::parse_str(&query[0].1).is_err()
     {
         return Err(failure("invalid ZIP v2 batch query"));
     }
-    let principal = crate::s3::ops::object::principal_id(&req)?;
+    let principal = crate::s3::ops::object::principal_id(state, &req)?;
+    let scope = access::scope(state, &req, Some(&bucket))?;
     let id = &query[0].1;
     let found = execution::read(state.store.db(), id)
         .await
@@ -1387,6 +1390,27 @@ pub(super) async fn status(state: &AppState, req: S3Request<Body>) -> S3Result<S
         } else {
             None
         };
+        if !scope.is_unrestricted() {
+            if let Some(intake) = &v2_mpu_intake {
+                let options = intake.options().map_err(|_| conflict())?;
+                super::super::authorize_zip(
+                    &scope,
+                    Action::GetDecompressZipStatus,
+                    &key,
+                    Some(&intake.target_prefix),
+                    Some(&options),
+                    None,
+                )?;
+            } else {
+                super::super::authorize_zip_status(
+                    &scope,
+                    Action::GetDecompressZipStatus,
+                    &key,
+                    &legacy.batch.captured_options,
+                    false,
+                )?;
+            }
+        }
         let settled_zero_status = if legacy.batch.source == "mpu"
             && v2_mpu_intake.is_some()
             && legacy.batch.state == "published"
@@ -1444,6 +1468,13 @@ pub(super) async fn status(state: &AppState, req: S3Request<Body>) -> S3Result<S
             settled_zero_status.as_deref(),
         ));
     };
+    super::super::authorize_zip_status(
+        &scope,
+        Action::GetDecompressZipStatus,
+        &key,
+        &found.captured_options,
+        true,
+    )?;
     if found.state == "completed" {
         if let Some(root) = zip::snapshot(state.store.db(), id).await?
             && root.batch.state == "published"

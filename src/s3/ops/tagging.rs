@@ -1,13 +1,18 @@
+mod selection;
 pub(crate) mod status;
 
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use s3s::{S3Request, S3Response, S3Result, dto::*};
-use sea_orm::{ConnectionTrait, TransactionTrait};
+use sea_orm::{
+    AccessMode, ConnectionTrait, DatabaseBackend, DatabaseConnection, DatabaseTransaction,
+    IsolationLevel, TransactionTrait,
+};
 
 use crate::{
     error::{AppError, AppResult},
+    iam::Action,
     pinning::{
         decision::{DecisionEffect, DecisionOrigin, ExtensionDecision, WarningCode},
         policy::{ManualLeaseMutation, PublicationContext, PublicationPolicy},
@@ -24,27 +29,41 @@ use crate::{
 };
 
 const INVALID_TAG_SET: &str = "invalid object tag set";
+
+async fn begin_tag_snapshot(db: &DatabaseConnection) -> AppResult<DatabaseTransaction> {
+    if db.get_database_backend() == DatabaseBackend::Sqlite {
+        Ok(db.begin().await?)
+    } else {
+        Ok(db
+            .begin_with_config(
+                Some(IsolationLevel::RepeatableRead),
+                Some(AccessMode::ReadOnly),
+            )
+            .await?)
+    }
+}
+
 pub async fn get_object_tagging(
     state: &Arc<AppState>,
     req: S3Request<GetObjectTaggingInput>,
 ) -> S3Result<S3Response<GetObjectTaggingOutput>> {
+    let principal = super::object::principal_id(state, &req)?;
     let input = req.input;
     let selector = version_selector(input.version_id.as_deref())?;
-    let resolved = crate::store::object_version::resolve_version(
-        state.store.db(),
-        &input.bucket,
-        &input.key,
+    let txn = begin_tag_snapshot(state.store.db()).await?;
+    let (resolved, stored) = selection::authorized_tags(
+        state,
+        &txn,
+        (&input.bucket, &input.key),
+        &principal,
+        Action::GetObjectTagging,
         &selector,
+        None,
     )
     .await?;
-    let owner_id = selected_content_owner(&resolved, matches!(selector, VersionSelector::Current))?
-        .id
-        .clone();
-    let version_id = response_version_id(state.store.db(), &input.bucket, &resolved).await?;
-    let stored = tags::list_object_tags(state.store.db(), &owner_id)
-        .await
-        .map_err(AppError::from)
-        .map_err(s3s::S3Error::from)?;
+    selected_content_owner(&resolved, matches!(selector, VersionSelector::Current))?;
+    let version_id = response_version_id(&txn, &input.bucket, &resolved).await?;
+    txn.commit().await.map_err(AppError::from)?;
     let tag_set = stored
         .into_iter()
         .map(|tag| Tag {
@@ -71,7 +90,7 @@ pub(crate) async fn put_object_tagging_at(
     req: S3Request<PutObjectTaggingInput>,
     now: DateTime<Utc>,
 ) -> S3Result<S3Response<PutObjectTaggingOutput>> {
-    let principal = super::object::principal_id(&req)?;
+    let principal = super::object::principal_id(state, &req)?;
     let input = req.input;
     let selector = version_selector(input.version_id.as_deref())?;
     let replacement = dto_to_object_tags(input.tagging.tag_set).map_err(s3s::S3Error::from)?;
@@ -81,7 +100,7 @@ pub(crate) async fn put_object_tagging_at(
         input.bucket,
         input.key,
         selector,
-        replacement,
+        Some(replacement),
         principal,
         now,
     )
@@ -105,17 +124,15 @@ pub(crate) async fn delete_object_tagging_at(
     req: S3Request<DeleteObjectTaggingInput>,
     now: DateTime<Utc>,
 ) -> S3Result<S3Response<DeleteObjectTaggingOutput>> {
-    let principal = super::object::principal_id(&req)?;
+    let principal = super::object::principal_id(state, &req)?;
     let input = req.input;
     let selector = version_selector(input.version_id.as_deref())?;
-    let replacement = Vec::new();
-    validate_replacement(&replacement).map_err(s3s::S3Error::from)?;
     let (version_id, _) = replace_tag_set(
         state,
         input.bucket,
         input.key,
         selector,
-        replacement,
+        None,
         principal,
         now,
     )
@@ -271,26 +288,38 @@ async fn replace_tag_set(
     bucket: String,
     key: String,
     selector: VersionSelector,
-    replacement: Vec<ObjectTag>,
+    replacement: Option<Vec<ObjectTag>>,
     principal: String,
     now: DateTime<Utc>,
 ) -> AppResult<(Option<String>, Option<WarningCode>)> {
     let db = state.store.db();
     let txn = db.begin().await?;
+    let action = if replacement.is_some() {
+        Action::PutObjectTagging
+    } else {
+        Action::DeleteObjectTagging
+    };
     let result: AppResult<_> = async {
-        let selected =
-            crate::store::object_version::lock_resolved_version(&txn, &bucket, &key, &selector)
-                .await?;
+        let (selected, current_tags) = selection::authorized_tags(
+            state,
+            &txn,
+            (&bucket, &key),
+            &principal,
+            action,
+            &selector,
+            replacement.as_deref(),
+        )
+        .await?;
+        let replacement = replacement.as_deref().unwrap_or_default();
         let owner =
             selected_content_owner(&selected, matches!(selector, VersionSelector::Current))?;
         let version_id = response_version_id(&txn, &bucket, &selected).await?;
         let previous = decision::read_for_version(&txn, &selected.id).await?;
-        let current_tags = tags::list_object_tags(&txn, &owner.id).await?;
         let manual = resources::manual(&txn, &owner.id, now).await?;
         let decision = capture_tag_decision(
             state,
             (&bucket, &key),
-            &replacement,
+            replacement,
             &current_tags,
             previous.as_ref(),
             manual.is_some(),
@@ -300,7 +329,7 @@ async fn replace_tag_set(
             &bucket,
             &key,
             manual.as_ref(),
-            &replacement,
+            replacement,
             now,
         ) {
             Ok(mutation) => mutation,
@@ -313,7 +342,7 @@ async fn replace_tag_set(
             Err(error) => return Err(error.into()),
         };
         resources::replace_manual(&txn, &owner.id, &mutation, now).await?;
-        tags::replace_object_tags(&txn, &owner.id, &replacement).await?;
+        tags::replace_object_tags(&txn, &owner.id, replacement).await?;
         decision::replace_for_version_in_transaction(&txn, &selected.id, &owner.id, &decision)
             .await?;
         Ok((version_id, decision.warning))

@@ -16,8 +16,8 @@ pub(super) fn saved_intent(
         && value.get("source_decision").is_none()
         && value.get("pin_plan").is_none()
     {
-        // Old terminal receipts need no new authorization. Missing intent may
-        // never authorize a pending publication; the direct adapter fences it.
+        // Terminal receipts can outlive the executable pin intent. Pending
+        // publications still require that intent.
         return Ok(None);
     }
     crate::store::pinning::publication::decode_zip_capture_json(&value.to_string())

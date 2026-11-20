@@ -120,7 +120,37 @@ async fn publication_and_renewal_use_current_provider_and_policy_limits() {
 
 #[tokio::test]
 async fn exact_file_renew_and_cancel_dont_mutate_automatic_or_current_demand() {
-    let versions = versioned_fixture().await;
+    let mut versions = versioned_fixture().await;
+    seed_tags_for_owner(
+        &versions.fixture,
+        &versions.historical_object_id,
+        &[("team", "history")],
+    )
+    .await;
+    seed_tags_for_owner(
+        &versions.fixture,
+        &versions.current_object_id,
+        &[("team", "current")],
+    )
+    .await;
+    set_access_policy(
+        &mut versions.fixture,
+        r#"
+        [[policy]]
+        effect = 'allow'
+        user = 'test-owner'
+        actions = ['GetObjectTagging', 'DeleteObjectTagging']
+        existing_tags.team = 'history'
+
+        [[policy]]
+        effect = 'allow'
+        user = 'test-owner'
+        actions = ['PutObjectTagging']
+        existing_tags.team = 'history'
+        request_tags.team = 'history'
+        request_tags.'ipfs-s3:pin' = 'true'
+        "#,
+    );
     let state = &versions.fixture.state;
     let db = state.store.db();
     let txn = db.begin().await.unwrap();
@@ -152,24 +182,66 @@ async fn exact_file_renew_and_cancel_dont_mutate_automatic_or_current_demand() {
     }
     txn.commit().await.unwrap();
     let exact = Some(versions.historical_version_id.as_str());
-    let tags = |until: &str| {
+    let tags = |until: &str, team: &str, version| {
         put_version_request(
             &[
                 ("ipfs-s3:pin", "true"),
                 ("ipfs-s3:retain-until", until),
-                ("team", "history"),
+                ("team", team),
             ],
-            exact,
+            version,
         )
     };
+    let renewal = "2026-07-22T08:00:00Z";
+    let wrong_request_tag = tags(renewal, "other", exact);
+    assert_eq!(
+        put_object_tagging_at(state, wrong_request_tag, time(3))
+            .await
+            .unwrap_err()
+            .code()
+            .as_str(),
+        "AccessDenied"
+    );
+    assert_eq!(
+        put_object_tagging_at(state, tags(renewal, "history", None), time(3))
+            .await
+            .unwrap_err()
+            .code()
+            .as_str(),
+        "AccessDenied"
+    );
+    assert_eq!(
+        delete_object_tagging_at(state, delete_request(KEY), time(3))
+            .await
+            .unwrap_err()
+            .code()
+            .as_str(),
+        "AccessDenied"
+    );
+    assert_eq!(
+        get_object_tagging(state, get_request(KEY))
+            .await
+            .unwrap_err()
+            .code()
+            .as_str(),
+        "AccessDenied"
+    );
+    assert_eq!(
+        get_object_tagging(state, get_request("missing"))
+            .await
+            .unwrap_err()
+            .code()
+            .as_str(),
+        "AccessDenied"
+    );
     for _ in 0..2 {
-        put_object_tagging_at(state, tags("2026-07-22T08:00:00Z"), time(3))
+        put_object_tagging_at(state, tags(renewal, "history", exact), time(3))
             .await
             .unwrap();
     }
     for until in ["2026-07-22T07:00:00Z", "2026-07-24T10:00:00Z"] {
         assert_eq!(
-            put_object_tagging_at(state, tags(until), time(3))
+            put_object_tagging_at(state, tags(until, "history", exact), time(3))
                 .await
                 .unwrap_err()
                 .code()

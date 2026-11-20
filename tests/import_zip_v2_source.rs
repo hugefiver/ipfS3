@@ -1,5 +1,4 @@
 use std::{
-    collections::HashMap,
     net::SocketAddr,
     sync::{
         Arc,
@@ -132,7 +131,7 @@ async fn setup(
         ),
         cold_kubo: None,
         store: Store::new(db),
-        credentials: HashMap::new(),
+        credentials: Default::default(),
         master_key: MasterKey::from_hex(&"0".repeat(64)).unwrap(),
         pinning: PinningCoordinator::disabled_for_test(),
     };

@@ -452,7 +452,7 @@ async fn source_and_entries_rollback_retries_retained_manifest_and_replays_exact
         kubo: harness.state.kubo.clone(),
         cold_kubo: None,
         store: harness.state.store.clone(),
-        credentials: HashMap::from([("test".into(), s3s::auth::SecretKey::from("test"))]),
+        credentials: HashMap::from([("test".into(), s3s::auth::SecretKey::from("test"))]).into(),
         master_key: ipfs_s3_gateway::crypto::key::MasterKey::from_hex(&"0".repeat(64)).unwrap(),
         pinning: harness.state.pinning.clone(),
     });
@@ -1064,7 +1064,7 @@ async fn current_automatic_deny_after_create_publishes_source_and_entries_withou
         kubo: harness.state.kubo.clone(),
         cold_kubo: None,
         store: harness.state.store.clone(),
-        credentials: HashMap::from([("test".into(), s3s::auth::SecretKey::from("test"))]),
+        credentials: HashMap::from([("test".into(), s3s::auth::SecretKey::from("test"))]).into(),
         master_key: ipfs_s3_gateway::crypto::key::MasterKey::from_hex(&"0".repeat(64)).unwrap(),
         pinning: changed.pinning.clone(),
     });

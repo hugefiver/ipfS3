@@ -121,7 +121,6 @@ fn verify_expected_owner(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
 
     use s3s::dto::{
         BucketLifecycleConfiguration, DeleteBucketLifecycleInput,
@@ -143,7 +142,7 @@ mod tests {
             kubo: crate::kubo::KuboClient::new("http://127.0.0.1:5001".to_owned()),
             cold_kubo: None,
             store: store::Store::new(db),
-            credentials: HashMap::new(),
+            credentials: Default::default(),
             master_key: crate::crypto::key::MasterKey::from_hex(
                 "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
             )

@@ -19,6 +19,9 @@ rpc_url = "http://127.0.0.1:5001"
 [storage]
 database_url = "sqlite:///data/ipfs-s3.db?mode=rwc"
 
+# Static credentials keep their existing access unless a user or bucket policy
+# applies. See docs/local-policies.md. For offline sessions, supply a shared
+# 32-byte hex key in IPFS_S3_SESSION_SIGNING_KEY; see docs/local-sessions.md.
 [[auth.credentials]]
 access_key = "test"
 secret_key = "test"

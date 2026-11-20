@@ -37,6 +37,10 @@ enum RunMode {
     Gateway,
     ReadyProbe,
     ConfigExplain,
+    IssueSession {
+        subject: String,
+        duration_seconds: u32,
+    },
     UpgradeDatabase,
 }
 
@@ -50,8 +54,14 @@ fn parse_run_mode(args: &[String]) -> anyhow::Result<RunMode> {
         [flag] if flag == "--ready-probe" => Ok(RunMode::ReadyProbe),
         [flag] if flag == "--config-explain" => Ok(RunMode::ConfigExplain),
         [flag] if flag == "--upgrade-database" => Ok(RunMode::UpgradeDatabase),
+        [flag, subject, seconds] if flag == "--issue-session" => Ok(RunMode::IssueSession {
+            subject: subject.clone(),
+            duration_seconds: seconds
+                .parse()
+                .map_err(|_| anyhow::anyhow!("expected duration in seconds"))?,
+        }),
         _ => anyhow::bail!(
-            "usage: ipfs-s3-gateway [--ready-probe | --config-explain | --upgrade-database]"
+            "usage: ipfs-s3-gateway [--ready-probe | --config-explain | --upgrade-database | --issue-session <access_key> <seconds>]"
         ),
     }
 }
@@ -126,6 +136,7 @@ fn gateway_app_with_root_default(
         let mut builder = S3ServiceBuilder::new(s3_impl);
         builder.set_validation(AwsNameValidation::new());
         builder.set_auth(gateway_auth);
+        builder.set_access(ipfs_s3_gateway::access::GatewayAccess(state.clone()));
         builder.set_route(s3::route::gateway::GatewayRoute::with_root_default(
             state.clone(),
             imports,
@@ -271,6 +282,18 @@ async fn main() -> anyhow::Result<()> {
     match parse_run_mode(&args)? {
         RunMode::Gateway => run_gateway().await,
         RunMode::ConfigExplain => diagnostics::config_explain(),
+        RunMode::IssueSession {
+            subject,
+            duration_seconds,
+        } => {
+            let cfg = Config::load()
+                .map_err(|_| anyhow::anyhow!("unable to load gateway configuration"))?;
+            let credentials = ipfs_s3_gateway::auth::GatewayCredentials::from_config(&cfg)
+                .map_err(|_| anyhow::anyhow!("invalid gateway identity configuration"))?;
+            let session = credentials.issue_session(&subject, duration_seconds)?;
+            println!("{}", serde_json::to_string(&session)?);
+            Ok(())
+        }
         RunMode::UpgradeDatabase => {
             let config = Config::load()?;
             let db = ipfs_s3_gateway::store::connect_database(&config.storage.database_url).await?;
@@ -290,7 +313,6 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::HashMap,
         io::{self, Write},
         sync::{Arc, Mutex},
         time::Duration,
@@ -342,7 +364,7 @@ mod tests {
             kubo: KuboClient::new("http://127.0.0.1:1".to_owned()),
             cold_kubo: None,
             store: Store::new(db),
-            credentials: HashMap::new(),
+            credentials: Default::default(),
             master_key: MasterKey::from_hex(&"0".repeat(64)).unwrap(),
             pinning: PinningCoordinator::disabled_for_test(),
         })

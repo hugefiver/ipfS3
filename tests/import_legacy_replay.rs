@@ -102,7 +102,7 @@ async fn stage2_token_replay_is_read_only_and_cannot_be_used_by_another_principa
         kubo: KuboClient::new("http://127.0.0.1:1".into()),
         cold_kubo: None,
         store: Store::new(db),
-        credentials: HashMap::new(),
+        credentials: Default::default(),
         master_key: MasterKey::from_hex(&"0".repeat(64)).unwrap(),
         pinning: PinningCoordinator::disabled_for_test(),
     });

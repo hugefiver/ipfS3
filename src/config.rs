@@ -93,9 +93,13 @@ fn default_database_url() -> String {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct AuthConfig {
     #[serde(default = "default_credentials")]
     pub credentials: Vec<Credential>,
+    #[serde(default)]
+    pub policy: Vec<crate::iam::Rule>,
+    pub session_signing_key: Option<String>,
 }
 
 fn default_credentials() -> Vec<Credential> {
@@ -403,6 +407,8 @@ fn default_storage_config() -> StorageConfig {
 fn default_auth_config() -> AuthConfig {
     AuthConfig {
         credentials: default_credentials(),
+        policy: Vec::new(),
+        session_signing_key: None,
     }
 }
 
@@ -510,6 +516,9 @@ impl Config {
                 secret_key,
             }];
         }
+        if let Some(key) = get_env("IPFS_S3_SESSION_SIGNING_KEY").filter(|v| !v.is_empty()) {
+            self.auth.session_signing_key = Some(key);
+        }
         if let Some(master_key) = get_env("IPFS_S3_MASTER_KEY").filter(|value| !value.is_empty()) {
             self.crypto.master_key = master_key;
         }
@@ -580,20 +589,6 @@ mod tests {
     }
 
     #[test]
-    fn cold_kubo_is_optional_and_env_does_not_replace_hot() {
-        let mut config: Config = toml::from_str("").unwrap();
-        assert!(config.cold_kubo.is_none());
-        let hot = config.kubo.rpc_url.clone();
-        config
-            .apply_env_overrides(|name| {
-                (name == "IPFS_S3_COLD_KUBO_RPC_URL").then(|| "http://cold:5001".to_owned())
-            })
-            .unwrap();
-        assert_eq!(config.kubo.rpc_url, hot);
-        assert_eq!(config.cold_kubo.unwrap().rpc_url, "http://cold:5001");
-    }
-
-    #[test]
     fn metrics_bind_is_optional_and_overridable() {
         assert!(Config::build_default().metrics.bind.is_none());
         let mut config: Config = toml::from_str("[metrics]\nbind = '127.0.0.1:9190'").unwrap();
@@ -611,6 +606,20 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+
+    #[test]
+    fn cold_kubo_is_optional_and_env_does_not_replace_hot() {
+        let mut config: Config = toml::from_str("").unwrap();
+        assert!(config.cold_kubo.is_none());
+        let hot = config.kubo.rpc_url.clone();
+        config
+            .apply_env_overrides(|name| {
+                (name == "IPFS_S3_COLD_KUBO_RPC_URL").then(|| "http://cold:5001".to_owned())
+            })
+            .unwrap();
+        assert_eq!(config.kubo.rpc_url, hot);
+        assert_eq!(config.cold_kubo.unwrap().rpc_url, "http://cold:5001");
     }
 
     #[test]

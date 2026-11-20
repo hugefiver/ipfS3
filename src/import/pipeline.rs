@@ -319,7 +319,7 @@ mod tests {
             kubo: crate::kubo::KuboClient::new(kubo_uri),
             cold_kubo: None,
             store: Store::new(db),
-            credentials: HashMap::new(),
+            credentials: Default::default(),
             master_key: crate::crypto::key::MasterKey::from_hex(
                 "0000000000000000000000000000000000000000000000000000000000000000",
             )
@@ -833,7 +833,7 @@ mod tests {
             kubo: crate::kubo::KuboClient::new(server.uri()),
             cold_kubo: None,
             store: Store::new(original.store.db().clone()),
-            credentials: HashMap::new(),
+            credentials: Default::default(),
             master_key: crate::crypto::key::MasterKey::from_hex(&"0".repeat(64)).unwrap(),
             pinning,
         });

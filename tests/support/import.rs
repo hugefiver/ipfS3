@@ -847,7 +847,8 @@ pub async fn start_import_harness(config: ImportHarnessConfig) -> ImportHarness 
         kubo: ipfs_s3_gateway::kubo::KuboClient::new(kubo_harness.endpoint.clone()),
         cold_kubo: None,
         store: store::Store::new(db),
-        credentials: HashMap::from([("test".to_owned(), s3s::auth::SecretKey::from("test"))]),
+        credentials: HashMap::from([("test".to_owned(), s3s::auth::SecretKey::from("test"))])
+            .into(),
         master_key: ipfs_s3_gateway::crypto::key::MasterKey::from_hex(&"0".repeat(64))
             .expect("zero test master key"),
         pinning: ipfs_s3_gateway::pinning::coordinator::PinningCoordinator::disabled_for_test(),
@@ -929,7 +930,8 @@ pub async fn start_strict_import_harness() -> StrictImportHarness {
         kubo: ipfs_s3_gateway::kubo::KuboClient::new(kubo_harness.endpoint.clone()),
         cold_kubo: None,
         store: store::Store::new(db),
-        credentials: HashMap::from([("test".to_owned(), s3s::auth::SecretKey::from("test"))]),
+        credentials: HashMap::from([("test".to_owned(), s3s::auth::SecretKey::from("test"))])
+            .into(),
         master_key: ipfs_s3_gateway::crypto::key::MasterKey::from_hex(&"0".repeat(64))
             .expect("zero test master key"),
         pinning: ipfs_s3_gateway::pinning::coordinator::PinningCoordinator::disabled_for_test(),

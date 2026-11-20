@@ -31,7 +31,8 @@ impl ProcessGateway {
             kubo: hot,
             cold_kubo: Some(cold),
             store: Store::new(db),
-            credentials: HashMap::from([("test".to_owned(), s3s::auth::SecretKey::from("test"))]),
+            credentials: HashMap::from([("test".to_owned(), s3s::auth::SecretKey::from("test"))])
+                .into(),
             master_key: ipfs_s3_gateway::crypto::MasterKey::from_hex(&"0".repeat(64))
                 .expect("process gateway test master key"),
             pinning: ipfs_s3_gateway::pinning::coordinator::PinningCoordinator::disabled_for_test(),

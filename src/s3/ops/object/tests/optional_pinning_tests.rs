@@ -146,7 +146,7 @@ async fn warn_state(uri: String) -> Arc<AppState> {
         kubo: crate::kubo::KuboClient::new(uri),
         cold_kubo: None,
         store: crate::store::Store::new(db),
-        credentials: HashMap::from([("test".into(), s3s::auth::SecretKey::from("test"))]),
+        credentials: HashMap::from([("test".into(), s3s::auth::SecretKey::from("test"))]).into(),
         master_key: crate::crypto::key::MasterKey::from_hex(&"0".repeat(64)).unwrap(),
         pinning: crate::pinning::coordinator::PinningCoordinator::build_with_kubo_and_mode(
             config,
@@ -367,7 +367,7 @@ async fn warn_disabled_provider_only_skips_manual_without_remote_work() {
         kubo: crate::kubo::KuboClient::new(kubo.uri()),
         cold_kubo: None,
         store: crate::store::Store::new(base.store.db().clone()),
-        credentials: HashMap::new(),
+        credentials: Default::default(),
         master_key: crate::crypto::key::MasterKey::from_hex(&"0".repeat(64)).unwrap(),
         pinning: crate::pinning::coordinator::PinningCoordinator::build_with_kubo_and_mode(
             validated,
@@ -401,7 +401,7 @@ async fn warn_manual_skip_never_swallows_automatic_policy_failure() {
         kubo: crate::kubo::KuboClient::new(kubo.uri()),
         cold_kubo: None,
         store: crate::store::Store::new(base.store.db().clone()),
-        credentials: HashMap::new(),
+        credentials: Default::default(),
         master_key: crate::crypto::key::MasterKey::from_hex(&"0".repeat(64)).unwrap(),
         pinning: crate::pinning::coordinator::PinningCoordinator::build_with_kubo_and_mode(
             config,
@@ -490,7 +490,7 @@ async fn copied_skipped_tags_remain_skipped_after_policy_becomes_available() {
         kubo: crate::kubo::KuboClient::new(kubo.uri()),
         cold_kubo: None,
         store: crate::store::Store::new(state.store.db().clone()),
-        credentials: HashMap::new(),
+        credentials: Default::default(),
         master_key: crate::crypto::key::MasterKey::from_hex(&"0".repeat(64)).unwrap(),
         pinning: available_policy(),
     });
@@ -574,10 +574,8 @@ async fn signed_copy_of_legacy_raw_control_preserves_tags_without_manual_work() 
 
     let kubo = kubo_server(CID).await;
     let mut state = pinning_state(kubo.uri(), "request", "one", "dest/").await;
-    Arc::get_mut(&mut state)
-        .unwrap()
-        .credentials
-        .insert("test".into(), s3s::auth::SecretKey::from("test"));
+    Arc::get_mut(&mut state).unwrap().credentials =
+        HashMap::from([("test".into(), s3s::auth::SecretKey::from("test"))]).into();
     seed_copy_source(
         &state,
         "source",

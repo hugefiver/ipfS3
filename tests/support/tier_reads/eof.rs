@@ -602,7 +602,8 @@ async fn start_eof_harness(kubo_endpoint: &str) -> (Arc<AppState>, super::S3Serv
         credentials: std::collections::HashMap::from([(
             "test".to_owned(),
             s3s::auth::SecretKey::from("test"),
-        )]),
+        )])
+        .into(),
         master_key: ipfs_s3_gateway::crypto::MasterKey::from_hex(&"0".repeat(64))
             .expect("EOF master key"),
         pinning: ipfs_s3_gateway::pinning::coordinator::PinningCoordinator::disabled_for_test(),

@@ -8,7 +8,9 @@ use s3s::{S3Request, S3Response, S3Result};
 use sea_orm::TransactionTrait;
 use sha2::{Digest, Sha256};
 
+use crate::access;
 use crate::crypto::EncryptionMode;
+use crate::iam::Action;
 use crate::lifecycle::model::MultipartUploadTargetIdentity;
 use crate::pinning::config::ProviderLimitMap;
 use crate::pinning::decision::{DecisionOrigin, ExtensionDecision};
@@ -107,6 +109,18 @@ pub async fn create_multipart_upload(
         .as_ref()
         .map(|c| c.options.clone())
         .unwrap_or(crate::zip::options::ZipOptions::Legacy);
+    let scope = access::scope(state, &req, Some(bucket))?;
+    crate::s3::route::authorize_zip(
+        &scope,
+        Action::CreateMultipartUpload,
+        key,
+        decompress_zip_target.as_deref(),
+        match &zip_options {
+            crate::zip::options::ZipOptions::Legacy => None,
+            crate::zip::options::ZipOptions::V2(options) => Some(options),
+        },
+        Some(&tags),
+    )?;
 
     // Validate the bucket exists.
     let db = state.store.db();
@@ -134,7 +148,7 @@ pub async fn create_multipart_upload(
     let metadata = extract_custom_metadata(&req.headers);
     let object_id = uuid::Uuid::new_v4().to_string();
     let upload_id = uuid::Uuid::new_v4().to_string();
-    let principal = super::object::principal_id(&req)?;
+    let principal = super::object::principal_id(state, &req)?;
     if let crate::zip::options::ZipOptions::V2(requested_options) = zip_options {
         let prefix = decompress_zip_target
             .as_deref()
@@ -871,7 +885,7 @@ pub async fn assemble_zip_v2_archive(
         &req.headers,
         req.input.if_match.is_some() || req.input.if_none_match.is_some(),
     )?;
-    let principal = super::object::principal_id(req)?;
+    let principal = super::object::principal_id(state, req)?;
     let db = state.store.db();
     let id = &req.input.upload_id;
     if intake.original_upload_id != *id
@@ -1648,8 +1662,9 @@ pub async fn complete_multipart_upload_inner(
         &req.headers,
         req.input.if_match.is_some() || req.input.if_none_match.is_some(),
     )?;
-    let completion_attempt_id = uuid::Uuid::new_v4().to_string();
     let bucket = &req.input.bucket;
+    let scope = access::scope(state, &req, Some(bucket))?;
+    let completion_attempt_id = uuid::Uuid::new_v4().to_string();
     let key = &req.input.key;
     let upload_id = &req.input.upload_id;
     let db = state.store.db();
@@ -1748,6 +1763,14 @@ pub async fn complete_multipart_upload_inner(
 
     let tags = crate::store::pinning::tags::tags_from_json(&upload.tags_json)
         .map_err(|_| s3s::s3_error!(InternalError, "invalid persisted multipart upload tags"))?;
+    crate::s3::route::authorize_zip(
+        &scope,
+        Action::CompleteMultipartUpload,
+        key,
+        decompress_zip_target.as_deref(),
+        None,
+        Some(&tags),
+    )?;
     let zip_intent = if let Some(prefix) = decompress_zip_target.as_deref() {
         let json = match upload.zip_intent_json.as_deref() {
             Some(json) => json.to_owned(),
@@ -1764,7 +1787,7 @@ pub async fn complete_multipart_upload_inner(
             || intent.source_key() != key
             || intent.target_prefix() != prefix
             || intent.origin().request_id != *upload_id
-            || intent.origin().principal_id != super::object::principal_id(&req)?
+            || intent.origin().principal_id != super::object::principal_id(state, &req)?
             || intent.controls().result_enabled != upload.decompress_zip_result
         {
             return Err(s3s::s3_error!(
@@ -1950,7 +1973,7 @@ pub async fn complete_multipart_upload_inner(
     };
 
     if let Some(intent) = &zip_intent {
-        let principal = super::object::principal_id(&req)?;
+        let principal = super::object::principal_id(state, &req)?;
         let verification = async {
             let batch = crate::store::zip::read(db, upload_id)
                 .await?
@@ -2509,7 +2532,7 @@ mod tests {
             kubo: crate::kubo::KuboClient::new(kubo_uri),
             cold_kubo: None,
             store: crate::store::Store::new(db),
-            credentials: HashMap::new(),
+            credentials: Default::default(),
             master_key: crate::crypto::key::MasterKey::from_hex(
                 "0000000000000000000000000000000000000000000000000000000000000000",
             )
@@ -2590,7 +2613,7 @@ mod tests {
             kubo: crate::kubo::KuboClient::new(kubo_uri),
             cold_kubo: None,
             store,
-            credentials: HashMap::new(),
+            credentials: Default::default(),
             master_key: crate::crypto::key::MasterKey::from_hex(
                 "0000000000000000000000000000000000000000000000000000000000000000",
             )
@@ -2686,7 +2709,7 @@ mod tests {
             kubo: crate::kubo::KuboClient::new(kubo_uri),
             cold_kubo: None,
             store: crate::store::Store::new(db),
-            credentials: HashMap::new(),
+            credentials: Default::default(),
             master_key: crate::crypto::key::MasterKey::from_hex(
                 "0000000000000000000000000000000000000000000000000000000000000000",
             )
@@ -3931,7 +3954,7 @@ mod tests {
         first_request.credentials =
             multipart_create_request("test-bucket", "archive.zip").credentials;
         assert_eq!(
-            crate::s3::ops::object::principal_id(&first_request).unwrap(),
+            crate::s3::ops::object::principal_id(&state, &first_request).unwrap(),
             intent.origin().principal_id
         );
         let mut second_request = complete_request("upload-1", "QmPart");
@@ -4032,7 +4055,7 @@ mod tests {
             kubo: crate::kubo::KuboClient::new(kubo.uri()),
             cold_kubo: None,
             store: crate::store::Store::new(db),
-            credentials: HashMap::new(),
+            credentials: Default::default(),
             master_key,
             pinning: crate::pinning::coordinator::PinningCoordinator::disabled_for_test(),
         });
@@ -5074,7 +5097,7 @@ mod tests {
                 complete.credentials =
                     multipart_create_request("test-bucket", "archive.zip").credentials;
                 assert_eq!(
-                    crate::s3::ops::object::principal_id(&complete).unwrap(),
+                    crate::s3::ops::object::principal_id(&state, &complete).unwrap(),
                     decision.origin.principal_id
                 );
             }
@@ -5244,7 +5267,7 @@ mod tests {
                 complete.credentials =
                     multipart_create_request("test-bucket", "archive.zip").credentials;
                 assert_eq!(
-                    crate::s3::ops::object::principal_id(&complete).unwrap(),
+                    crate::s3::ops::object::principal_id(&state, &complete).unwrap(),
                     decision.origin.principal_id
                 );
             }

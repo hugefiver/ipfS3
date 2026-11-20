@@ -202,7 +202,8 @@ async fn start_harness() -> TierReadHarness {
         kubo: ipfs_s3_gateway::kubo::KuboClient::new(hot.uri()),
         cold_kubo: Some(ipfs_s3_gateway::kubo::KuboClient::new(cold.uri())),
         store: Store::new(db),
-        credentials: HashMap::from([("test".to_owned(), s3s::auth::SecretKey::from("test"))]),
+        credentials: HashMap::from([("test".to_owned(), s3s::auth::SecretKey::from("test"))])
+            .into(),
         master_key: ipfs_s3_gateway::crypto::key::MasterKey::from_hex(&"0".repeat(64))
             .expect("tier-read master key"),
         pinning: ipfs_s3_gateway::pinning::coordinator::PinningCoordinator::disabled_for_test(),

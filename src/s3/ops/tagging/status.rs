@@ -1,8 +1,9 @@
 use crate::{
     error::{AppError, AppResult},
+    iam::Action,
     s3::{ops::object::principal_id, query},
     state::AppState,
-    store::object_version::{VersionSelector, resolve_version},
+    store::object_version::VersionSelector,
 };
 use chrono::{DateTime, Utc};
 use http::{HeaderMap, HeaderValue, Method, Uri, header::CONTENT_TYPE};
@@ -15,7 +16,7 @@ pub(crate) fn matches(uri: &Uri) -> bool {
 }
 
 pub(crate) async fn get(state: &AppState, req: S3Request<Body>) -> S3Result<S3Response<Body>> {
-    principal_id(&req)?;
+    let principal = principal_id(state, &req)?;
     if req.method != Method::GET {
         return Err(s3s::s3_error!(MethodNotAllowed));
     }
@@ -37,7 +38,7 @@ pub(crate) async fn get(state: &AppState, req: S3Request<Body>) -> S3Result<S3Re
     let key = decode(key)?;
     let mut version = None;
     let mut status = false;
-    for (name, value) in query::decoded_query_pairs(&req.uri)? {
+    for (name, value) in query::authenticated_business_query_pairs(&req.uri)? {
         match name.as_str() {
             "ipfs3-pin-status" if !status && value.is_empty() => status = true,
             "versionId" if version.is_none() => version = Some(value),
@@ -45,14 +46,24 @@ pub(crate) async fn get(state: &AppState, req: S3Request<Body>) -> S3Result<S3Re
         }
     }
     let selector = super::version_selector(version.as_deref())?;
-    let db = state.store.db();
-    let selected = resolve_version(db, &bucket, &key, &selector).await?;
+    let txn = super::begin_tag_snapshot(state.store.db()).await?;
+    let (selected, _) = super::selection::authorized_tags(
+        state,
+        &txn,
+        (&bucket, &key),
+        &principal,
+        Action::GetPinningStatus,
+        &selector,
+        None,
+    )
+    .await?;
     let owner =
         super::selected_content_owner(&selected, matches!(selector, VersionSelector::Current))?;
-    let references = file_references(db, &owner.id, Utc::now()).await?;
+    let references = file_references(&txn, &owner.id, Utc::now()).await?;
+    let version_id = super::response_version_id(&txn, &bucket, &selected).await?;
+    txn.commit().await.map_err(AppError::from)?;
     let mut headers = HeaderMap::new();
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-    let version_id = super::response_version_id(db, &bucket, &selected).await?;
     if let Some(version) = version_id.as_ref() {
         headers.insert(
             "x-amz-version-id",

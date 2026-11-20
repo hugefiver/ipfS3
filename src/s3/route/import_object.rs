@@ -15,7 +15,9 @@ use self::request::{
     validate_submission_content_type, validate_v2_import_headers,
 };
 use crate::{
+    access,
     error::AppError,
+    iam::Action,
     import::{
         ImportSource,
         pipeline::ImportCoordinator,
@@ -112,13 +114,26 @@ impl ImportObjectRoute {
             }
         }
 
+        let scope = access::scope(&self.state, &req, Some(&parsed_query.bucket))?;
+        super::authorize_zip(
+            &scope,
+            Action::ImportObject,
+            &parsed_query.key,
+            decompress_prefix,
+            match &zip_options {
+                ZipOptions::Legacy => None,
+                ZipOptions::V2(options) => Some(options),
+            },
+            Some(&tags),
+        )?;
+
         let body = collect_import_xml(&mut req.input).await?;
         let parsed_source = parse_import_xml(&body)?;
         let source = match parsed_source {
             ParsedImportSource::Cid(cid) => ImportSource::Cid(cid),
             ParsedImportSource::Url(url) => ImportSource::Url(url),
         };
-        let principal = crate::s3::ops::object::principal_id(&req)?;
+        let principal = crate::s3::ops::object::principal_id(&self.state, &req)?;
         if let ZipOptions::V2(mut options) = zip_options {
             let prefix = decompress_prefix.expect("v2 prefix validated");
             let saved = execution::read_by_identity(
@@ -463,7 +478,8 @@ impl ImportObjectRoute {
 
     async fn status(&self, req: S3Request<Body>) -> S3Result<S3Response<Body>> {
         let parsed = parse_status_query(&req.uri)?;
-        let principal = crate::s3::ops::object::principal_id(&req)?;
+        let principal = crate::s3::ops::object::principal_id(&self.state, &req)?;
+        let scope = access::scope(&self.state, &req, Some(&parsed.bucket))?;
         if let Some(status) = import_intake::read_for_path(
             self.state.store.db(),
             &parsed.job_id,
@@ -473,6 +489,24 @@ impl ImportObjectRoute {
         )
         .await?
         {
+            if !scope.is_unrestricted() {
+                let capture = execution::read(self.state.store.db(), &parsed.job_id)
+                    .await?
+                    .filter(|row| {
+                        row.source == "import"
+                            && row.owner == principal
+                            && row.bucket == parsed.bucket
+                            && row.source_key == parsed.key
+                    })
+                    .ok_or(AppError::NoSuchImportJob)?;
+                super::authorize_zip_status(
+                    &scope,
+                    Action::GetImportStatus,
+                    &parsed.key,
+                    &capture.captured_options,
+                    true,
+                )?;
+            }
             if parsed.continuation_sequence.is_some() {
                 return Err(AppError::InvalidImportRequest.into());
             }
@@ -486,6 +520,14 @@ impl ImportObjectRoute {
         )
         .await?
         .ok_or(AppError::NoSuchImportJob)?;
+        super::authorize_zip(
+            &scope,
+            Action::GetImportStatus,
+            &parsed.key,
+            job.decompress_prefix.as_deref(),
+            None,
+            None,
+        )?;
 
         let result_page = if job.state == "completed" && job.decompress_prefix.is_some() {
             Some(
@@ -696,8 +738,9 @@ impl S3Route for ImportObjectRoute {
         is_import_request(method, uri)
     }
 
-    async fn call(&self, mut req: S3Request<Body>) -> S3Result<S3Response<Body>> {
-        self.check_access(&mut req).await?;
+    async fn call(&self, req: S3Request<Body>) -> S3Result<S3Response<Body>> {
+        access::subject(&self.state, &req)?
+            .ok_or_else(|| s3s::s3_error!(AccessDenied, "Signature is required"))?;
         self.call_authenticated(req).await
     }
 }
@@ -720,7 +763,6 @@ mod durable_admission_tests {
         entities::{import_job, standard_mutation_lease},
     };
     use sea_orm::{Database, EntityTrait, PaginatorTrait};
-    use std::collections::HashMap;
 
     #[tokio::test]
     async fn legacy_remote_intent_fails_before_import_job_guard_or_kubo() {
@@ -772,7 +814,7 @@ mod durable_admission_tests {
             kubo: crate::kubo::KuboClient::new(kubo.uri()),
             cold_kubo: None,
             store: Store::new(db),
-            credentials: HashMap::new(),
+            credentials: Default::default(),
             master_key: crate::crypto::key::MasterKey::from_hex(&"0".repeat(64)).unwrap(),
             pinning,
         });

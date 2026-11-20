@@ -8,6 +8,8 @@ use s3s::route::S3Route;
 use s3s::{Body, S3Request, S3Response, S3Result};
 
 use crate::{
+    access,
+    iam::Action,
     pinning::{decision::DecisionOrigin, tags::ObjectTag},
     state::AppState,
     store::pinning::publication::{
@@ -886,6 +888,18 @@ impl DecompressZipRoute {
         )?
         .ok_or_else(|| s3s::s3_error!(InternalError, "missing ZIP controls"))?;
         let (bucket, key) = parse_path_bucket_key(&req.uri)?;
+        let scope = access::scope(&self.state, &req, Some(&bucket))?;
+        super::authorize_zip(
+            &scope,
+            Action::DecompressZip,
+            &key,
+            controls.target_prefix.as_deref(),
+            match &controls.options {
+                crate::zip::options::ZipOptions::Legacy => None,
+                crate::zip::options::ZipOptions::V2(options) => Some(options),
+            },
+            Some(&tags),
+        )?;
         let parsed = ParsedDecompressPut {
             bucket,
             key,
@@ -912,7 +926,7 @@ impl DecompressZipRoute {
         }
 
         let root_enabled = controls.root.enabled();
-        let principal = crate::s3::ops::object::principal_id(&req)?;
+        let principal = crate::s3::ops::object::principal_id(&self.state, &req)?;
         let capture = |mutation_id: &str| {
             let intent = crate::pinning::zip_policy::capture_zip_intent(
                 self.state.pinning.effective_config(),
@@ -1160,11 +1174,11 @@ impl DecompressZipRoute {
 
         let body_bytes = collect_complete_xml(&mut req.input).await?;
         let parts = parse_complete_multipart_xml(&body_bytes)?;
-        let principal = crate::s3::ops::object::principal_id(&req)?;
+        let principal = crate::s3::ops::object::principal_id(&self.state, &req)?;
         let v2_intake =
             crate::store::multipart::v2_zip::read_by_upload(self.state.store.db(), &upload_id)
                 .await?;
-        if v2_intake.is_none() {
+        let legacy_capture = if v2_intake.is_none() {
             let batch = crate::store::zip::read(self.state.store.db(), &upload_id).await?;
             if let Some(batch) = batch {
                 if batch.source != "mpu"
@@ -1224,8 +1238,13 @@ impl DecompressZipRoute {
                         "ZIP multipart cannot use server-side encryption"
                     ));
                 }
+                Some((prefix.to_owned(), options))
+            } else {
+                None
             }
-        }
+        } else {
+            None
+        };
         // GatewayRoute is called only after s3s verifies SigV4. Do not require
         // an Authorization *header*: query-presigned SigV4 is authenticated too.
         if v2_intake.is_none() {
@@ -1241,6 +1260,22 @@ impl DecompressZipRoute {
             {
                 Ok(found) => {
                     if let Some(receipt) = found.completed() {
+                        let scope = access::scope(&self.state, &req, Some(&bucket))?;
+                        if !scope.is_unrestricted() {
+                            let (prefix, captured) = legacy_capture.ok_or_else(mpu_zip_conflict)?;
+                            let tags: Vec<ObjectTag> = serde_json::from_value(
+                                captured.get("tags").cloned().ok_or_else(mpu_zip_conflict)?,
+                            )
+                            .map_err(|_| mpu_zip_conflict())?;
+                            super::authorize_zip(
+                                &scope,
+                                Action::CompleteMultipartUpload,
+                                &key,
+                                Some(&prefix),
+                                None,
+                                Some(&tags),
+                            )?;
+                        }
                         let requested_result = crate::s3::query::decoded_query_pairs(&req.uri)?
                             .into_iter()
                             .find_map(|(name, value)| {
@@ -1569,8 +1604,9 @@ impl S3Route for DecompressZipRoute {
                 && !crate::s3::query::query_key_is_present(uri, "uploads"))
     }
 
-    async fn call(&self, mut req: S3Request<Body>) -> S3Result<S3Response<Body>> {
-        self.check_access(&mut req).await?;
+    async fn call(&self, req: S3Request<Body>) -> S3Result<S3Response<Body>> {
+        access::subject(&self.state, &req)?
+            .ok_or_else(|| s3s::s3_error!(AccessDenied, "Signature is required"))?;
         self.call_authenticated(req).await
     }
 }
@@ -1717,7 +1753,7 @@ mod tests {
             kubo: crate::kubo::KuboClient::new(kubo.uri()),
             cold_kubo: None,
             store,
-            credentials: HashMap::new(),
+            credentials: Default::default(),
             master_key: crate::crypto::key::MasterKey::from_hex(
                 "0000000000000000000000000000000000000000000000000000000000000000",
             )
@@ -2110,7 +2146,7 @@ mod tests {
             kubo: crate::kubo::KuboClient::new(kubo.uri()),
             cold_kubo: None,
             store: crate::store::Store::new(db),
-            credentials: HashMap::new(),
+            credentials: Default::default(),
             master_key,
             pinning: crate::pinning::coordinator::PinningCoordinator::disabled_for_test(),
         });
@@ -3278,6 +3314,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ordinary_complete_does_not_authorize_replacement_request_tags() {
+        let (_, mut state, kubo) =
+            route_with_seeded_plain_multipart(None, true, b"part".to_vec(), Vec::new()).await;
+        let config: crate::config::Config = toml::from_str(
+            r#"
+            [[auth.policy]]
+            user = 'test'
+            effect = 'allow'
+            actions = ['CompleteMultipartUpload']
+            request_tags = { team = 'storage' }
+            "#,
+        )
+        .unwrap();
+        Arc::get_mut(&mut state).unwrap().credentials =
+            crate::auth::GatewayCredentials::from_config(&config).unwrap();
+        let mut req = signed_route_request(
+            Method::POST,
+            "/bucket/archive.zip?uploadId=upload-1",
+            Body::from("<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>QmPart</ETag></Part></CompleteMultipartUpload>".to_owned()),
+        );
+        req.headers
+            .insert("x-amz-tagging", "team=storage".parse().unwrap());
+        let denied = DecompressZipRoute::new(state.clone())
+            .call(req)
+            .await
+            .unwrap_err();
+        assert_eq!(denied.code().as_str(), "AccessDenied");
+        assert!(
+            crate::store::multipart::get_upload(state.store.db(), "upload-1")
+                .await
+                .is_ok()
+        );
+        assert!(kubo.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn complete_route_returns_standard_xml_for_non_decompress_sse_upload() {
         let (route, _state, _kubo) = route_with_seeded_sse_multipart().await;
 
@@ -3374,7 +3446,8 @@ mod tests {
             },
         ]);
         let archive_size = archive_body.len() as i64;
-        let (route, state, kubo) = pinning_route_with_seeded_plain_multipart(archive_body).await;
+        let (route, mut state, kubo) =
+            pinning_route_with_seeded_plain_multipart(archive_body).await;
         let complete = || {
             signed_route_request(
             Method::POST,
@@ -3463,6 +3536,30 @@ mod tests {
         let replay = route.call(complete()).await.unwrap();
         assert_eq!(replay.headers, first_headers);
         assert_eq!(replay.output.collect().await.unwrap().to_bytes(), body);
+        drop(route);
+        let config: crate::config::Config = toml::from_str(
+            r#"
+            [[auth.policy]]
+            user = 'test'
+            effect = 'allow'
+            actions = ['CompleteMultipartUpload']
+
+            [[auth.policy]]
+            user = 'test'
+            effect = 'deny'
+            actions = ['CompleteMultipartUpload']
+            prefix = 'prefix/private/'
+            request_tags = { team = 'storage' }
+            "#,
+        )
+        .unwrap();
+        Arc::get_mut(&mut state).unwrap().credentials =
+            crate::auth::GatewayCredentials::from_config(&config).unwrap();
+        let denied = DecompressZipRoute::new(state.clone())
+            .call(complete())
+            .await
+            .unwrap_err();
+        assert_eq!(denied.code().as_str(), "AccessDenied");
         assert_eq!(kubo.received_requests().await.unwrap().len(), kubo_requests);
         assert_eq!(pin_references(&state).await, expected);
     }

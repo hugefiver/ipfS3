@@ -808,7 +808,7 @@ async fn late_kubo_cat_trailer_cannot_bind_input_or_finalize_upload_over_http() 
         kubo: ipfs_s3_gateway::kubo::KuboClient::new(kubo_url),
         cold_kubo: None,
         store: store::Store::new(db),
-        credentials: HashMap::from([("test".into(), s3s::auth::SecretKey::from("test"))]),
+        credentials: HashMap::from([("test".into(), s3s::auth::SecretKey::from("test"))]).into(),
         master_key: ipfs_s3_gateway::crypto::key::MasterKey::from_hex(&"0".repeat(64)).unwrap(),
         pinning: ipfs_s3_gateway::pinning::coordinator::PinningCoordinator::disabled_for_test(),
     });
@@ -887,7 +887,8 @@ async fn different_authenticated_owner_cannot_replay_original_upload() {
         kubo: harness.state.kubo.clone(),
         cold_kubo: None,
         store: harness.state.store.clone(),
-        credentials: HashMap::from([("other".into(), s3s::auth::SecretKey::from("other-secret"))]),
+        credentials: HashMap::from([("other".into(), s3s::auth::SecretKey::from("other-secret"))])
+            .into(),
         master_key: ipfs_s3_gateway::crypto::key::MasterKey::from_hex(&"0".repeat(64)).unwrap(),
         pinning: harness.state.pinning.clone(),
     });

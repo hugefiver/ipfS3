@@ -425,7 +425,7 @@ async fn signed_zip_batches_share_resources_and_provider_acks_leave_s3_unblocked
         kubo: ipfs_s3_gateway::kubo::KuboClient::new(kubo.server.uri()),
         cold_kubo: None,
         store,
-        credentials: HashMap::from([("test".into(), s3s::auth::SecretKey::from("test"))]),
+        credentials: HashMap::from([("test".into(), s3s::auth::SecretKey::from("test"))]).into(),
         master_key: ipfs_s3_gateway::crypto::key::MasterKey::from_hex(&"0".repeat(64)).unwrap(),
         pinning,
     });

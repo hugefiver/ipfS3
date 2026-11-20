@@ -256,7 +256,7 @@ async fn fixture_from_db_and_coordinator(
             kubo: crate::kubo::KuboClient::new("http://127.0.0.1:5001".to_owned()),
             cold_kubo: None,
             store: Store::new(db),
-            credentials: HashMap::new(),
+            credentials: Default::default(),
             master_key: crate::crypto::key::MasterKey::from_hex(
                 "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
             )
@@ -266,6 +266,18 @@ async fn fixture_from_db_and_coordinator(
         policy_id,
     }
 }
+fn set_access_policy(fixture: &mut Fixture, policy: &str) {
+    #[derive(serde::Deserialize)]
+    struct Rules {
+        policy: Vec<crate::iam::Rule>,
+    }
+    let rules: Rules = toml::from_str(policy).unwrap();
+    Arc::get_mut(&mut fixture.state)
+        .unwrap()
+        .credentials
+        .policies = crate::iam::Policies::new(&rules.policy).unwrap();
+}
+
 fn request<T>(input: T, method: http::Method) -> S3Request<T> {
     S3Request {
         input,
@@ -447,7 +459,7 @@ async fn warn_tagging_skip_is_durable_and_never_reapplied_after_provider_appears
         kubo: crate::kubo::KuboClient::new("http://127.0.0.1:5001".into()),
         cold_kubo: None,
         store: Store::new(fixture.state.store.db().clone()),
-        credentials: HashMap::new(),
+        credentials: Default::default(),
         master_key: crate::crypto::key::MasterKey::from_hex(
             "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
         )
@@ -511,7 +523,7 @@ async fn signed_copy_legacy_control_survives_ordinary_tagging_without_manual_wor
         kubo: crate::kubo::KuboClient::new(kubo.uri()),
         cold_kubo: None,
         store: Store::new(fixture.state.store.db().clone()),
-        credentials: HashMap::from([("test".into(), s3s::auth::SecretKey::from("test"))]),
+        credentials: HashMap::from([("test".into(), s3s::auth::SecretKey::from("test"))]).into(),
         master_key: crate::crypto::key::MasterKey::from_hex(&"0".repeat(64)).unwrap(),
         pinning: fixture.state.pinning.clone(),
     });
@@ -596,7 +608,7 @@ async fn signed_copy_legacy_control_survives_ordinary_tagging_without_manual_wor
         kubo: crate::kubo::KuboClient::new(kubo.uri()),
         cold_kubo: None,
         store: Store::new(state.store.db().clone()),
-        credentials: HashMap::new(),
+        credentials: Default::default(),
         master_key: crate::crypto::key::MasterKey::from_hex(&"0".repeat(64)).unwrap(),
         pinning: coordinator_fixture_with_providers(&["alpha", "beta", "gamma"]).0,
     });
@@ -636,7 +648,7 @@ async fn signed_copy_legacy_control_survives_ordinary_tagging_without_manual_wor
         kubo: crate::kubo::KuboClient::new(kubo.uri()),
         cold_kubo: None,
         store: Store::new(state.store.db().clone()),
-        credentials: HashMap::new(),
+        credentials: Default::default(),
         master_key: crate::crypto::key::MasterKey::from_hex(&"0".repeat(64)).unwrap(),
         pinning: strict,
     });

@@ -432,7 +432,6 @@ mod read_observation {
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::HashMap,
         io,
         sync::{
             Arc, Mutex,
@@ -525,7 +524,7 @@ mod tests {
             kubo: KuboClient::new("http://127.0.0.1:1".to_owned()),
             cold_kubo: None,
             store: Store::new(db),
-            credentials: HashMap::new(),
+            credentials: Default::default(),
             master_key: MasterKey::from_hex(&"0".repeat(64)).unwrap(),
             pinning: PinningCoordinator::disabled_for_test(),
         })

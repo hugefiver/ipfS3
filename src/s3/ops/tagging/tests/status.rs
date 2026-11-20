@@ -15,11 +15,43 @@ use s3s::service::S3ServiceBuilder;
 #[tokio::test]
 async fn signed_status_reports_the_selected_files_resource_acknowledgments() {
     let mut versions = versioned_fixture().await;
-    let state = &mut versions.fixture.state;
-    Arc::get_mut(state)
+    Arc::get_mut(&mut versions.fixture.state)
         .unwrap()
-        .credentials
-        .insert("test".into(), s3s::auth::SecretKey::from("test"));
+        .credentials = HashMap::from([("test".into(), s3s::auth::SecretKey::from("test"))]).into();
+    seed_tags_for_owner(
+        &versions.fixture,
+        &versions.historical_object_id,
+        &[("team", "historical")],
+    )
+    .await;
+    seed_tags_for_owner(
+        &versions.fixture,
+        &versions.current_object_id,
+        &[("team", "current")],
+    )
+    .await;
+    set_access_policy(
+        &mut versions.fixture,
+        &format!(
+            r#"
+            [[policy]]
+            effect = 'allow'
+            user = 'test'
+            actions = ['GetPinningStatus']
+            version = '{}'
+            existing_tags.team = 'historical'
+
+            [[policy]]
+            effect = 'allow'
+            user = 'test'
+            actions = ['GetPinningStatus']
+            version = '{}'
+            existing_tags.team = 'current'
+            "#,
+            versions.historical_version_id, versions.current_version_id,
+        ),
+    );
+    let state = &versions.fixture.state;
     let db = state.store.db();
     let txn = db.begin().await.unwrap();
     let now = Utc::now();
@@ -67,20 +99,25 @@ async fn signed_status_reports_the_selected_files_resource_acknowledgments() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    let get = async |version: &str| {
+    let get = async |version: Option<&str>| {
+        let mut query = vec![("ipfs3-pin-status", "")];
+        if let Some(version) = version {
+            query.push(("versionId", version));
+        }
         sigv4::send_sigv4(
             reqwest::Method::GET,
             &endpoint,
             BUCKET,
             KEY,
-            &[("ipfs3-pin-status", ""), ("versionId", version)],
+            &query,
             vec![],
             http::HeaderMap::new(),
             "test",
         )
         .await
     };
-    let response = get(&versions.historical_version_id).await;
+    assert_eq!(get(None).await.status(), reqwest::StatusCode::FORBIDDEN);
+    let response = get(Some(&versions.historical_version_id)).await;
     assert_eq!(response.status(), reqwest::StatusCode::OK);
     assert_eq!(
         response.headers()["x-amz-version-id"],
@@ -94,7 +131,7 @@ async fn signed_status_reports_the_selected_files_resource_acknowledgments() {
     assert_eq!(refs[0]["cid"], cid);
     assert!(refs[0].get("handle").is_none());
     assert_eq!(refs[1]["status"], "waiting");
-    let current: serde_json::Value = get(&versions.current_version_id)
+    let current: serde_json::Value = get(Some(&versions.current_version_id))
         .await
         .json()
         .await

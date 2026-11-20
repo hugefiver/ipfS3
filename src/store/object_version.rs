@@ -120,6 +120,16 @@ pub async fn read_snapshot(
     key: &str,
     selector: &VersionSelector,
 ) -> AppResult<ObjectReadSnapshot> {
+    read_snapshot_projected(db, bucket_name, key, selector, true).await
+}
+
+pub(crate) async fn read_snapshot_projected(
+    db: &sea_orm::DatabaseConnection,
+    bucket_name: &str,
+    key: &str,
+    selector: &VersionSelector,
+    include_tags: bool,
+) -> AppResult<ObjectReadSnapshot> {
     use sea_orm::{AccessMode, IsolationLevel, TransactionTrait};
 
     // SQLite BEGIN retains the snapshot from the first SELECT. PostgreSQL's
@@ -142,9 +152,9 @@ pub async fn read_snapshot(
         None
     };
     let versioning_state = bucket::get_versioning_state(&txn, bucket_name).await?;
-    let tags = match version.object.as_ref() {
-        Some(object) => super::pinning::tags::list_object_tags(&txn, &object.id).await?,
-        None => Vec::new(),
+    let tags = match (include_tags, version.object.as_ref()) {
+        (true, Some(object)) => super::pinning::tags::list_object_tags(&txn, &object.id).await?,
+        _ => Vec::new(),
     };
     txn.commit().await?;
     Ok(ObjectReadSnapshot {
@@ -898,9 +908,11 @@ pub async fn scan_versions<C: ConnectionTrait>(
         return Ok(Vec::new());
     }
 
-    let mut query = object_version::Entity::find()
-        .filter(object_version::Column::Bucket.eq(bucket_name))
-        .filter(object_version::Column::Key.starts_with(prefix));
+    let mut query =
+        object_version::Entity::find().filter(object_version::Column::Bucket.eq(bucket_name));
+    if !prefix.is_empty() {
+        query = query.filter(super::object::key_prefix(db.get_database_backend(), prefix));
+    }
     if let Some(cursor) = cursor {
         if is_key_boundary(cursor) {
             query = query.filter(object_version::Column::Key.gt(&cursor.key));

@@ -20,9 +20,9 @@ use crate::{
     store::{
         entities::{bucket, import_job_result, multipart_upload, object, object_version},
         import::ownership::{
-            ImportPublicationGuard, StandardMutationGuard, complete_publication_in_transaction,
-            complete_standard_mutation_in_transaction, lock_bucket_for_ownership,
-            verify_publication_guard, verify_standard_mutation_guard,
+            ImportPublicationGuard, StandardMutationGuard, admit_content_mutation_in_transaction,
+            complete_publication_in_transaction, complete_standard_mutation_in_transaction,
+            lock_bucket_for_ownership, verify_publication_guard, verify_standard_mutation_guard,
         },
         multipart::{
             AbortExactIncompleteUploadResult, CommitCompletedUploadError, ReconciledCommitOutcome,
@@ -1035,6 +1035,99 @@ async fn publication_result_for_internal_object<C: ConnectionTrait>(
     })
 }
 
+pub(crate) async fn delete_version_authorized(
+    db: &DatabaseConnection,
+    bucket: &str,
+    key: &str,
+    selector: VersionSelector,
+    needs_existing_tags: bool,
+    authorize: impl Fn(Option<&[ObjectTag]>) -> AppResult<()> + Send + Sync,
+    now: DateTime<Utc>,
+) -> AppResult<DeleteVersionResult> {
+    for retry in 0..=MAX_TRANSACTION_RETRIES {
+        let txn = db.begin().await?;
+        let result = async {
+            lock_bucket_for_ownership(&txn, bucket).await?;
+            let state = crate::store::bucket::get_versioning_state(&txn, bucket).await?;
+            let current = crate::store::object_version::lock_current_row(&txn, bucket, key).await?;
+            if needs_existing_tags {
+                // Tagging locks the same version row before writing tags. In a suspended
+                // bucket a simple delete displaces the null slot, even if it is not current.
+                let object_id = match (&selector, state) {
+                    (VersionSelector::Exact(_), BucketVersioningState::Unversioned) => None,
+                    (VersionSelector::Exact(version), _) => {
+                        locked_delete_target_object_id(&txn, bucket, key, version).await?
+                    }
+                    (VersionSelector::Current, BucketVersioningState::Suspended) => {
+                        locked_delete_target_object_id(&txn, bucket, key, &PublicVersionId::Null)
+                            .await?
+                    }
+                    (VersionSelector::Current, BucketVersioningState::Unversioned) => {
+                        lock_current_object_projection(&txn, bucket, key)
+                            .await?
+                            .map(|object| object.id)
+                    }
+                    (VersionSelector::Current, BucketVersioningState::Enabled) => {
+                        current.and_then(|row| row.object_id)
+                    }
+                };
+                let existing_tags = match object_id {
+                    Some(id) => tags::list_object_tags(&txn, &id).await?,
+                    None => Vec::new(),
+                };
+                authorize(Some(&existing_tags))?;
+            } else {
+                authorize(None)?;
+            }
+
+            // Admission can supersede active imports, so it must be covered by the
+            // same authorization and rollback as the version mutation.
+            let guard = admit_content_mutation_in_transaction(
+                &txn,
+                bucket,
+                key,
+                None,
+                crate::import::SupersedeReason::DeleteObject,
+                now,
+            )
+            .await?;
+            let deleted =
+                delete_version_in_transaction(&txn, bucket, key, selector.clone(), state, now)
+                    .await?;
+            complete_standard_mutation_in_transaction(&txn, &guard, now).await?;
+            Ok(deleted)
+        }
+        .await;
+        match result {
+            Ok(deleted) => {
+                txn.commit().await?;
+                return Ok(deleted);
+            }
+            Err(error) => {
+                txn.rollback().await?;
+                if !is_retryable_transaction_conflict(&error) || retry == MAX_TRANSACTION_RETRIES {
+                    return Err(error);
+                }
+                publication_retry_delay(retry).await;
+            }
+        }
+    }
+    unreachable!("authorized version delete retry loop exhausted without returning")
+}
+
+async fn locked_delete_target_object_id(
+    txn: &DatabaseTransaction,
+    bucket: &str,
+    key: &str,
+    version: &PublicVersionId,
+) -> AppResult<Option<String>> {
+    Ok(
+        crate::store::object_version::lock_indexed_version(txn, bucket, key, version)
+            .await?
+            .and_then(|(row, _)| row.object_id),
+    )
+}
+
 pub async fn delete_version_guarded(
     db: &DatabaseConnection,
     bucket: &str,
@@ -1102,36 +1195,43 @@ async fn delete_version_attempt(
             lock_bucket_for_ownership(txn, bucket).await?;
             verify_standard_mutation_guard(txn, &guard, bucket, key, &[]).await?;
             let state = crate::store::bucket::get_versioning_state(txn, bucket).await?;
-            if state == BucketVersioningState::Unversioned
-                && matches!(&selector, VersionSelector::Exact(_))
-            {
-                return Err(AppError::InvalidArgument(
-                    "version IDs are unavailable for an unversioned bucket".to_owned(),
-                ));
-            }
-
             let _ = crate::store::object_version::lock_current_row(txn, bucket, key).await?;
-            let result = match selector {
-                VersionSelector::Current => match state {
-                    BucketVersioningState::Unversioned => {
-                        delete_unversioned_current_in_transaction(txn, bucket, key, now).await?
-                    }
-                    BucketVersioningState::Enabled => {
-                        delete_enabled_current_in_transaction(txn, bucket, key, now).await?
-                    }
-                    BucketVersioningState::Suspended => {
-                        delete_suspended_current_in_transaction(txn, bucket, key, now).await?
-                    }
-                },
-                VersionSelector::Exact(version_id) => {
-                    delete_exact_in_transaction(txn, bucket, key, version_id, now).await?
-                }
-            };
+            let result =
+                delete_version_in_transaction(txn, bucket, key, selector, state, now).await?;
             complete_standard_mutation_in_transaction(txn, &guard, now).await?;
             Ok(result)
         })
     })
     .await
+}
+
+async fn delete_version_in_transaction(
+    txn: &DatabaseTransaction,
+    bucket: &str,
+    key: &str,
+    selector: VersionSelector,
+    state: BucketVersioningState,
+    now: DateTime<Utc>,
+) -> AppResult<DeleteVersionResult> {
+    match (selector, state) {
+        (VersionSelector::Current, BucketVersioningState::Unversioned) => {
+            delete_unversioned_current_in_transaction(txn, bucket, key, now).await
+        }
+        (VersionSelector::Current, BucketVersioningState::Enabled) => {
+            delete_enabled_current_in_transaction(txn, bucket, key, now).await
+        }
+        (VersionSelector::Current, BucketVersioningState::Suspended) => {
+            delete_suspended_current_in_transaction(txn, bucket, key, now).await
+        }
+        (VersionSelector::Exact(_), BucketVersioningState::Unversioned) => {
+            Err(AppError::InvalidArgument(
+                "version IDs are unavailable for an unversioned bucket".to_owned(),
+            ))
+        }
+        (VersionSelector::Exact(version), _) => {
+            delete_exact_in_transaction(txn, bucket, key, version, now).await
+        }
+    }
 }
 
 pub(crate) async fn delete_unversioned_current_in_transaction(

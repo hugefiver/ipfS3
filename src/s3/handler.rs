@@ -6,6 +6,7 @@ use s3s::S3Response;
 use s3s::S3Result;
 use s3s::dto::*;
 
+use crate::iam::{Action, Context, Resource};
 use crate::state::AppState;
 
 #[derive(Clone)]
@@ -17,6 +18,27 @@ impl S3Impl {
     pub fn new(state: Arc<AppState>) -> Self {
         Self { state }
     }
+
+    fn authorize<T>(
+        &self,
+        req: &S3Request<T>,
+        action: Action,
+        bucket: Option<&str>,
+        resource: Resource<'_>,
+    ) -> S3Result<()> {
+        let scope = crate::access::scope(&self.state, req, bucket)?;
+        if scope.allows(&Context {
+            action,
+            resource,
+            version: None,
+            request_tags: None,
+            existing_tags: None,
+        }) {
+            Ok(())
+        } else {
+            Err(s3s::s3_error!(AccessDenied))
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -25,6 +47,12 @@ impl S3 for S3Impl {
         &self,
         req: S3Request<CreateBucketInput>,
     ) -> S3Result<S3Response<CreateBucketOutput>> {
+        self.authorize(
+            &req,
+            Action::CreateBucket,
+            Some(&req.input.bucket),
+            Resource::Bucket,
+        )?;
         super::ops::bucket::create_bucket(&self.state, req).await
     }
 
@@ -32,6 +60,12 @@ impl S3 for S3Impl {
         &self,
         req: S3Request<DeleteBucketInput>,
     ) -> S3Result<S3Response<DeleteBucketOutput>> {
+        self.authorize(
+            &req,
+            Action::DeleteBucket,
+            Some(&req.input.bucket),
+            Resource::Bucket,
+        )?;
         super::ops::bucket::delete_bucket(&self.state, req).await
     }
 
@@ -39,6 +73,12 @@ impl S3 for S3Impl {
         &self,
         req: S3Request<HeadBucketInput>,
     ) -> S3Result<S3Response<HeadBucketOutput>> {
+        self.authorize(
+            &req,
+            Action::HeadBucket,
+            Some(&req.input.bucket),
+            Resource::Bucket,
+        )?;
         super::ops::bucket::head_bucket(&self.state, req).await
     }
 
@@ -46,6 +86,12 @@ impl S3 for S3Impl {
         &self,
         req: S3Request<GetBucketLocationInput>,
     ) -> S3Result<S3Response<GetBucketLocationOutput>> {
+        self.authorize(
+            &req,
+            Action::GetBucketLocation,
+            Some(&req.input.bucket),
+            Resource::Bucket,
+        )?;
         super::ops::bucket::get_bucket_location(&self.state, req).await
     }
 
@@ -53,6 +99,7 @@ impl S3 for S3Impl {
         &self,
         req: S3Request<ListBucketsInput>,
     ) -> S3Result<S3Response<ListBucketsOutput>> {
+        self.authorize(&req, Action::ListBuckets, None, Resource::Bucket)?;
         super::ops::bucket::list_buckets(&self.state, req).await
     }
 
@@ -60,6 +107,12 @@ impl S3 for S3Impl {
         &self,
         req: S3Request<GetBucketVersioningInput>,
     ) -> S3Result<S3Response<GetBucketVersioningOutput>> {
+        self.authorize(
+            &req,
+            Action::GetBucketVersioning,
+            Some(&req.input.bucket),
+            Resource::Bucket,
+        )?;
         super::ops::versioning::get_bucket_versioning(&self.state, req).await
     }
 
@@ -67,6 +120,12 @@ impl S3 for S3Impl {
         &self,
         req: S3Request<PutBucketVersioningInput>,
     ) -> S3Result<S3Response<PutBucketVersioningOutput>> {
+        self.authorize(
+            &req,
+            Action::PutBucketVersioning,
+            Some(&req.input.bucket),
+            Resource::Bucket,
+        )?;
         super::ops::versioning::put_bucket_versioning(&self.state, req).await
     }
 
@@ -74,6 +133,12 @@ impl S3 for S3Impl {
         &self,
         req: S3Request<DeleteBucketLifecycleInput>,
     ) -> S3Result<S3Response<DeleteBucketLifecycleOutput>> {
+        self.authorize(
+            &req,
+            Action::DeleteBucketLifecycle,
+            Some(&req.input.bucket),
+            Resource::Bucket,
+        )?;
         super::ops::lifecycle::delete_bucket_lifecycle(&self.state, req).await
     }
 
@@ -81,6 +146,12 @@ impl S3 for S3Impl {
         &self,
         req: S3Request<GetBucketLifecycleConfigurationInput>,
     ) -> S3Result<S3Response<GetBucketLifecycleConfigurationOutput>> {
+        self.authorize(
+            &req,
+            Action::GetBucketLifecycleConfiguration,
+            Some(&req.input.bucket),
+            Resource::Bucket,
+        )?;
         super::ops::lifecycle::get_bucket_lifecycle_configuration(&self.state, req).await
     }
 
@@ -88,6 +159,12 @@ impl S3 for S3Impl {
         &self,
         req: S3Request<PutBucketLifecycleConfigurationInput>,
     ) -> S3Result<S3Response<PutBucketLifecycleConfigurationOutput>> {
+        self.authorize(
+            &req,
+            Action::PutBucketLifecycleConfiguration,
+            Some(&req.input.bucket),
+            Resource::Bucket,
+        )?;
         super::ops::lifecycle::put_bucket_lifecycle_configuration(&self.state, req).await
     }
 
@@ -95,6 +172,12 @@ impl S3 for S3Impl {
         &self,
         req: S3Request<GetBucketCorsInput>,
     ) -> S3Result<S3Response<GetBucketCorsOutput>> {
+        self.authorize(
+            &req,
+            Action::GetBucketCors,
+            Some(&req.input.bucket),
+            Resource::Bucket,
+        )?;
         super::ops::cors::get_bucket_cors(&self.state, req).await
     }
 
@@ -102,6 +185,12 @@ impl S3 for S3Impl {
         &self,
         req: S3Request<PutBucketCorsInput>,
     ) -> S3Result<S3Response<PutBucketCorsOutput>> {
+        self.authorize(
+            &req,
+            Action::PutBucketCors,
+            Some(&req.input.bucket),
+            Resource::Bucket,
+        )?;
         super::ops::cors::put_bucket_cors(&self.state, req).await
     }
 
@@ -109,6 +198,12 @@ impl S3 for S3Impl {
         &self,
         req: S3Request<DeleteBucketCorsInput>,
     ) -> S3Result<S3Response<DeleteBucketCorsOutput>> {
+        self.authorize(
+            &req,
+            Action::DeleteBucketCors,
+            Some(&req.input.bucket),
+            Resource::Bucket,
+        )?;
         super::ops::cors::delete_bucket_cors(&self.state, req).await
     }
 
@@ -179,6 +274,12 @@ impl S3 for S3Impl {
         &self,
         req: S3Request<ListObjectsInput>,
     ) -> S3Result<S3Response<ListObjectsOutput>> {
+        self.authorize(
+            &req,
+            Action::ListObjects,
+            Some(&req.input.bucket),
+            Resource::Prefix(req.input.prefix.as_deref().unwrap_or("")),
+        )?;
         super::ops::object::list_objects(&self.state, req).await
     }
 
@@ -186,6 +287,12 @@ impl S3 for S3Impl {
         &self,
         req: S3Request<ListObjectVersionsInput>,
     ) -> S3Result<S3Response<ListObjectVersionsOutput>> {
+        self.authorize(
+            &req,
+            Action::ListObjectVersions,
+            Some(&req.input.bucket),
+            Resource::Prefix(req.input.prefix.as_deref().unwrap_or("")),
+        )?;
         super::ops::versioning::list_object_versions(&self.state, req).await
     }
 
@@ -193,6 +300,12 @@ impl S3 for S3Impl {
         &self,
         req: S3Request<ListObjectsV2Input>,
     ) -> S3Result<S3Response<ListObjectsV2Output>> {
+        self.authorize(
+            &req,
+            Action::ListObjectsV2,
+            Some(&req.input.bucket),
+            Resource::Prefix(req.input.prefix.as_deref().unwrap_or("")),
+        )?;
         super::ops::object::list_objects_v2(&self.state, req).await
     }
 
@@ -207,6 +320,12 @@ impl S3 for S3Impl {
         &self,
         req: S3Request<UploadPartInput>,
     ) -> S3Result<S3Response<UploadPartOutput>> {
+        self.authorize(
+            &req,
+            Action::UploadPart,
+            Some(&req.input.bucket),
+            Resource::Object(&req.input.key),
+        )?;
         super::ops::multipart::upload_part(&self.state, req).await
     }
 
@@ -221,6 +340,12 @@ impl S3 for S3Impl {
         &self,
         req: S3Request<AbortMultipartUploadInput>,
     ) -> S3Result<S3Response<AbortMultipartUploadOutput>> {
+        self.authorize(
+            &req,
+            Action::AbortMultipartUpload,
+            Some(&req.input.bucket),
+            Resource::Object(&req.input.key),
+        )?;
         super::ops::multipart::abort_multipart_upload(&self.state, req).await
     }
 
@@ -228,6 +353,12 @@ impl S3 for S3Impl {
         &self,
         req: S3Request<ListPartsInput>,
     ) -> S3Result<S3Response<ListPartsOutput>> {
+        self.authorize(
+            &req,
+            Action::ListParts,
+            Some(&req.input.bucket),
+            Resource::Object(&req.input.key),
+        )?;
         super::ops::multipart::list_parts(&self.state, req).await
     }
 }

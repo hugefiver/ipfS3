@@ -315,6 +315,26 @@ pub struct ListingObject {
     pub created_at: chrono::DateTime<Utc>,
 }
 
+pub(super) fn key_prefix(backend: DatabaseBackend, prefix: &str) -> sea_orm::Condition {
+    use sea_orm::{Condition, sea_query::Alias};
+
+    if backend == DatabaseBackend::Postgres {
+        return Condition::all().add(Expr::cust_with_values("\"key\" ^@ $1", [prefix]));
+    }
+    // SQLite's default LIKE folds ASCII case. The indexed BINARY key range
+    // includes exactly strings beginning with these UTF-8 bytes.
+    let key = Expr::col(Alias::new("key"));
+    let range = Condition::all().add(key.clone().gte(prefix));
+    for (offset, last) in prefix.char_indices().rev() {
+        if let Some(next) = (last..=char::MAX).nth(1) {
+            let mut end = prefix[..offset].to_owned();
+            end.push(next);
+            return range.add(key.lt(end));
+        }
+    }
+    range
+}
+
 pub async fn list<C: ConnectionTrait>(
     db: &C,
     bucket: &str,
@@ -337,7 +357,7 @@ pub async fn list<C: ConnectionTrait>(
         .filter(object::Column::IsLatest.eq(true));
 
     if let Some(pfx) = prefix {
-        query = query.filter(object::Column::Key.starts_with(pfx));
+        query = query.filter(key_prefix(db.get_database_backend(), pfx));
     }
 
     if let Some(token) = continuation_token

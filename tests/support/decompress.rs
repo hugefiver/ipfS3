@@ -369,7 +369,8 @@ async fn build_harness(
             kubo: ipfs_s3_gateway::kubo::KuboClient::new(kubo.uri()),
             cold_kubo: None,
             store: ipfs_s3_gateway::store::Store::new(db),
-            credentials: HashMap::from([("test".to_owned(), s3s::auth::SecretKey::from("test"))]),
+            credentials: HashMap::from([("test".to_owned(), s3s::auth::SecretKey::from("test"))])
+                .into(),
             master_key: ipfs_s3_gateway::crypto::key::MasterKey::from_hex(&"0".repeat(64))
                 .expect("zero test master key"),
             pinning: ipfs_s3_gateway::pinning::coordinator::PinningCoordinator::disabled_for_test(),

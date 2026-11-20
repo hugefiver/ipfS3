@@ -1,7 +1,6 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 
-use s3s::auth::SecretKey;
+use crate::auth::GatewayCredentials;
 
 use crate::config::Config;
 use crate::crypto::key::MasterKey;
@@ -13,7 +12,7 @@ pub struct AppState {
     pub kubo: KuboClient,
     pub cold_kubo: Option<KuboClient>,
     pub store: Store,
-    pub credentials: HashMap<String, SecretKey>,
+    pub credentials: GatewayCredentials,
     pub master_key: MasterKey,
     pub pinning: Arc<PinningCoordinator>,
 }
@@ -46,12 +45,7 @@ impl AppState {
         let db = crate::store::connect_database(&cfg.storage.database_url).await?;
         let store = Store::open(db).await?;
 
-        let credentials: HashMap<String, SecretKey> = cfg
-            .auth
-            .credentials
-            .iter()
-            .map(|c| (c.access_key.clone(), SecretKey::from(c.secret_key.as_str())))
-            .collect();
+        let credentials = GatewayCredentials::from_config(cfg)?;
 
         let master_key =
             MasterKey::from_hex(&cfg.crypto.master_key).map_err(|e| anyhow::anyhow!("{e}"))?;

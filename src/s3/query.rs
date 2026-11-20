@@ -24,6 +24,28 @@ pub fn decoded_query_pairs(uri: &Uri) -> S3Result<Vec<(String, String)>> {
         .collect()
 }
 
+/// Business parameters from an already authenticated request, excluding SigV4
+/// presigning fields. The original URI remains available to authentication.
+pub(crate) fn authenticated_business_query_pairs(uri: &Uri) -> S3Result<Vec<(String, String)>> {
+    let mut pairs = decoded_query_pairs(uri)?;
+    if pairs.iter().any(|(name, _)| name == "X-Amz-Signature") {
+        pairs.retain(|(name, _)| {
+            !matches!(
+                name.as_str(),
+                "X-Amz-Algorithm"
+                    | "X-Amz-Credential"
+                    | "X-Amz-Date"
+                    | "X-Amz-Expires"
+                    | "X-Amz-SignedHeaders"
+                    | "X-Amz-Signature"
+                    | "X-Amz-Security-Token"
+                    | "X-Amz-Content-Sha256"
+            )
+        });
+    }
+    Ok(pairs)
+}
+
 /// Check whether a decoded query parameter name is present without validating
 /// its value. This is only used for custom-route selection.
 pub fn query_key_is_present(uri: &Uri, expected: &str) -> bool {

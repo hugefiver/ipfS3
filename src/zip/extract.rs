@@ -1092,7 +1092,6 @@ where
 #[cfg(test)]
 mod tests {
     include!("hardening_tests.rs");
-    use std::collections::HashMap;
     use std::io;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -1472,7 +1471,7 @@ mod tests {
             kubo,
             cold_kubo: None,
             store: Store::new(db),
-            credentials: HashMap::new(),
+            credentials: Default::default(),
             master_key: MasterKey::from_hex(
                 "0000000000000000000000000000000000000000000000000000000000000000",
             )

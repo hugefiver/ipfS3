@@ -1049,8 +1049,7 @@ pub async fn admit_content_and_prefix_mutation<C: ConnectionTrait + TransactionT
     unreachable!("combined admission retry loop always returns or errors")
 }
 
-#[cfg(test)]
-async fn admit_content_mutation_in_transaction<C: ConnectionTrait>(
+pub(crate) async fn admit_content_mutation_in_transaction<C: ConnectionTrait>(
     txn: &C,
     bucket_name: &str,
     key: &str,

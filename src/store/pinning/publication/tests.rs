@@ -2593,6 +2593,103 @@ async fn exact_latest_delete_promotes_next_object_or_marker() {
 }
 
 #[tokio::test]
+async fn authorized_delete_uses_displaced_null_tags_without_superseding_on_denial() {
+    let db = setup().await;
+    set_versioning(&db, BucketVersioningState::Enabled).await;
+    set_versioning(&db, BucketVersioningState::Suspended).await;
+    let null_tags = vec![tag("deletable", "no")];
+    publish_object(
+        &db,
+        request(
+            object("null-content", "key", "bafy-null", 7),
+            null_tags.clone(),
+            vec![],
+        ),
+        &limits(),
+    )
+    .await
+    .unwrap();
+    set_versioning(&db, BucketVersioningState::Enabled).await;
+    let allow_tags = vec![tag("deletable", "yes")];
+    publish_object(
+        &db,
+        request(
+            object("current-content", "key", "bafy-current", 7),
+            allow_tags.clone(),
+            vec![],
+        ),
+        &limits(),
+    )
+    .await
+    .unwrap();
+    set_versioning(&db, BucketVersioningState::Suspended).await;
+    let now = Utc::now();
+    let put_guard =
+        admit_content_mutation(&db, "bucket", "key", None, SupersedeReason::PutObject, now)
+            .await
+            .unwrap();
+    let authorize = |tags: Option<&[ObjectTag]>| {
+        if tags == Some(allow_tags.as_slice()) {
+            Ok(())
+        } else {
+            Err(AppError::AccessDenied("not deletable".to_owned()))
+        }
+    };
+    let version_rows = versions_for(&db, "key").await;
+    let denied = delete_version_authorized(
+        &db,
+        "bucket",
+        "key",
+        VersionSelector::Current,
+        true,
+        authorize,
+        now,
+    )
+    .await;
+    assert!(matches!(denied, Err(AppError::AccessDenied(_))));
+    assert_eq!(versions_for(&db, "key").await, version_rows);
+    let destination =
+        import_destination::Entity::find_by_id(("bucket".to_owned(), "key".to_owned()))
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(
+        destination.mutation_id.as_deref(),
+        Some(put_guard.mutation_id.as_str())
+    );
+
+    tags::replace_object_tags(&db, "null-content", &allow_tags)
+        .await
+        .unwrap();
+    let deleted = delete_version_authorized(
+        &db,
+        "bucket",
+        "key",
+        VersionSelector::Current,
+        true,
+        authorize,
+        now,
+    )
+    .await
+    .unwrap();
+    assert!(deleted.created_delete_marker);
+    assert_eq!(deleted.version_id.as_deref(), Some("null"));
+    assert!(
+        tags::list_object_tags(&db, "null-content")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        tags::list_object_tags(&db, "current-content")
+            .await
+            .unwrap(),
+        allow_tags
+    );
+}
+
+#[tokio::test]
 async fn delete_race_loses_to_newer_mutation_fence() {
     let db = setup().await;
     set_versioning(&db, BucketVersioningState::Enabled).await;

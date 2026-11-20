@@ -48,6 +48,10 @@ impl S3Route for GatewayRoute {
             || self.decompress.is_match(method, uri, headers, extensions)
     }
 
+    async fn check_access(&self, req: &mut S3Request<Body>) -> S3Result<()> {
+        crate::access::bind_custom(&self.state, req)
+    }
+
     async fn call(&self, mut req: S3Request<Body>) -> S3Result<S3Response<Body>> {
         if crate::s3::ops::tagging::status::matches(&req.uri) {
             return crate::s3::ops::tagging::status::get(&self.state, req).await;
@@ -73,12 +77,10 @@ impl S3Route for GatewayRoute {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        collections::HashMap,
-        sync::{
-            Arc,
-            atomic::{AtomicUsize, Ordering},
-        },
+    use std::collections::HashMap;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
     };
 
     use axum::error_handling::HandleError;
@@ -105,7 +107,8 @@ mod tests {
             kubo: crate::kubo::KuboClient::new("http://127.0.0.1:1".to_owned()),
             cold_kubo: None,
             store: Store::new(db),
-            credentials: HashMap::from([("test".to_owned(), s3s::auth::SecretKey::from("test"))]),
+            credentials: HashMap::from([("test".to_owned(), s3s::auth::SecretKey::from("test"))])
+                .into(),
             master_key: crate::crypto::key::MasterKey::from_hex(&"0".repeat(64)).unwrap(),
             pinning: crate::pinning::coordinator::PinningCoordinator::disabled_for_test(),
         });
