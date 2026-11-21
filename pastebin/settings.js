@@ -4,7 +4,20 @@ function isLoopback(hostname) {
   return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "[::1]";
 }
 
-function parseHttpUrl(value, originOnly) {
+// Validate the authority as typed: URL normalizes dot paths and shorthand IPv4.
+export function normalizeEndpoint(value) {
+  const invalid = "Use an HTTPS endpoint origin, or HTTP on localhost, 127.0.0.1 or [::1].";
+  const match = /^https?:\/\/([^/\s?#@\\%]+)\/?$/i.exec(value);
+  if (!match || match[0] !== value) throw new Error(invalid);
+  let url;
+  try { url = new URL(value); } catch { throw new Error(invalid); }
+  if (url.protocol === "http:" && !/^(?:localhost|127\.0\.0\.1|\[::1\])(?::\d+)?$/i.test(match[1])) {
+    throw new Error(invalid);
+  }
+  return url.origin;
+}
+
+export function normalizeGateway(value) {
   if (typeof value !== "string" || value.includes("\\")) {
     throw new Error("Enter a valid HTTP(S) URL.");
   }
@@ -20,18 +33,7 @@ function parseHttpUrl(value, originOnly) {
   if (url.username || url.password || url.search || url.hash) {
     throw new Error("URLs cannot contain credentials, query parameters, or fragments.");
   }
-  if (originOnly && url.pathname !== "/") {
-    throw new Error("The S3 endpoint must be an origin without a path.");
-  }
-  return url;
-}
 
-export function normalizeEndpoint(value) {
-  return parseHttpUrl(value, true).origin;
-}
-
-export function normalizeGateway(value) {
-  const url = parseHttpUrl(value, false);
   if (!url.pathname.endsWith("/")) url.pathname += "/";
   return url.href;
 }
@@ -47,6 +49,13 @@ export function normalizeBucket(value) {
   return value;
 }
 
+export function instanceTarget({ endpoint, bucket, region }) {
+  if (typeof region !== "string" || region.trim() !== region || !/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(region)) {
+    throw new Error("Enter a valid S3 region.");
+  }
+  return { endpoint: normalizeEndpoint(endpoint), bucket: normalizeBucket(bucket), region };
+}
+
 export function validateSettings(settings, deploymentMaxBytes) {
   const maxUploadBytes = settings.maxUploadBytes;
   if (!Number.isSafeInteger(deploymentMaxBytes) || deploymentMaxBytes < 1) {
@@ -55,13 +64,8 @@ export function validateSettings(settings, deploymentMaxBytes) {
   if (!Number.isSafeInteger(maxUploadBytes) || maxUploadBytes < 1 || maxUploadBytes > deploymentMaxBytes) {
     throw new Error(`Upload limit must be between 1 and ${deploymentMaxBytes} bytes.`);
   }
-  if (typeof settings.region !== "string" || !/^[a-z0-9][a-z0-9-]{0,62}$/.test(settings.region)) {
-    throw new Error("Enter a valid S3 region.");
-  }
   return {
-    endpoint: normalizeEndpoint(settings.endpoint),
-    bucket: normalizeBucket(settings.bucket),
-    region: settings.region,
+    ...instanceTarget(settings),
     maxUploadBytes,
     ipfsGateway: normalizeGateway(settings.ipfsGateway),
     inbrowserGateway: normalizeGateway(settings.inbrowserGateway),

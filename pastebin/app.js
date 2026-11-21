@@ -9,7 +9,6 @@ import {
   ipfsUrl,
   objectUrlFromList,
   probePublicUrl,
-  safeHttpUrl,
 } from "./share.js";
 
 const $ = (id) => document.getElementById(id);
@@ -95,11 +94,10 @@ $("reset-settings").addEventListener("click", () => {
 });
 
 for (const input of publishForm.elements.mode) {
-  input.addEventListener("change", () => updateMode(input.value));
+  input.addEventListener("change", updateMode);
 }
 
-function updateMode(mode) {
-  if (!publishForm.elements.mode.value) return;
+function updateMode() {
   const selected = publishForm.elements.mode.value;
   const isText = selected === "text";
   $("text-panel").hidden = !isText;
@@ -119,17 +117,10 @@ function selectedBody() {
   const mode = publishForm.elements.mode.value;
   if (mode === "text") {
     const value = $("text-content").value;
-    const size = new TextEncoder().encode(value).length;
-    if (size > settings.maxUploadBytes) {
-      throw new Error(`Text is ${formatBytes(size)}; this instance allows ${formatBytes(settings.maxUploadBytes)}.`);
-    }
     return { mode: "file", body: new Blob([value], { type: "text/plain;charset=utf-8" }) };
   }
   const file = $("file-content").files[0];
   if (!file) throw new Error(mode === "directory" ? "Choose a ZIP file." : "Choose a file.");
-  if (file.size > settings.maxUploadBytes) {
-    throw new Error(`File is ${formatBytes(file.size)}; this instance allows ${formatBytes(settings.maxUploadBytes)}.`);
-  }
   return { mode, body: file };
 }
 
@@ -154,14 +145,14 @@ function showShare(selection) {
   setStatus($("copy-status"), direct ? "Direct object link ready." : "Download/listing link ready; it contains only this selected target.", "success");
 }
 
-async function downloadObject(url, name, status, useS3Proxy = false) {
+async function downloadObject(url, name, status) {
   try {
     const response = await fetch(url, {
       credentials: "omit",
       redirect: "error",
       cache: "no-store",
       referrerPolicy: "no-referrer",
-      headers: useS3Proxy ? { "X-IPFS3-Download-Gateway": "proxy" } : undefined,
+      headers: { "X-IPFS3-Download-Gateway": "proxy" },
     });
     if (!response.ok) throw new Error(`Raw download returned HTTP ${response.status}.`);
     const objectUrl = URL.createObjectURL(await response.blob());
@@ -198,7 +189,7 @@ function addLink(container, { url, label, name, backend, mode, kind, rootStatus 
       if (action.getAttribute("aria-busy") === "true") return;
       action.setAttribute("aria-busy", "true");
       setStatus(status, "Fetching raw object…");
-      await downloadObject(url, name, status, true);
+      await downloadObject(url, name, status);
       action.removeAttribute("aria-busy");
     });
   } else {
@@ -311,10 +302,6 @@ function renderResult(result) {
 
 publishForm.addEventListener("submit", async (event) => {
   event.preventDefault();
-  if (!window.isSecureContext) {
-    setStatus(publishStatus, "WebCrypto signing requires HTTPS or a loopback development origin.", "error");
-    return;
-  }
   publishButton.disabled = true;
   publishForm.setAttribute("aria-busy", "true");
   setStatus(publishStatus, "Publishing…");
@@ -322,15 +309,8 @@ publishForm.addEventListener("submit", async (event) => {
     const body = selectedBody();
     const result = await publish(
       { ...body, name: $("content-name").value, credentials: credentials() },
-      {
-        endpoint: settings.endpoint,
-        bucket: settings.bucket,
-        region: settings.region,
-        maxUploadBytes: settings.maxUploadBytes,
-      },
+      settings,
     );
-    if (!safeHttpUrl(result.url)) throw new Error("The publisher returned an unsafe object URL.");
-    if (result.kind === "directory" && !result.cid) throw new Error("The ZIP response has no directory root.");
     renderResult(result);
     setStatus(publishStatus, "Published. Choose Share beside the exact link you want to send.", "success");
   } catch (error) {
@@ -475,7 +455,7 @@ function renderSharedEntries(entries, listUrl) {
     raw.className = "button secondary";
     raw.textContent = "Raw";
     raw.addEventListener("click", async () => {
-      await downloadObject(url, entry.key.slice(entry.key.lastIndexOf("/") + 1), $("shared-status"), true);
+      await downloadObject(url, entry.key.slice(entry.key.lastIndexOf("/") + 1), $("shared-status"));
     });
     links.append(preview, raw);
     row.append(name, size, links);
@@ -501,7 +481,7 @@ function renderSharedSelection(selection) {
   if (isS3Raw) {
     download.addEventListener("click", async () => {
       download.setAttribute("aria-busy", "true");
-      await downloadObject(selection.url, selection.name, $("shared-status"), true);
+      await downloadObject(selection.url, selection.name, $("shared-status"));
       download.removeAttribute("aria-busy");
     });
   } else if (!isDirectoryListing) {

@@ -5,6 +5,7 @@ import { createServer } from 'node:http';
 import { buffer } from 'node:stream/consumers';
 import { test } from 'node:test';
 import { publish } from '../publish.mjs';
+import { encodeS3Component, signPut } from '../sigv4.mjs';
 
 const fileCid = 'bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku';
 const rootCid = 'bafybeib4r26s6xrk5uqyy6k5lkwxmrsfecmfxluvlz44b2qnt3rottiw3u';
@@ -73,48 +74,22 @@ test('signs the exact UTF-8 bytes and path-style file URL with a port and sessio
   assert.notEqual(result.key, second.key);
 });
 
-function zipReply(request, partial) {
-  const url = new URL(request.url, 'http://example.invalid');
-  const archiveKey = decodeURIComponent(url.pathname.slice('/test-bucket/'.length))
-    .replaceAll('&', '&amp;').replaceAll("'", '&apos;');
-  const prefix = url.searchParams.get('decompress-zip');
-  const failures = partial ? '<Failure><EntryName>&lt;lost&gt;.txt</EntryName><Code>EntryUploadFailed</Code><Message>Can&apos;t upload &amp; retry</Message></Failure>' : '';
-  return {
-    headers: { 'x-ipfs-s3-zip-root-cid': rootCid, 'x-ipfs-s3-zip-root-status': partial ? 'partial' : 'complete' },
-    body: `<?xml version="1.0" encoding="UTF-8"?><DecompressZipResult><ArchiveKey>${archiveKey}</ArchiveKey>` +
-      `<ArchiveETag>${fileCid}</ArchiveETag><ArchiveSize>${request.bytes.length}</ArchiveSize>` +
-      `<ExtractedCount>1</ExtractedCount><FailedCount>${partial ? 1 : 0}</FailedCount><Entries>` +
-      `<Entry><Key>${prefix}nested/好 &amp;lt;.txt</Key><ETag>${fileCid}</ETag><Size>0</Size></Entry>` +
-      `</Entries><Failures>${failures}</Failures></DecompressZipResult>`,
-  };
-}
-
-test('signs the ZIP v1 query and separates complete/partial roots from the archive', async t => {
-  let partial = false;
-  const { config, requests } = await serve(t, request => zipReply(request, partial));
-  for (const rootStatus of ['complete', 'partial']) {
-    partial = rootStatus === 'partial';
-    const result = await publish(directory, config);
-    const request = requests.at(-1);
-    const raw = new URL(result.url);
-    const prefix = result.key.slice(0, -directory.name.length) + 'files/';
-    assert.equal(raw.search, '');
-    assert.equal(decodeURIComponent(raw.pathname), `/test-bucket/${result.key}`);
-    assert.equal(request.url, `${raw.pathname}?decompress-zip=${prefix.replaceAll('/', '%2F')}`);
-    assertSignature(request, true);
-    assert.deepEqual(result, {
-      key: result.key, url: result.url, name: directory.name, kind: 'directory', cid: rootCid, archiveCid: fileCid,
-      rootStatus, entries: [{ key: `${prefix}nested/好 &lt;.txt`, cid: fileCid, size: 0 }],
-      failures: partial ? [{ name: '<lost>.txt', code: 'EntryUploadFailed', message: "Can't upload & retry" }] : [],
-    });
-  }
+test('signs the ZIP v1 query and explicit directory-root request', async t => {
+  const { config, endpoint, requests } = await serve(t, () => ({ headers: { etag: `"${fileCid}"` } }));
+  // A reply without a shareable root ends before browser XML parsing.
+  await assert.rejects(publish(directory, config), /no shareable directory root/);
+  const [request] = requests;
+  const raw = new URL(request.url, endpoint);
+  const prefix = raw.pathname.split('/').slice(2, -1).join('/') + '/files/';
+  assert.match(prefix, /^pastebin\/[a-f0-9-]+\/files\/$/);
+  assert.equal(raw.pathname.split('/').at(-1), '%E5%BD%92%E6%A1%A3%20%26%27.zip');
+  assert.equal(raw.search, `?decompress-zip=${prefix.replaceAll('/', '%2F')}`);
+  assertSignature(request, true);
 });
 
 test('never reports a successful object or directory link without the required CID and status', async t => {
   let headers = {};
-  const { config } = await serve(t, request => ({
-    body: request.url.includes('?') ? zipReply(request, false).body : undefined, headers,
-  }));
+  const { config } = await serve(t, () => ({ headers }));
   await assert.rejects(publish(file, config), /stored.*CID could not be read/);
   headers = { etag: '"d41d8cd98f00b204e9800998ecf8427e"' };
   await assert.rejects(publish(file, config), /stored.*CID could not be read/);
@@ -128,14 +103,6 @@ test('never reports a successful object or directory link without the required C
     headers = { etag: `"${fileCid}"`, ...rootHeaders };
     await assert.rejects(publish(directory, config), /stored.*no shareable directory root/);
   }
-});
-
-test('rejects unreadable ZIP extraction results even with a shareable root header', async t => {
-  const { config } = await serve(t, request => {
-    const reply = zipReply(request, true);
-    return { ...reply, body: reply.body.replace('</Failure>', '') };
-  });
-  await assert.rejects(publish(directory, config), /stored.*extraction result/);
 });
 
 test('blocks redirects without forwarding credentials and ignores gateway error body details', async t => {
@@ -198,18 +165,28 @@ test('live gateway accepts signed file and ZIP PUTs, rejects unsigned PUT and se
 
     // A ZIP containing nested/entry.txt with the UTF-8 content "zip entry".
     const archive = Buffer.from('UEsDBBQAAAAIAGUfdl0FWedKEQAAAAkAAAAQAAAAbmVzdGVkL2VudHJ5LnR4dKrKLFBIzSspqgQAAAD//wMAUEsBAhQAFAAAAAgAZR92XQVZ50oRAAAACQAAABAAAAAAAAAAAAAAAAAAAAAAAG5lc3RlZC9lbnRyeS50eHRQSwUGAAAAAAEAAQA+AAAAPwAAAAAA', 'base64');
-    const zip = await publish({ ...directory, credentials: liveCredentials, body: new Blob([archive]) }, config);
-    assert.equal(zip.rootStatus, 'complete');
-    assert.notEqual(zip.cid, zip.archiveCid);
-    assert.deepEqual(zip.failures, []);
-    assert.equal(zip.entries.length, 1);
-    const [entry] = zip.entries;
-    assert.match(entry.key, /\/files\/nested\/entry\.txt$/);
-    assert.equal(entry.size, 9);
-    const original = await fetch(zip.url);
+    const baseKey = receipt.key.slice(0, -receipt.name.length);
+    const prefix = `${baseKey}files/`;
+    const archiveUrl = new URL(`/${config.bucket}/${baseKey}${encodeS3Component(directory.name)}`, liveEndpoint);
+    const uploadUrl = new URL(archiveUrl);
+    uploadUrl.search = `decompress-zip=${encodeS3Component(prefix)}`;
+    const headers = new Headers({ 'content-type': 'application/zip', 'x-amz-tagging': 'ipfs-s3%3Azip-root=true' });
+    await signPut(uploadUrl, archive, headers, config.region, liveCredentials);
+    const zip = await fetch(uploadUrl, { method: 'PUT', body: archive, headers, redirect: 'error' });
+    assert.equal(zip.status, 200);
+    assert.equal(zip.headers.get('x-ipfs-s3-zip-root-status'), 'complete');
+    const cid = zip.headers.get('x-ipfs-s3-zip-root-cid');
+    const archiveCid = zip.headers.get('etag')?.slice(1, -1);
+    assert.ok(cid && archiveCid && cid !== archiveCid);
+    const entryKey = `${prefix}nested/entry.txt`;
+    const xml = await zip.text();
+    assert.ok(xml.includes(`<ArchiveETag>${archiveCid}</ArchiveETag>`));
+    assert.ok(xml.includes('<ExtractedCount>1</ExtractedCount><FailedCount>0</FailedCount>'));
+    assert.ok(xml.includes(`<Key>${entryKey}</Key>`));
+    const original = await fetch(archiveUrl);
     assert.equal(original.status, 200);
     assert.deepEqual(Buffer.from(await original.arrayBuffer()), archive);
-    const extracted = await fetch(new URL(`/${config.bucket}/${entry.key}`, config.endpoint));
+    const extracted = await fetch(new URL(`/${config.bucket}/${entryKey}`, config.endpoint));
     assert.equal(extracted.status, 200);
     assert.equal(await extracted.text(), 'zip entry');
 

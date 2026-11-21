@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>Pastebin ZIP publisher browser tests</title>
+<output id="result">Running browser tests</output>
+<script type="module">
+  import { publish } from '../publish.mjs';
+
+  const archiveCid = 'bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku';
+  const rootCid = 'bafybeib4r26s6xrk5uqyy6k5lkwxmrsfecmfxluvlz44b2qnt3rottiw3u';
+  const config = { endpoint: 'https://fixture.invalid', bucket: 'test-bucket', region: 'us-east-1', maxUploadBytes: 64 };
+  const input = {
+    mode: 'directory', name: "归档 &'.zip", body: new Blob(['synthetic ZIP']),
+    credentials: { accessKeyId: 'browser-test', secretAccessKey: 'synthetic' },
+  };
+  const output = document.getElementById('result');
+  const realFetch = globalThis.fetch;
+
+  function check(condition, label) {
+    if (!condition) throw new Error(label);
+  }
+
+  function publishZip(rootStatus, alterXml = xml => xml) {
+    globalThis.fetch = async url => {
+      const key = decodeURIComponent(url.pathname.slice('/test-bucket/'.length));
+      const prefix = url.searchParams.get('decompress-zip');
+      const partial = rootStatus === 'partial';
+      const xml = `<?xml version='1.0'?>
+        <DecompressZipResult>
+          <ArchiveKey>${key.replaceAll('&', '&#x26;').replaceAll("'", '&#39;')}</ArchiveKey>
+          <ArchiveETag>${archiveCid}</ArchiveETag>
+          <ArchiveSize>13</ArchiveSize>
+          <ExtractedCount>1</ExtractedCount>
+          <FailedCount>${partial ? 1 : 0}</FailedCount>
+          <Entries>
+            <Entry>
+              <Key>${prefix}nested/好 &amp;lt; &#x1F30D;.txt</Key>
+              <ETag>${archiveCid}</ETag>
+              <Size>0</Size>
+            </Entry>
+          </Entries>
+          <Failures>${partial ? `
+            <Failure>
+              <EntryName>&lt;lost&gt;.txt</EntryName><Code>EntryUploadFailed</Code>
+              <Message>Can&apos;t upload &amp; retry</Message>
+            </Failure>` : ''}
+          </Failures>
+        </DecompressZipResult>`;
+      return new Response(alterXml(xml), { headers: {
+        'content-type': 'application/xml',
+        'x-ipfs-s3-zip-root-cid': rootCid,
+        'x-ipfs-s3-zip-root-status': rootStatus,
+      } });
+    };
+    return publish(input, config);
+  }
+
+  try {
+    for (const rootStatus of ['complete', 'partial']) {
+      const receipt = await publishZip(rootStatus);
+      const prefix = receipt.key.slice(0, -input.name.length) + 'files/';
+      const rawUrl = new URL(receipt.url);
+      check(receipt.kind === 'directory' && receipt.rootStatus === rootStatus, 'Wrong directory kind or status');
+      check(receipt.cid === rootCid && receipt.archiveCid === archiveCid, 'Wrong root or archive CID');
+      check(!rawUrl.search && decodeURIComponent(rawUrl.pathname) === `/test-bucket/${receipt.key}`, 'Wrong raw ZIP URL');
+      check(receipt.entries.length === 1, 'Missing extraction entry');
+      const [entry] = receipt.entries;
+      check(entry.key === `${prefix}nested/好 &lt; 🌍.txt` && entry.cid === archiveCid && entry.size === 0, 'Wrong entry');
+      check(receipt.failures.length === (rootStatus === 'partial' ? 1 : 0), 'Wrong failure count');
+      if (rootStatus === 'partial') {
+        const [failure] = receipt.failures;
+        check(failure.name === '<lost>.txt' && failure.code === 'EntryUploadFailed' &&
+          failure.message === "Can't upload & retry", 'Wrong partial failure');
+      }
+    }
+    for (const [label, alterXml] of [
+      ['malformed XML', xml => xml.replace('</Failure>', '')],
+      ['wrong result element', xml => xml.replaceAll('DecompressZipResult', 'OtherResult')],
+      ['wrong archive key', xml => xml.replace(/<ArchiveKey>[^<]+/, '<ArchiveKey>different.zip')],
+      ['invalid archive CID', xml => xml.replace(`<ArchiveETag>${archiveCid}`, '<ArchiveETag>not-a-cid')],
+      ['invalid entry CID', xml => xml.replace(`<ETag>${archiveCid}`, '<ETag>not-a-cid')],
+      ['wrong entry prefix', xml => xml.replace(/<Key>[^<]+/, '<Key>another/file.txt')],
+      ['wrong failure count', xml => xml.replace('<FailedCount>1', '<FailedCount>0')],
+    ]) {
+      let error;
+      try { await publishZip('partial', alterXml); } catch (caught) { error = caught; }
+      check(/stored.*extraction result/.test(error?.message), `Expected rejection: ${label}; got ${error?.message}`);
+    }
+    output.textContent = 'PASS: complete/partial ZIP results, native XML entities, invalid responses';
+  } catch (error) {
+    output.textContent = `FAIL: ${error.message}`;
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+</script>
+</html>

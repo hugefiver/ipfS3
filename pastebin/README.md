@@ -10,10 +10,10 @@ Serve this directory over HTTPS, or over HTTP on loopback for development. For
 example, from the repository root:
 
 ```powershell
-uv run python -m http.server 8080 --directory pastebin
+uv run --no-project python -m http.server 8000 --bind 127.0.0.1 --directory pastebin
 ```
 
-Open the isolated local site, configure the S3 endpoint, bucket and region, then
+Open `http://127.0.0.1:8000/`, configure the S3 endpoint, bucket and region, then
 enter publishing credentials. Text is uploaded as a `text/plain;charset=utf-8`
 Blob. File mode stores the original bytes; ZIP directory mode uses the signed
 `decompress-zip` extension and displays complete or partial extraction results.
@@ -127,6 +127,8 @@ output. Tune them for the deployment and keep `max_archive_bytes` no larger than
 the browser and reverse-proxy compressed upload limits. Proxy request buffering
 allows the ingress body limit to run before forwarding the upload.
 
+To cap the total storage used by a bucket, set its [ipfS3 bucket quota](../docs/bucket-quota.md). The server rejects an over-quota publication, including ZIP output, regardless of the settings in this page.
+
 ### Expiration
 
 The site never reads or replaces lifecycle rules. An operator should first get
@@ -155,8 +157,7 @@ lifecycle action does not start Kubo unpin or garbage collection.
 No package installation is needed. Run deterministic module tests with:
 
 ```powershell
-node --test pastebin/tests
+node --test "pastebin/test/*.test.mjs"
 ```
 
-Real Kubo, signed S3 interoperability, anonymous-write rejection and public-read
-checks remain separate deployment integration tests.
+Open `test/publish.browser.html` on the static site to exercise native browser XML parsing. To include the live signed PUT and anonymous read tests, set `PASTEBIN_TEST_ENDPOINT`, `PASTEBIN_TEST_BUCKET`, `PASTEBIN_TEST_ACCESS_KEY` and `PASTEBIN_TEST_SECRET_KEY` for a dedicated public-read test bucket. The test publishes new objects.

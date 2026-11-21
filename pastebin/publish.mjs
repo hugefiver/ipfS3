@@ -1,20 +1,5 @@
 import { encodeS3Component, signPut } from './sigv4.mjs';
-
-function endpointOrigin(endpoint) {
-  const invalid = 'Use an HTTPS endpoint origin, or HTTP on localhost, 127.0.0.1 or [::1].';
-  const match = /^https?:\/\/([^/\s?#@\\%]+)\/?$/i.exec(endpoint);
-  if (!match || match[0] !== endpoint) throw new Error(invalid);
-
-  let url;
-  try {
-    url = new URL(endpoint);
-  } catch {
-    throw new Error(invalid);
-  }
-  const local = /^(?:localhost|127\.0\.0\.1|\[::1\])(?::\d+)?$/i.test(match[1]);
-  if (url.protocol === 'http:' && !local) throw new Error(invalid);
-  return url.origin;
-}
+import { instanceTarget } from './settings.js';
 
 function readCid(value) {
   const cid = value?.trim().replace(/^"([^"]+)"$/, '$1').trim();
@@ -42,7 +27,7 @@ async function uploadError(response) {
 }
 
 export async function publish({ mode, body, name, credentials }, config) {
-  const { endpoint, bucket, region, maxUploadBytes } = config;
+  const { maxUploadBytes } = config;
   if (globalThis.isSecureContext === false || !globalThis.crypto?.subtle) {
     throw new Error('Publishing requires a secure browser context with WebCrypto.');
   }
@@ -52,13 +37,7 @@ export async function publish({ mode, body, name, credentials }, config) {
   if (!name || /^\.{1,2}$/.test(name) || /[\/\\\x00-\x1f\x7f\uD800-\uDFFF]/u.test(name)) {
     throw new Error('Use a file name without path separators or control characters.');
   }
-  const origin = endpointOrigin(endpoint);
-  if (bucket?.trim() !== bucket || !/^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/.test(bucket ?? '')) {
-    throw new Error('Use a valid S3 bucket name.');
-  }
-  if (region?.trim() !== region || !/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(region ?? '')) {
-    throw new Error('Use a valid S3 region.');
-  }
+  const { endpoint: origin, bucket, region } = instanceTarget(config);
   if (!credentials?.accessKeyId || /[^!-~]|[/,]/.test(credentials.accessKeyId) ||
       !credentials.secretAccessKey || (credentials.sessionToken && /[^!-~]/.test(credentials.sessionToken))) {
     throw new Error('Enter valid S3 credentials.');
@@ -109,71 +88,53 @@ export async function publish({ mode, body, name, credentials }, config) {
   return { ...result, cid, rootStatus, ...readZipResult(xml, key, prefix, rootStatus) };
 }
 
-const xmlEscapes = { '&amp;': '&', '&lt;': '<', '&gt;': '>', '&quot;': '"', '&apos;': "'" };
-
-// Decode only the gateway's v1 result format, without interpreting arbitrary XML markup.
 function readZipResult(source, key, prefix, rootStatus) {
-  const xml = source.trim();
+  const doc = new DOMParser().parseFromString(source, 'application/xml');
+  const root = doc.documentElement;
   const invalid = new Error('The ZIP was stored, but its extraction result was incomplete or invalid.');
-  let offset = 0;
+  if (root.tagName !== 'DecompressZipResult' || doc.querySelector('parsererror')) throw invalid;
 
-  function tag(name) {
-    const expected = `<${name}>`;
-    if (!xml.startsWith(expected, offset)) throw invalid;
-    offset += expected.length;
+  function child(parent, name) {
+    const matches = parent.querySelectorAll(`:scope > ${name}`);
+    if (matches.length !== 1) throw invalid;
+    return matches[0];
   }
 
-  function text(name) {
-    tag(name);
-    const end = xml.indexOf('<', offset);
-    if (end < 0) throw invalid;
-    const value = xml.slice(offset, end).replace(/&(?:amp;|lt;|gt;|quot;|apos;)?/g, entity => {
-      if (entity === '&') throw invalid;
-      return xmlEscapes[entity];
-    });
-    offset = end;
-    tag(`/${name}`);
-    return value;
+  function text(parent, name) {
+    const element = child(parent, name);
+    if (element.childElementCount) throw invalid;
+    return element.textContent;
   }
 
-  function size(name) {
-    const value = text(name);
+  function size(parent, name) {
+    const value = text(parent, name).trim();
     const number = Number(value);
     if (!/^\d+$/.test(value) || !Number.isSafeInteger(number)) throw invalid;
     return number;
   }
 
   function list(name, item, parse) {
-    tag(name);
-    const entries = [];
-    while (xml.startsWith(`<${item}>`, offset)) {
-      tag(item);
-      entries.push(parse());
-      tag(`/${item}`);
-    }
-    tag(`/${name}`);
-    return entries;
+    return Array.from(child(root, name).children, element => {
+      if (element.tagName !== item) throw invalid;
+      return parse(element);
+    });
   }
 
-  const declaration = '<?xml version="1.0" encoding="UTF-8"?>';
-  if (xml.startsWith(declaration)) offset = declaration.length;
-  tag('DecompressZipResult');
-  if (text('ArchiveKey') !== key) throw invalid;
-  const archiveCid = readCid(text('ArchiveETag'));
-  size('ArchiveSize');
-  const extractedCount = size('ExtractedCount');
-  const failedCount = size('FailedCount');
-  const entries = list('Entries', 'Entry', () => {
-    const key = text('Key');
-    const cid = readCid(text('ETag'));
+  if (text(root, 'ArchiveKey') !== key) throw invalid;
+  const archiveCid = readCid(text(root, 'ArchiveETag'));
+  size(root, 'ArchiveSize');
+  const extractedCount = size(root, 'ExtractedCount');
+  const failedCount = size(root, 'FailedCount');
+  const entries = list('Entries', 'Entry', entry => {
+    const key = text(entry, 'Key');
+    const cid = readCid(text(entry, 'ETag'));
     if (!key.startsWith(prefix) || !cid) throw invalid;
-    return { key, cid, size: size('Size') };
+    return { key, cid, size: size(entry, 'Size') };
   });
-  const failures = list('Failures', 'Failure', () => ({
-    name: text('EntryName'), code: text('Code'), message: text('Message'),
+  const failures = list('Failures', 'Failure', failure => ({
+    name: text(failure, 'EntryName'), code: text(failure, 'Code'), message: text(failure, 'Message'),
   }));
-  tag('/DecompressZipResult');
-  if (offset !== xml.length || !archiveCid || !entries.length || entries.length !== extractedCount ||
+  if (!archiveCid || !entries.length || entries.length !== extractedCount ||
       failures.length !== failedCount || (rootStatus === 'partial') !== (failedCount > 0)) throw invalid;
   return { archiveCid, entries, failures };
 }
