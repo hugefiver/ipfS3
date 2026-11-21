@@ -1716,6 +1716,8 @@ pub async fn copy_object(
 
 use crate::store::object::ListingObject;
 
+mod directory_cid;
+
 struct ListingRequest<'a> {
     bucket: &'a str,
     prefix: &'a str,
@@ -1861,6 +1863,14 @@ async fn listing_dtos<C: sea_orm::ConnectionTrait>(
         })
         .collect::<Vec<_>>();
     let classes = super::storage_class::classes_in_snapshot(db, &objects).await?;
+    Ok(listing_fields(entries, url_encode, &classes))
+}
+
+fn listing_fields(
+    entries: &[ListingEntry],
+    url_encode: bool,
+    classes: &HashMap<String, crate::residency::StorageClass>,
+) -> (Vec<Object>, Vec<CommonPrefix>) {
     let mut contents = Vec::new();
     let mut common_prefixes = Vec::new();
 
@@ -1882,7 +1892,7 @@ async fn listing_dtos<C: sea_orm::ConnectionTrait>(
         }
     }
 
-    Ok((contents, common_prefixes))
+    (contents, common_prefixes)
 }
 
 pub async fn list_objects(
@@ -1950,21 +1960,31 @@ pub async fn list_objects_v2(
         .filter(|value| !value.is_empty())
         .or_else(|| start_after.as_deref().filter(|value| !value.is_empty()));
     let txn = super::storage_class::begin_read_snapshot(state.store.db()).await?;
-    let (page, contents, common_prefixes) = listing_page_in_snapshot(
-        &txn,
-        ListingRequest {
-            bucket: &bucket,
-            prefix: prefix.as_deref().unwrap_or(""),
-            delimiter: delimiter.as_deref(),
-            cursor,
-            max_keys,
-        },
-        url_encode,
-    )
-    .await?;
+    let (scope, _) = access::existing_bucket_scope(state, &txn, &req, &bucket).await?;
+    let listing = ListingRequest {
+        bucket: &bucket,
+        prefix: prefix.as_deref().unwrap_or(""),
+        delimiter: delimiter.as_deref(),
+        cursor,
+        max_keys,
+    };
+    access::authorize_scope(
+        &scope,
+        Action::ListObjectsV2,
+        Resource::Prefix(listing.prefix),
+    )?;
+    let mut manifest = None;
+    let (page, contents, common_prefixes) = if directory_cid::requested(&req)? {
+        let (page, files, classes) = directory_cid::snapshot(&txn, listing, &scope).await?;
+        manifest = Some(files);
+        let (contents, prefixes) = listing_fields(&page.entries, url_encode, &classes);
+        (page, contents, prefixes)
+    } else {
+        listing_page_in_snapshot(&txn, listing, url_encode).await?
+    };
     txn.commit().await.map_err(crate::error::AppError::from)?;
 
-    Ok(S3Response::new(ListObjectsV2Output {
+    let mut response = S3Response::new(ListObjectsV2Output {
         contents: Some(contents),
         common_prefixes: (!common_prefixes.is_empty()).then_some(common_prefixes),
         is_truncated: Some(page.is_truncated),
@@ -1981,7 +2001,14 @@ pub async fn list_objects_v2(
         encoding_type,
         start_after: project_optional_listing_field(start_after, url_encode),
         ..Default::default()
-    }))
+    });
+    if let Some(files) = manifest {
+        response.headers.insert(
+            "x-ipfs3-directory-cid",
+            directory_cid::build_header(&state.kubo, &files).await?,
+        );
+    }
+    Ok(response)
 }
 
 /// Determine the common prefix for `key` under `prefix` and `delimiter`.

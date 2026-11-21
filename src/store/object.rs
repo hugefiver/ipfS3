@@ -335,13 +335,13 @@ pub(super) fn key_prefix(backend: DatabaseBackend, prefix: &str) -> sea_orm::Con
     range
 }
 
-pub async fn list<C: ConnectionTrait>(
-    db: &C,
+pub(crate) fn listing_query(
+    backend: DatabaseBackend,
     bucket: &str,
     prefix: Option<&str>,
     continuation_token: Option<&str>,
     max_keys: u64,
-) -> AppResult<Vec<ListingObject>> {
+) -> sea_orm::Select<object::Entity> {
     let mut query = object::Entity::find()
         .select_only()
         .columns([
@@ -357,7 +357,7 @@ pub async fn list<C: ConnectionTrait>(
         .filter(object::Column::IsLatest.eq(true));
 
     if let Some(pfx) = prefix {
-        query = query.filter(key_prefix(db.get_database_backend(), pfx));
+        query = query.filter(key_prefix(backend, pfx));
     }
 
     if let Some(token) = continuation_token
@@ -366,14 +366,26 @@ pub async fn list<C: ConnectionTrait>(
         query = query.filter(object::Column::Key.gt(token));
     }
 
-    let objects = query
-        .order_by_asc(object::Column::Key)
-        .limit(max_keys)
-        .into_model::<ListingObject>()
-        .all(db)
-        .await?;
+    query.order_by_asc(object::Column::Key).limit(max_keys)
+}
 
-    Ok(objects)
+pub async fn list<C: ConnectionTrait>(
+    db: &C,
+    bucket: &str,
+    prefix: Option<&str>,
+    continuation_token: Option<&str>,
+    max_keys: u64,
+) -> AppResult<Vec<ListingObject>> {
+    Ok(listing_query(
+        db.get_database_backend(),
+        bucket,
+        prefix,
+        continuation_token,
+        max_keys,
+    )
+    .into_model::<ListingObject>()
+    .all(db)
+    .await?)
 }
 
 #[allow(dead_code)]

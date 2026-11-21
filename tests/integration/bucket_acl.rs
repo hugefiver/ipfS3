@@ -15,7 +15,7 @@ async fn bucket_defaults_compose_with_directory_grants_and_version_tags() {
     let cid = "QmBucketAclPayload";
     let kubo = start_kubo_harness(KuboScript::repeated_add(
         cid,
-        3,
+        4,
         HashMap::from([(cid.to_owned(), payload.to_vec())]),
     ))
     .await;
@@ -58,9 +58,9 @@ existing_tags = {{ hidden = 'yes' }}
     let server = start_gateway(state, default_import_coordinator()).await;
     let endpoint = &server.endpoint;
     owner_put(endpoint, "", &[], HeaderMap::new(), &[]).await;
-    for key in ["shared/doc", "plain", "marked"] {
+    for key in ["shared/doc", "plain", "marked", "shared/z"] {
         let mut headers = HeaderMap::new();
-        if key == "marked" {
+        if matches!(key, "marked" | "shared/z") {
             headers.insert("x-amz-tagging", "hidden=yes".parse().unwrap());
         }
         owner_put(endpoint, key, &[], headers, payload).await;
@@ -97,6 +97,28 @@ existing_tags = {{ hidden = 'yes' }}
     .await;
     assert_eq!(wrong_secret.status(), StatusCode::FORBIDDEN);
     assert_eq!(status(&marked).await, StatusCode::FORBIDDEN);
+    let directory = send_sigv4(
+        Method::GET,
+        endpoint,
+        BUCKET,
+        "",
+        &[
+            ("list-type", "2"),
+            ("prefix", "shared/"),
+            ("max-keys", "1"),
+            ("ipfs3-directory-cid", "true"),
+        ],
+        vec![],
+        HeaderMap::new(),
+        "test",
+    )
+    .await;
+    assert_eq!(
+        directory.status(),
+        StatusCode::FORBIDDEN,
+        "tag denial beyond the XML page"
+    );
+    assert!(!directory.headers().contains_key("x-ipfs3-directory-cid"));
     let listed = client
         .get(reader_url(endpoint, "", ""))
         .send()

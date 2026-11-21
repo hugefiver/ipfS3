@@ -289,14 +289,6 @@ impl S3 for S3Impl {
         &self,
         req: S3Request<ListObjectsV2Input>,
     ) -> S3Result<S3Response<ListObjectsV2Output>> {
-        authorize(
-            &self.state,
-            &req,
-            Action::ListObjectsV2,
-            Some(&req.input.bucket),
-            Resource::Prefix(req.input.prefix.as_deref().unwrap_or("")),
-        )
-        .await?;
         super::ops::object::list_objects_v2(&self.state, req).await
     }
 

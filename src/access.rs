@@ -105,6 +105,7 @@ async fn load_bucket_scope<'a>(
 
 async fn load_request_bucket_scope<'a, T>(
     state: &'a AppState,
+    db: &impl ConnectionTrait,
     req: &S3Request<T>,
     name: &str,
 ) -> S3Result<(Scope<'a>, Option<entities::bucket::Model>)> {
@@ -112,7 +113,7 @@ async fn load_request_bucket_scope<'a, T>(
     // Older embedded callers access unclassified buckets without installing an HTTP hook.
     let embedded_legacy =
         user.is_none() && !anonymous_http(req) && state.credentials.policies.is_empty();
-    Ok(load_bucket_scope(state, state.store.db(), user, name, embedded_legacy).await?)
+    Ok(load_bucket_scope(state, db, user, name, embedded_legacy).await?)
 }
 
 pub(crate) async fn request_bucket_scope<'a, T>(
@@ -120,16 +121,17 @@ pub(crate) async fn request_bucket_scope<'a, T>(
     req: &S3Request<T>,
     name: &str,
 ) -> S3Result<Scope<'a>> {
-    let (scope, _) = load_request_bucket_scope(state, req, name).await?;
+    let (scope, _) = load_request_bucket_scope(state, state.store.db(), req, name).await?;
     Ok(scope)
 }
 
-async fn existing_bucket_scope<'a, T>(
+pub(crate) async fn existing_bucket_scope<'a, T>(
     state: &'a AppState,
+    db: &impl ConnectionTrait,
     req: &S3Request<T>,
     name: &str,
 ) -> S3Result<(Scope<'a>, entities::bucket::Model)> {
-    let (scope, model) = load_request_bucket_scope(state, req, name).await?;
+    let (scope, model) = load_request_bucket_scope(state, db, req, name).await?;
     let model = model.ok_or_else(|| AppError::NoSuchBucket(name.to_owned()))?;
     Ok((scope, model))
 }
@@ -142,7 +144,7 @@ pub(crate) async fn scope<'a, T>(
     let Some(name) = bucket else {
         return service_scope(state, req, None);
     };
-    let (scope, _) = existing_bucket_scope(state, req, name).await?;
+    let (scope, _) = existing_bucket_scope(state, state.store.db(), req, name).await?;
     Ok(scope)
 }
 
@@ -167,12 +169,16 @@ pub(crate) async fn authorize_bucket<T>(
     name: &str,
     resource: Resource<'_>,
 ) -> S3Result<entities::bucket::Model> {
-    let (scope, model) = existing_bucket_scope(state, req, name).await?;
+    let (scope, model) = existing_bucket_scope(state, state.store.db(), req, name).await?;
     authorize_scope(&scope, action, resource)?;
     Ok(model)
 }
 
-fn authorize_scope(scope: &Scope<'_>, action: Action, resource: Resource<'_>) -> S3Result<()> {
+pub(crate) fn authorize_scope(
+    scope: &Scope<'_>,
+    action: Action,
+    resource: Resource<'_>,
+) -> S3Result<()> {
     if scope.allows(&Context {
         action,
         resource,

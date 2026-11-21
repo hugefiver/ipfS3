@@ -25,6 +25,9 @@ mod bucket_acl;
 #[path = "integration/common.rs"]
 mod common;
 
+#[path = "integration/directory_cid.rs"]
+mod directory_cid;
+
 #[path = "integration/encryption.rs"]
 mod encryption;
 

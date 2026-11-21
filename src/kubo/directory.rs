@@ -17,7 +17,7 @@ use crate::error::AppError;
 
 pub const MAX_DIRECTORY_BLOCK_BYTES: usize = 2 * 1024 * 1024;
 const SHARD_THRESHOLD_BYTES: usize = 256 * 1024;
-const MAX_FILES: usize = 10_000;
+pub(crate) const MAX_FILES: usize = 10_000;
 const MAX_MANIFEST_BYTES: usize = 64 * 1024 * 1024;
 const MAX_DEPTH: usize = 64;
 const MAX_RPC_RESPONSE_BYTES: usize = 64 * 1024;
@@ -25,7 +25,7 @@ const BUILD_DEADLINE: Duration = Duration::from_secs(300);
 const DIRECTORY_DATA: &[u8] = &[0x08, 0x01]; // protobuf UnixFS Data { Type: Directory (1) }
 static BUILD_SLOTS: Semaphore = Semaphore::const_new(4);
 
-/// One final published file, with a trusted, relative ZIP path and its original CID.
+/// One final published file, with its relative path and original CID.
 /// Duplicate winners must be resolved by the caller before invoking this builder.
 #[derive(Clone, Debug)]
 pub struct DirectoryFile {
@@ -224,19 +224,28 @@ pub(crate) async fn build_directory_capturing_candidate(
     })
 }
 
+pub(crate) async fn build_unpinned_directory(
+    kubo: &KuboClient,
+    files: &[DirectoryFile],
+) -> BuildResult<cid::Cid> {
+    tokio::time::timeout(
+        BUILD_DEADLINE,
+        build_root(kubo, files, &CancellationToken::new(), None),
+    )
+    .await
+    .map_err(|_| DirectoryBuildError::Deadline)?
+}
+
 async fn build(
     kubo: &KuboClient,
     files: &[DirectoryFile],
     cancel: &CancellationToken,
     candidate: &mut Option<DirectoryCandidate>,
 ) -> BuildResult<Option<DirectoryRoot>> {
-    if files.len() > MAX_FILES {
-        return Err(DirectoryBuildError::InvalidManifest);
-    }
     if files.is_empty() {
         return Ok(None);
     }
-    let root = build_root(kubo, files, cancel, candidate).await?;
+    let root = build_root(kubo, files, cancel, Some(candidate)).await?;
     let root_cid = root.to_string();
     let url = rpc_url(
         kubo,
@@ -298,8 +307,12 @@ async fn build_root(
     kubo: &KuboClient,
     files: &[DirectoryFile],
     cancel: &CancellationToken,
-    candidate: &mut Option<DirectoryCandidate>,
+    mut pin_candidate: Option<&mut Option<DirectoryCandidate>>,
 ) -> BuildResult<cid::Cid> {
+    if files.len() > MAX_FILES {
+        return Err(DirectoryBuildError::InvalidManifest);
+    }
+    let pin = pin_candidate.is_some();
     let _slot = acquire_slot(cancel).await?;
     let mut used_bytes = 0_usize;
     let mut paths = BTreeSet::<Vec<String>>::new();
@@ -370,21 +383,23 @@ async fn build_root(
         links.sort_by(|a, b| a.name.as_bytes().cmp(b.name.as_bytes()));
         // Establish identity before the root write, so cancellation immediately
         // after its complete response still leaves an attributable candidate.
-        let node_identity = if path.is_empty() {
+        let node_identity = if path.is_empty() && pin {
             Some(kubo.local_node_identity().await?)
         } else {
             None
         };
         let (cid, size) = if block_size(&links, DIRECTORY_DATA)?.0 > SHARD_THRESHOLD_BYTES {
-            put_shards(kubo, links, cancel).await?
+            put_shards(kubo, links, pin, cancel).await?
         } else {
-            put_node(kubo, &links, DIRECTORY_DATA, cancel).await?
+            put_node(kubo, &links, DIRECTORY_DATA, pin, cancel).await?
         };
         if path.is_empty() {
-            *candidate = Some(DirectoryCandidate {
-                cid: cid.to_string(),
-                node_identity: node_identity.expect("root identity captured before dag/put"),
-            });
+            if let (Some(candidate), Some(node_identity)) = (pin_candidate.take(), node_identity) {
+                *candidate = Some(DirectoryCandidate {
+                    cid: cid.to_string(),
+                    node_identity,
+                });
+            }
             root = Some(cid);
         } else {
             directories
@@ -596,6 +611,7 @@ fn block_size(links: &[Link], data: &[u8]) -> BuildResult<(usize, u64)> {
 async fn put_shards(
     kubo: &KuboClient,
     links: Vec<Link>,
+    pin: bool,
     cancel: &CancellationToken,
 ) -> BuildResult<(cid::Cid, u64)> {
     let shards = hamt::shards(links)?;
@@ -616,7 +632,7 @@ async fn put_shards(
             }
         }
         let data = hamt::data(&shard.bitmap);
-        built.push(put_node(kubo, &links, &data, cancel).await?);
+        built.push(put_node(kubo, &links, &data, pin, cancel).await?);
     }
     Ok(*built.last().expect("HAMT has a root"))
 }
@@ -625,6 +641,7 @@ async fn put_node(
     kubo: &KuboClient,
     links: &[Link],
     data: &[u8],
+    pin: bool,
     cancel: &CancellationToken,
 ) -> BuildResult<(cid::Cid, u64)> {
     let (length, cumulative) = block_size(links, data)?;
@@ -660,9 +677,7 @@ async fn put_node(
             ("input-codec", "dag-json"),
             ("store-codec", "dag-pb"),
             ("hash", "sha2-256"),
-            // Protect every emitted directory/HAMT block immediately, before
-            // the next RPC can race with GC. No per-file-leaf pin calls.
-            ("pin", "true"),
+            ("pin", if pin { "true" } else { "false" }),
         ],
     )?;
     let form = reqwest::multipart::Form::new().part(
