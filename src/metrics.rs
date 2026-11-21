@@ -1,6 +1,6 @@
 use std::{
     collections::BTreeMap,
-    fmt::Write as _,
+    fmt::{Display, Write as _},
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering::Relaxed},
@@ -38,7 +38,7 @@ impl Timing {
         self.count.fetch_add(1, Relaxed);
     }
 
-    fn render(&self, text: &mut String, name: &str, labels: &str) {
+    fn render(&self, text: &mut String, name: &str, labels: impl Display) {
         let count = self.count.load(Relaxed);
         if count != 0 {
             let seconds = self.micros.load(Relaxed) as f64 / 1_000_000.0;
@@ -144,7 +144,7 @@ impl Metrics {
                 self.requests[m][s].render(
                     &mut text,
                     REQUEST,
-                    &format!(r#"method="{method}",status_class="{class}""#),
+                    format_args!(r#"method="{method}",status_class="{class}""#),
                 );
             }
         }
@@ -170,7 +170,7 @@ impl Metrics {
         }
         writeln!(text, "# TYPE {WAIT} summary").unwrap();
         for (pin, a, labels) in series() {
-            pin.wait[a].render(&mut text, WAIT, &labels);
+            pin.wait[a].render(&mut text, WAIT, labels);
         }
         writeln!(text, "# TYPE {PROVIDER} summary").unwrap();
         for (pin, a, labels) in series() {
@@ -178,7 +178,7 @@ impl Metrics {
                 pin.provider[a][o].render(
                     &mut text,
                     PROVIDER,
-                    &format!(r#"{labels},outcome="{outcome}""#),
+                    format_args!(r#"{labels},outcome="{outcome}""#),
                 );
             }
         }
@@ -188,7 +188,7 @@ impl Metrics {
                 pin.settlement[a][o].render(
                     &mut text,
                     SETTLE,
-                    &format!(r#"{labels},outcome="{outcome}""#),
+                    format_args!(r#"{labels},outcome="{outcome}""#),
                 );
             }
         }
