@@ -11,6 +11,7 @@ struct DirectoryObject {
     #[sea_orm(nested)]
     listing: ListingObject,
     encrypted: bool,
+    has_current_version: bool,
 }
 
 pub(super) fn requested(req: &S3Request<ListObjectsV2Input>) -> S3Result<bool> {
@@ -67,6 +68,13 @@ pub(super) async fn snapshot(
         MAX_FILES as u64 + 1,
     )
     .column(object::Column::Encrypted)
+    .column_as(
+        sea_orm::sea_query::Expr::cust(
+            "EXISTS (SELECT 1 FROM object_versions v WHERE v.bucket = objects.bucket \
+             AND v.key = objects.key AND v.is_latest AND v.kind = 'object' AND v.object_id = objects.id)",
+        ),
+        "has_current_version",
+    )
     .into_model::<DirectoryObject>()
     .all(db)
     .await
@@ -84,6 +92,12 @@ pub(super) async fn snapshot(
         ));
     }
     authorize_files(db, scope, &rows).await?;
+    if rows.iter().any(|row| !row.has_current_version) {
+        return Err(s3s::s3_error!(
+            NoSuchKey,
+            "directory contains an object without a matching current version"
+        ));
+    }
     if rows.iter().any(|row| row.encrypted) {
         return Err(s3s::s3_error!(
             InvalidRequest,

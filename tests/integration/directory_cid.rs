@@ -110,6 +110,58 @@ async fn directory_rejects_unsigned_invalid_and_unrepresentable_snapshots() {
 }
 
 #[tokio::test]
+async fn directory_rejects_a_latest_projection_without_a_current_version() {
+    let h = start_harness().await;
+    let key = "legacy/a";
+    ipfs_s3_gateway::store::object::upsert(
+        h.state.store.db(),
+        "orphan",
+        &h.bucket,
+        key,
+        LEAF,
+        0,
+        None,
+        LEAF,
+        None,
+        false,
+        None,
+        None,
+        false,
+    )
+    .await
+    .unwrap();
+    h.publish_plain_object("legacy/b", LEAF, 0).await;
+    let ordinary = list(&h.endpoint, &h.bucket, "legacy/", &[]).await;
+    assert_eq!(ordinary.status(), StatusCode::OK);
+    assert_eq!(
+        crate::common::xml_text(&ordinary.text().await.unwrap(), "Key").as_deref(),
+        Some(key)
+    );
+    let get = send_sigv4(
+        Method::GET,
+        &h.endpoint,
+        &h.bucket,
+        key,
+        &[],
+        vec![],
+        HeaderMap::new(),
+        "test",
+    )
+    .await;
+    assert_eq!(
+        crate::common::xml_text(&get.text().await.unwrap(), "Code").as_deref(),
+        Some("NoSuchKey")
+    );
+    let directory = list(&h.endpoint, &h.bucket, "legacy/", &[FLAG]).await;
+    assert!(!directory.headers().contains_key(HEADER));
+    assert_eq!(
+        crate::common::xml_text(&directory.text().await.unwrap(), "Code").as_deref(),
+        Some("NoSuchKey")
+    );
+    assert_eq!(h.kubo_request_count().await, 0);
+}
+
+#[tokio::test]
 async fn signed_directory_is_complete_beyond_xml_page_without_pinning() {
     let h = start_harness().await;
     for key in ["p/a", "p/目录/猫", "P/outside"] {
