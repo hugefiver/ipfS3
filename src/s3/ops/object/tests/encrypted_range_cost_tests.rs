@@ -49,13 +49,8 @@ async fn measure_range(
         observed.fetch_add(chunk.len() as u64, Ordering::Relaxed);
         Ok::<_, std::io::Error>(chunk)
     });
-    let mut body = encrypted_object_body(
-        input,
-        key,
-        Some(encrypted_range),
-        None,
-        "authentication failed",
-    );
+    let mut body =
+        encrypted_object_body(input, key, Some(encrypted_range), "authentication failed");
     let started = Instant::now();
     let mut first_byte = None;
     let mut first_byte_read_bytes = 0;

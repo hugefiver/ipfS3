@@ -691,48 +691,23 @@ fn encrypted_object_body<S>(
     cat: S,
     key: Arc<crate::crypto::ObjectKey>,
     range: Option<EncryptedRange>,
-    empty_range_end: Option<u64>,
     authentication_error: &'static str,
 ) -> StreamingBlob
 where
     S: Stream<Item = Result<Bytes, std::io::Error>> + Send + Sync + Unpin + 'static,
 {
-    let stream = async_stream::stream! {
-        let decrypted = match range {
-            Some(range) => range.decrypt(cat, key).left_stream(),
-            None => decrypt_chunk_stream(cat, key).right_stream(),
-        };
-        tokio::pin!(decrypted);
-        let mut discard_remaining = empty_range_end;
-        while let Some(chunk) = decrypted.next().await {
-            match chunk {
-                Ok(bytes) => match &mut discard_remaining {
-                    Some(remaining) => *remaining = remaining.saturating_sub(bytes.len() as u64),
-                    None => yield Ok(bytes),
-                },
-                Err(crate::error::AppError::Crypto(_)) => {
-                    yield Err(std::io::Error::new(
-                        std::io::ErrorKind::PermissionDenied,
-                        authentication_error,
-                    ));
-                    return;
-                }
-                Err(_) => {
-                    yield Err(std::io::Error::other(
-                        crate::error::INTERNAL_STORAGE_BACKEND_ERROR,
-                    ));
-                    return;
-                }
-            }
-        }
-        if discard_remaining.is_some_and(|remaining| remaining != 0) {
-            yield Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                crate::error::INTERNAL_STORAGE_BACKEND_ERROR,
-            ));
-        }
+    use futures_util::TryStreamExt;
+
+    let decrypted = match range {
+        Some(range) => range.decrypt(cat, key).left_stream(),
+        None => decrypt_chunk_stream(cat, key).right_stream(),
     };
-    StreamingBlob::wrap(stream)
+    StreamingBlob::wrap(decrypted.map_err(move |err| match err {
+        AppError::Crypto(_) => {
+            std::io::Error::new(std::io::ErrorKind::PermissionDenied, authentication_error)
+        }
+        _ => std::io::Error::other(crate::error::INTERNAL_STORAGE_BACKEND_ERROR),
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -1107,8 +1082,7 @@ pub async fn get_object(
         let ciphertext_bounds = range.as_ref().map(EncryptedRange::ciphertext_bounds);
         let cat = crate::kubo::cat::stream_cat(&selected.read_client, &obj.cid, ciphertext_bounds)
             .await?;
-        let empty_range_end = (has_range && start == end).then_some(end);
-        encrypted_object_body(cat, key, range, empty_range_end, authentication_error)
+        encrypted_object_body(cat, key, range, authentication_error)
     } else {
         // Plaintext: stream directly from Kubo without collecting into memory.
         let kubo_range = if has_range { Some((start, end)) } else { None };
