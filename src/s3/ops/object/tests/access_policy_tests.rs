@@ -1,4 +1,5 @@
 mod download_redirect;
+mod rate_limits;
 mod signed;
 
 use super::*;

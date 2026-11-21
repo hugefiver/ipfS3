@@ -37,6 +37,18 @@ The choice is made before the redirect. A failure at the destination does not tr
 
 Redirects apply to plaintext `STANDARD` objects, including valid byte-range requests. The client must follow cross-host redirects and send the `Range` header to the destination for partial downloads. The destination serves its own HTTP headers; use `HeadObject` for S3 metadata. Encrypted objects, requests carrying an SSE-C key, and `STANDARD_IA` reads stay on the S3 gateway.
 
+For client-specific redirect behavior and when to choose `proxy` or `on_request`, see [S3 client compatibility](docs/client-compatibility.md#download-redirects).
+
+### Per-caller rate limits
+
+Use `[rate_limits.anonymous]` for unsigned clients and `[rate_limits.authenticated]` for signed users, as in [the example configuration](config.example.toml). Each section accepts independent positive request and download limits. Omitting a section leaves that group unlimited; omitting one field disables only that limit. Neither group inherits the other's settings. On each gateway instance, a signed user shares its quota across static credentials, temporary sessions and presigned requests. Unsigned requests share by client IP. Separate gateway replicas maintain separate quotas.
+
+If the gateway is reachable **only** through a reverse proxy, set `IPFS_S3_TRUST_PROXY_HEADERS=true` to trust the immediate peer without listing its address. For mixed direct and proxied access, leave it `false` (default) and list only your proxy addresses or CIDRs in `[rate_limits].trusted_proxies`. The gateway reads `X-Forwarded-For` from right to left, skipping trusted proxies; if all addresses are trusted, it uses the leftmost address. With no `X-Forwarded-For`, it accepts a single `X-Real-IP`. A missing or malformed address falls back to the TCP peer. At the public edge, overwrite client-supplied forwarding headers; list only networks reserved for your own proxies.
+
+`requests_per_second` allows a burst of one second's requests. Standard and custom S3 requests that pass authentication or anonymous admission consume one request, including redirected GETs. Excess requests immediately receive `503 SlowDown` with `Retry-After: 1`. Health, readiness, metrics, CORS preflight and background workers are outside the request quota. The bundled multi-gateway Nginx configuration treats GET/HEAD 503s as upstream failures and can retry on another replica. If the first replica's `SlowDown` should reach the client directly, omit `http_503` from `proxy_next_upstream` in `@safe_read`; this also disables failover on other 503s for those reads.
+
+`proxy_download_bytes_per_second` paces the combined object bytes returned by the caller's concurrent proxy downloads. A range costs its returned bytes, and an encrypted download costs its plaintext bytes. A redirect, HEAD or error response spends no download bandwidth.
+
 ## Hardening boundaries
 
 - **Mutation leases:** Standard content mutations use a 120-second database-clock
@@ -730,6 +742,7 @@ Configuration is loaded from `config.toml` (or path specified by `IPFS_S3_CONFIG
 | Env Var                     | Description                                 | Default                 |
 | --------------------------- | ------------------------------------------- | ----------------------- |
 | `IPFS_S3_CONFIG`            | Path to config file                         | `config.toml`           |
+| `IPFS_S3_TRUST_PROXY_HEADERS` | Trust the immediate reverse proxy's client-IP headers for anonymous rate limits | `false` |
 | `IPFS_S3_BIND`              | Bind address                                | `0.0.0.0:9000`          |
 | `IPFS_S3_KUBO_RPC_URL`      | Kubo RPC URL                                | `http://127.0.0.1:5001` |
 | `IPFS_S3_DATABASE_URL`      | Database URL                                | `sqlite::memory:`       |

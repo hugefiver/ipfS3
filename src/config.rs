@@ -1,9 +1,14 @@
-use std::{net::SocketAddr, time::Duration};
+use std::{
+    net::{IpAddr, SocketAddr},
+    num::{NonZeroU32, NonZeroU64},
+    time::Duration,
+};
 
 use crate::import::ImportConfig;
 use anyhow::ensure;
 use chrono::Duration as ChronoDuration;
-use serde::Deserialize;
+use ipnet::IpNet;
+use serde::{Deserialize, Deserializer, de};
 
 use crate::pinning::identity::PinningIdentityConfig;
 use crate::pinning::zip_policy::ZipOutputRuleConfig;
@@ -62,6 +67,45 @@ pub struct Config {
 
     #[serde(default)]
     pub download_redirect: Option<DownloadRedirectConfig>,
+
+    #[serde(default)]
+    pub rate_limits: RateLimits,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RateLimits {
+    pub anonymous: CallerLimits,
+    pub authenticated: CallerLimits,
+    #[serde(deserialize_with = "deserialize_trusted_proxies")]
+    pub trusted_proxies: Vec<IpNet>,
+    #[serde(skip)]
+    pub trust_proxy_headers: bool,
+}
+
+fn deserialize_trusted_proxies<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<IpNet>, D::Error> {
+    Vec::<String>::deserialize(deserializer)?
+        .into_iter()
+        .map(|value| {
+            value
+                .parse::<IpNet>()
+                .or_else(|_| value.parse::<IpAddr>().map(IpNet::from))
+                .map_err(|_| {
+                    de::Error::custom(format_args!(
+                        "invalid trusted proxy {value:?}: expected an IP address or CIDR"
+                    ))
+                })
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CallerLimits {
+    pub requests_per_second: Option<NonZeroU32>,
+    pub proxy_download_bytes_per_second: Option<NonZeroU64>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -453,6 +497,7 @@ impl Config {
             lifecycle: default_lifecycle_config(),
             decompress_zip: DecompressZipConfig::default(),
             download_redirect: None,
+            rate_limits: RateLimits::default(),
         }
     }
 
@@ -500,6 +545,11 @@ impl Config {
     {
         if let Some(bind) = get_env("IPFS_S3_BIND") {
             self.server.bind = bind.parse()?;
+        }
+        if let Some(value) = get_env("IPFS_S3_TRUST_PROXY_HEADERS") {
+            self.rate_limits.trust_proxy_headers = value.parse().map_err(|_| {
+                anyhow::anyhow!("IPFS_S3_TRUST_PROXY_HEADERS must be true or false")
+            })?;
         }
         if let Some(bind) = get_env("IPFS_S3_METRICS_BIND") {
             self.metrics.bind = Some(bind.parse()?);
@@ -617,6 +667,37 @@ mod tests {
                 .location("public", "logo.png", None, "bafyexample", false)
                 .as_deref(),
             Some("http://gateway.example/ipfs/bafyexample"),
+        );
+    }
+
+    #[test]
+    fn rate_limit_proxy_only_environment_trusts_the_immediate_peer() {
+        let mut cfg: Config =
+            toml::from_str("[rate_limits.anonymous]\nrequests_per_second = 1").unwrap();
+        let peer = "192.0.2.10".parse().unwrap();
+        let client = "198.51.100.3".parse().unwrap();
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            "203.0.113.7, 198.51.100.3".parse().unwrap(),
+        );
+        for (value, expected) in [(None, peer), (Some("true"), client), (Some("false"), peer)] {
+            cfg.apply_env_overrides(|name| {
+                if name == "IPFS_S3_TRUST_PROXY_HEADERS" {
+                    value.map(str::to_owned)
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+            let limiter = crate::rate_limit::RateLimiter::new(cfg.rate_limits.clone()).unwrap();
+            assert_eq!(limiter.anonymous_client_ip(peer, &headers, false), expected);
+        }
+        assert!(
+            cfg.apply_env_overrides(
+                |name| (name == "IPFS_S3_TRUST_PROXY_HEADERS").then(|| "bad".into())
+            )
+            .is_err()
         );
     }
 

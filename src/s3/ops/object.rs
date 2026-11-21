@@ -16,6 +16,7 @@ use crate::iam::{Action, Context, Decision, Resource, Scope};
 use crate::pinning::decision::{DecisionEffect, DecisionOrigin, ExtensionDecision, WarningCode};
 use crate::pinning::policy::{PublicationContext, PublicationPolicy};
 use crate::pinning::tags::{ObjectTag, PinControl};
+use crate::rate_limit::DownloadBudget;
 use crate::state::AppState;
 use crate::store::entities::object;
 use crate::store::object_version::{
@@ -1177,6 +1178,10 @@ pub async fn get_object(
     };
 
     let body = super::object_body::finish_get_body(body, end.saturating_sub(start)).await?;
+    let body = match req.extensions.get::<DownloadBudget>() {
+        Some(budget) => budget.wrap(body),
+        None => body,
+    };
     let content_length = end.saturating_sub(start) as i64;
     let content_range = if has_range {
         Some(format!(

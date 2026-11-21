@@ -6,6 +6,16 @@ bind = "0.0.0.0:9000"
 # [metrics]
 # bind = "127.0.0.1:9090"
 
+# Optional per-caller limits on each gateway instance. Omitted limits are unlimited.
+# [rate_limits]
+# trusted_proxies = ["127.0.0.1", "::1"]  # replace with your proxy addresses or CIDRs
+# [rate_limits.anonymous]       # per client IP
+# requests_per_second = 5
+# proxy_download_bytes_per_second = 1048576   # 1 MiB/s
+# [rate_limits.authenticated]   # per signed user, including that user's sessions
+# requests_per_second = 50
+# proxy_download_bytes_per_second = 10485760  # 10 MiB/s
+
 # Redirect matching plaintext STANDARD downloads to a path-style IPFS HTTP gateway.
 # Use a base URL without /ipfs; the gateway must be able to serve the selected CID.
 # [download_redirect]

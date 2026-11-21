@@ -21,6 +21,7 @@ pub mod kubo;
 pub mod lifecycle;
 pub mod metrics;
 pub mod pinning;
+pub mod rate_limit;
 pub mod residency;
 pub mod s3;
 pub mod state;

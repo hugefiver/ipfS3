@@ -1,29 +1,59 @@
 use super::super::{publish_versioned_read_object, versioned_read_state};
-use crate::config::DownloadRedirectConfig;
+use crate::config::{DownloadRedirectConfig, RateLimits};
+use crate::import::{ImportConfig, downloader::SourceDownloader, pipeline::ImportCoordinator};
+use crate::rate_limit::RateLimiter;
 use crate::s3::handler::S3Impl;
 use crate::s3::http::with_download_redirect;
+use crate::s3::route::gateway::GatewayRoute;
 use crate::s3::sigv4::{presign_sigv4_query, send_sigv4};
 use crate::state::AppState;
 use axum::error_handling::HandleError;
 use base64::Engine as _;
 use http::{HeaderMap, Method, StatusCode};
-use std::sync::Arc;
+use std::{net::SocketAddr, sync::Arc};
 
 pub(super) async fn serve_object_http(
     state: &Arc<AppState>,
     download_redirect: Option<DownloadRedirectConfig>,
 ) -> (String, tokio::task::JoinHandle<()>) {
+    serve_object_http_with_rate_limits(state, download_redirect, RateLimits::default()).await
+}
+
+pub(super) async fn serve_object_http_with_rate_limits(
+    state: &Arc<AppState>,
+    download_redirect: Option<DownloadRedirectConfig>,
+    rate_limits: RateLimits,
+) -> (String, tokio::task::JoinHandle<()>) {
+    let limiter = RateLimiter::new(rate_limits);
     let mut builder = s3s::service::S3ServiceBuilder::new(S3Impl::new(state.clone()));
     builder.set_auth(crate::auth::GatewayAuth::new(state.clone()));
     builder.set_access(crate::access::GatewayAccess(state.clone()));
+    if limiter.is_some() {
+        let config = ImportConfig::default().validate().unwrap();
+        let downloader = SourceDownloader::production(Arc::new(config.clone()));
+        let imports = ImportCoordinator::new(config, downloader);
+        builder.set_route(GatewayRoute::new(state.clone(), imports));
+    }
     let app = axum::Router::new().fallback_service(HandleError::new(
         builder.build(),
         |_: s3s::HttpError| async { StatusCode::INTERNAL_SERVER_ERROR },
     ));
     let app = with_download_redirect(app, download_redirect);
+    let app = if let Some(limiter) = limiter {
+        app.layer(axum::Extension(Arc::new(limiter)))
+    } else {
+        app
+    };
     let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}", socket.local_addr().unwrap());
-    let server = tokio::spawn(async move { axum::serve(socket, app).await.unwrap() });
+    let server = tokio::spawn(async move {
+        axum::serve(
+            socket,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap()
+    });
     (endpoint, server)
 }
 

@@ -211,6 +211,7 @@ services:
       - "127.0.0.1:${IPFS_S3_GATEWAY_PORT:?IPFS_S3_GATEWAY_PORT is required}:9000"
     environment:
       IPFS_S3_BIND: 0.0.0.0:9000
+      IPFS_S3_TRUST_PROXY_HEADERS: "${IPFS_S3_TRUST_PROXY_HEADERS:-false}"
       IPFS_S3_PUBLISHED_BIND: "${IPFS_S3_GATEWAY_BIND:?IPFS_S3_GATEWAY_BIND is required}"
       IPFS_S3_KUBO_RPC_URL: http://cluster-a:9095
       IPFS_S3_DATABASE_URL: "postgres://ipfs3:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432/ipfs3"

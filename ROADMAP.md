@@ -10,6 +10,7 @@
 - Multipart upload initiation, part upload and listing, completion and abort. Encrypted parts must use the same SSE-C key as the upload.
 - Bucket versioning (enable/suspend), `ListObjectVersions`, delete markers and exact-version operations.
 - Path-style bucket CORS. CORS and lifecycle configuration APIs honor `ExpectedBucketOwner` when supplied.
+- Optional [per-caller limits](README.md#per-caller-rate-limits) on S3 request rate and aggregate proxy download bandwidth. Redirected downloads count as requests only.
 
 ### Storage and background work
 
@@ -24,14 +25,7 @@
 
 ## Planned
 
-### Identity and request controls
-
-- Gateway request rate limits. Current dispatch limits apply to background pin providers, not S3 clients.
-- Audit logging for S3 requests and administrative changes.
-
 ### S3 and client extensions
 
 - S3 Select and tag-based search. Search can be eventually consistent and is separate from authorization.
-- Object event notifications via webhook for committed PUT and DELETE operations. Delivery work is tracked independently of request completion and settled by the destination's acknowledgment.
 - Static website hosting via IPFS Gateway and DNSLink.
-- Native rclone backend for gateway extensions, separate from rclone's existing S3 backend.

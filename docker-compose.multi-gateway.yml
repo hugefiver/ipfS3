@@ -42,6 +42,7 @@ services:
     image: ghcr.io/hugefiver/ipfs3:latest
     environment:
       IPFS_S3_BIND: 0.0.0.0:9000
+      IPFS_S3_TRUST_PROXY_HEADERS: "${IPFS_S3_TRUST_PROXY_HEADERS:-false}"
       IPFS_S3_KUBO_RPC_URL: http://kubo:5001
       IPFS_S3_DATABASE_URL: "postgres://ipfs3:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432/ipfs3"
       IPFS_S3_ACCESS_KEY_ID: "${IPFS_S3_ACCESS_KEY_ID:?IPFS_S3_ACCESS_KEY_ID is required}"
@@ -68,6 +69,7 @@ services:
     image: ghcr.io/hugefiver/ipfs3:latest
     environment:
       IPFS_S3_BIND: 0.0.0.0:9000
+      IPFS_S3_TRUST_PROXY_HEADERS: "${IPFS_S3_TRUST_PROXY_HEADERS:-false}"
       IPFS_S3_KUBO_RPC_URL: http://kubo:5001
       IPFS_S3_DATABASE_URL: "postgres://ipfs3:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432/ipfs3"
       IPFS_S3_ACCESS_KEY_ID: "${IPFS_S3_ACCESS_KEY_ID:?IPFS_S3_ACCESS_KEY_ID is required}"

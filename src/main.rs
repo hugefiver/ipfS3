@@ -1,20 +1,22 @@
 use std::{
     future::Future,
+    net::SocketAddr,
     sync::Arc,
     time::{Duration, Instant},
 };
 
-use axum::Router;
 use axum::error_handling::HandleError;
 use axum::extract::State;
 use axum::http::{Response as HttpResponse, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
+use axum::{Extension, Router};
 use ipfs_s3_gateway::auth::GatewayAuth;
-use ipfs_s3_gateway::config::{Config, DownloadRedirectConfig};
+use ipfs_s3_gateway::config::{Config, DownloadRedirectConfig, RateLimits};
 use ipfs_s3_gateway::import::{downloader::SourceDownloader, pipeline::ImportCoordinator};
 use ipfs_s3_gateway::lifecycle::worker::start_worker_with_tiers;
 use ipfs_s3_gateway::metrics::Metrics;
+use ipfs_s3_gateway::rate_limit::RateLimiter;
 use ipfs_s3_gateway::residency::backfill::start_worker as start_residency_backfill_worker;
 use ipfs_s3_gateway::s3;
 use ipfs_s3_gateway::s3::handler::S3Impl;
@@ -120,7 +122,7 @@ async fn handle_s3_error(_err: HttpError) -> HttpResponse<S3Body> {
 
 #[cfg(test)]
 fn gateway_app(state: Arc<AppState>, imports: Arc<ImportCoordinator>) -> Router {
-    gateway_app_with_root_default(state, imports, true, None, None)
+    gateway_app_with_root_default(state, imports, true, None, None, RateLimits::default())
 }
 
 fn gateway_app_with_root_default(
@@ -129,6 +131,7 @@ fn gateway_app_with_root_default(
     root_default: bool,
     metrics: Option<Arc<Metrics>>,
     download_redirect: Option<DownloadRedirectConfig>,
+    rate_limits: RateLimits,
 ) -> Router {
     let s3_impl = S3Impl::new(state.clone());
     let gateway_auth = GatewayAuth::new(state.clone());
@@ -146,10 +149,15 @@ fn gateway_app_with_root_default(
         builder.build()
     };
 
-    let app = Router::new()
+    let app = Router::new().fallback_service(HandleError::new(s3_service, handle_s3_error));
+    let app = if let Some(limiter) = RateLimiter::new(rate_limits) {
+        app.layer(Extension(Arc::new(limiter)))
+    } else {
+        app
+    };
+    let app = app
         .route("/health", get(health_check))
         .route("/ready", get(ready_handler))
-        .fallback_service(HandleError::new(s3_service, handle_s3_error))
         .with_state(state.clone());
     let app = s3::http::with_download_redirect(app, download_redirect)
         .layer(axum::middleware::from_fn(
@@ -205,6 +213,7 @@ async fn run_gateway() -> anyhow::Result<()> {
         cfg.decompress_zip.unixfs_directory_root,
         metrics.clone(),
         cfg.download_redirect,
+        cfg.rate_limits,
     );
 
     let signal = shutdown::ShutdownSignal::install()?;
@@ -233,8 +242,11 @@ async fn run_gateway() -> anyhow::Result<()> {
         state.kubo.clone(),
         shutdown.child_token(),
     );
-    let server =
-        axum::serve(listener, app).with_graceful_shutdown(shutdown.clone().cancelled_owned());
+    let server = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown.clone().cancelled_owned());
     let metrics_shutdown = shutdown.clone();
     let servers = async move {
         let scrape = async move {
