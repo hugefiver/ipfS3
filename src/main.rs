@@ -11,7 +11,7 @@ use axum::http::{Response as HttpResponse, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use ipfs_s3_gateway::auth::GatewayAuth;
-use ipfs_s3_gateway::config::Config;
+use ipfs_s3_gateway::config::{Config, DownloadRedirectConfig};
 use ipfs_s3_gateway::import::{downloader::SourceDownloader, pipeline::ImportCoordinator};
 use ipfs_s3_gateway::lifecycle::worker::start_worker_with_tiers;
 use ipfs_s3_gateway::metrics::Metrics;
@@ -120,7 +120,7 @@ async fn handle_s3_error(_err: HttpError) -> HttpResponse<S3Body> {
 
 #[cfg(test)]
 fn gateway_app(state: Arc<AppState>, imports: Arc<ImportCoordinator>) -> Router {
-    gateway_app_with_root_default(state, imports, true, None)
+    gateway_app_with_root_default(state, imports, true, None, None)
 }
 
 fn gateway_app_with_root_default(
@@ -128,6 +128,7 @@ fn gateway_app_with_root_default(
     imports: Arc<ImportCoordinator>,
     root_default: bool,
     metrics: Option<Arc<Metrics>>,
+    download_redirect: Option<DownloadRedirectConfig>,
 ) -> Router {
     let s3_impl = S3Impl::new(state.clone());
     let gateway_auth = GatewayAuth::new(state.clone());
@@ -149,15 +150,16 @@ fn gateway_app_with_root_default(
         .route("/health", get(health_check))
         .route("/ready", get(ready_handler))
         .fallback_service(HandleError::new(s3_service, handle_s3_error))
+        .with_state(state.clone());
+    let app = s3::http::with_download_redirect(app, download_redirect)
         .layer(axum::middleware::from_fn(
             s3::http::bridge_chunked_content_length,
         ))
         .layer(axum::middleware::from_fn(telemetry::record_request_status))
         .layer(axum::middleware::from_fn_with_state(
-            state.clone(),
+            state,
             ipfs_s3_gateway::cors::http::bucket_cors,
-        ))
-        .with_state(state);
+        ));
     if let Some(metrics) = metrics {
         app.layer(axum::middleware::from_fn_with_state(
             metrics,
@@ -202,6 +204,7 @@ async fn run_gateway() -> anyhow::Result<()> {
         imports.clone(),
         cfg.decompress_zip.unixfs_directory_root,
         metrics.clone(),
+        cfg.download_redirect,
     );
 
     let signal = shutdown::ShutdownSignal::install()?;

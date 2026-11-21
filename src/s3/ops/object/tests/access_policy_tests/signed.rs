@@ -1,9 +1,31 @@
 use super::super::{publish_versioned_read_object, versioned_read_state};
+use crate::config::DownloadRedirectConfig;
+use crate::s3::handler::S3Impl;
+use crate::s3::http::with_download_redirect;
 use crate::s3::sigv4::{presign_sigv4_query, send_sigv4};
+use crate::state::AppState;
 use axum::error_handling::HandleError;
 use base64::Engine as _;
 use http::{HeaderMap, Method, StatusCode};
 use std::sync::Arc;
+
+pub(super) async fn serve_object_http(
+    state: &Arc<AppState>,
+    download_redirect: Option<DownloadRedirectConfig>,
+) -> (String, tokio::task::JoinHandle<()>) {
+    let mut builder = s3s::service::S3ServiceBuilder::new(S3Impl::new(state.clone()));
+    builder.set_auth(crate::auth::GatewayAuth::new(state.clone()));
+    builder.set_access(crate::access::GatewayAccess(state.clone()));
+    let app = axum::Router::new().fallback_service(HandleError::new(
+        builder.build(),
+        |_: s3s::HttpError| async { StatusCode::INTERNAL_SERVER_ERROR },
+    ));
+    let app = with_download_redirect(app, download_redirect);
+    let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", socket.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(socket, app).await.unwrap() });
+    (endpoint, server)
+}
 
 #[tokio::test]
 async fn signed_copy_batch_delete_and_presigned_lists_obey_literal_object_scope() {
@@ -36,17 +58,7 @@ async fn signed_copy_batch_delete_and_presigned_lists_obey_literal_object_scope(
         };
         publish_versioned_read_object(&state, id, key, "QmExample", false, None, None, tags).await;
     }
-    let mut builder =
-        s3s::service::S3ServiceBuilder::new(crate::s3::handler::S3Impl::new(state.clone()));
-    builder.set_auth(crate::auth::GatewayAuth::new(state.clone()));
-    builder.set_access(crate::access::GatewayAccess(state.clone()));
-    let app = axum::Router::new().fallback_service(HandleError::new(
-        builder.build(),
-        |_: s3s::HttpError| async { StatusCode::INTERNAL_SERVER_ERROR },
-    ));
-    let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let endpoint = format!("http://{}", socket.local_addr().unwrap());
-    let server = tokio::spawn(async move { axum::serve(socket, app).await.unwrap() });
+    let (endpoint, server) = serve_object_http(&state, None).await;
 
     for mut query in [vec![], vec![("list-type", "2")], vec![("versions", "")]] {
         query.push(("prefix", "Team_%/"));

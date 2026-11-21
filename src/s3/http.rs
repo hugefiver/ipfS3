@@ -4,6 +4,36 @@ use axum::middleware::Next;
 use axum::response::Response;
 use http::header::CONTENT_LENGTH;
 
+#[derive(Clone)]
+pub(crate) struct DownloadLocation(pub http::HeaderValue);
+
+pub fn with_download_redirect(
+    app: axum::Router,
+    config: Option<crate::config::DownloadRedirectConfig>,
+) -> axum::Router {
+    let Some(config) = config.map(std::sync::Arc::new) else {
+        return app;
+    };
+    app.layer(axum::middleware::from_fn(
+        move |mut req: Request, next: Next| {
+            if req.method() == http::Method::GET {
+                req.extensions_mut().insert(config.clone());
+            }
+            async move {
+                let mut response = next.run(req).await;
+                // s3s serializes GetObject as 200/206 but preserves response extensions.
+                if let Some(DownloadLocation(location)) = response.extensions_mut().remove() {
+                    *response.status_mut() = http::StatusCode::TEMPORARY_REDIRECT;
+                    response
+                        .headers_mut()
+                        .insert(http::header::LOCATION, location);
+                }
+                response
+            }
+        },
+    ))
+}
+
 /// Rejects browser forms, then bridges decoded or proven-empty POST lengths.
 ///
 /// `x-amz-decoded-content-length` is part of the signed request and gives s3s

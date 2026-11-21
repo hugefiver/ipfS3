@@ -6,6 +6,23 @@ bind = "0.0.0.0:9000"
 # [metrics]
 # bind = "127.0.0.1:9090"
 
+# Redirect matching plaintext STANDARD downloads to a path-style IPFS HTTP gateway.
+# Use a base URL without /ipfs; the gateway must be able to serve the selected CID.
+# [download_redirect]
+# gateway_url = "https://ipfs.example.com"
+# [[download_redirect.rules]]
+# bucket = "releases"
+# prefix = "public/"
+# filename_glob = "*.zip"   # matches the filename, not the directory
+# anonymous = true          # only unsigned requests that already have read access
+# mode = "redirect"         # default: redirect; client can still request proxy
+# [[download_redirect.rules]]
+# user = "build-bot"
+# mode = "on_request"       # redirect only for X-IPFS3-Download-Gateway: prefer or require
+# [[download_redirect.rules]]
+# filename_glob = "*.manifest"
+# mode = "proxy"            # always stream through S3; overrides other rules
+
 [kubo]
 rpc_url = "http://127.0.0.1:5001"
 

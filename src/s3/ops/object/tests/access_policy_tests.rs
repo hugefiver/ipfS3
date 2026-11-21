@@ -1,3 +1,4 @@
+mod download_redirect;
 mod signed;
 
 use super::*;

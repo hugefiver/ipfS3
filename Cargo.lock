@@ -1843,6 +1843,7 @@ dependencies = [
  "cid",
  "futures-io",
  "futures-util",
+ "glob",
  "hex",
  "hmac 0.13.0",
  "http",

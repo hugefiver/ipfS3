@@ -1053,9 +1053,10 @@ pub async fn get_object(
 ) -> S3Result<S3Response<GetObjectOutput>> {
     let bucket = &req.input.bucket;
     let key = &req.input.key;
+    let scope = access::request_bucket_scope(state, &req, bucket).await?;
     let selected = select_s3_object(
         state,
-        &access::request_bucket_scope(state, &req, bucket).await?,
+        &scope,
         Action::GetObject,
         bucket,
         key,
@@ -1087,7 +1088,62 @@ pub async fn get_object(
         .map_err(|_| s3s::s3_error!(InternalError, "negative stored object size"))?;
     let (start, end) = resolve_range(range_ref, total_size)?;
 
-    // Build the response body stream.
+    const GATEWAY_HEADER: &str = "x-ipfs3-download-gateway";
+    let preference = req
+        .headers
+        .get(GATEWAY_HEADER)
+        .map(http::HeaderValue::as_bytes);
+    let requested = match preference {
+        Some(b"require" | b"prefer") => true,
+        None | Some(b"proxy") => false,
+        _ => {
+            return Err(s3s::s3_error!(
+                InvalidArgument,
+                "expected prefer, require or proxy for X-IPFS3-Download-Gateway"
+            ));
+        }
+    };
+    let vary = http::HeaderValue::from_static(
+        "X-IPFS3-Download-Gateway, Authorization, X-Amz-Server-Side-Encryption-Customer-Key",
+    );
+    let customer_key = req
+        .headers
+        .contains_key("x-amz-server-side-encryption-customer-key");
+    if let Some(redirect) = req
+        .extensions
+        .get::<Arc<crate::config::DownloadRedirectConfig>>()
+        && preference != Some(b"proxy")
+        && !obj.encrypted
+        && selected.residency.storage_class == crate::residency::model::StorageClass::Standard
+        && !customer_key
+        && let Some(location) = redirect.location(
+            bucket,
+            key,
+            access::subject(state, &req)?,
+            &obj.cid,
+            requested,
+        )
+    {
+        let mut response = S3Response::new(GetObjectOutput::default());
+        response
+            .extensions
+            .insert(crate::s3::http::DownloadLocation(
+                location
+                    .parse()
+                    .map_err(|_| s3s::s3_error!(InternalError, "invalid redirect location"))?,
+            ));
+        response.headers.insert(http::header::VARY, vary);
+        return Ok(response);
+    }
+    if preference == Some(b"require") {
+        let mut error = s3s::S3Error::with_message(
+            s3s::S3ErrorCode::Custom("NotAcceptable".into()),
+            "IPFS gateway download is not available for this request",
+        );
+        error.set_status_code(http::StatusCode::NOT_ACCEPTABLE);
+        return Err(error);
+    }
+
     let body: StreamingBlob = if obj.encrypted {
         // Resolve the object key used for decryption.
         let (key, authentication_error) = if let Some(wrapped) = obj.key_wrap.as_ref() {
@@ -1109,7 +1165,6 @@ pub async fn get_object(
             .await?;
         encrypted_object_body(cat, key, range, authentication_error)
     } else {
-        // Plaintext: stream directly from Kubo without collecting into memory.
         let kubo_range = if has_range { Some((start, end)) } else { None };
         let cat = crate::kubo::cat::stream_cat(&selected.read_client, &obj.cid, kubo_range).await?;
         let stream = async_stream::stream! {
@@ -1140,7 +1195,7 @@ pub async fn get_object(
         None
     };
 
-    Ok(S3Response::new(GetObjectOutput {
+    let mut response = S3Response::new(GetObjectOutput {
         body: Some(body),
         content_length: Some(content_length),
         content_type: obj.content_type.clone(),
@@ -1154,7 +1209,16 @@ pub async fn get_object(
         version_id,
         storage_class: Some(storage_class),
         ..Default::default()
-    }))
+    });
+    if customer_key {
+        response.headers.insert(
+            http::header::CACHE_CONTROL,
+            http::HeaderValue::from_static("no-store"),
+        );
+    } else {
+        response.headers.insert(http::header::VARY, vary);
+    }
+    Ok(response)
 }
 
 pub async fn head_object(

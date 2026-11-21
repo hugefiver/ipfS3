@@ -8,6 +8,10 @@ use serde::Deserialize;
 use crate::pinning::identity::PinningIdentityConfig;
 use crate::pinning::zip_policy::ZipOutputRuleConfig;
 
+mod download_redirect;
+
+pub use download_redirect::DownloadRedirectConfig;
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
     #[serde(default = "default_server_config")]
@@ -55,6 +59,9 @@ pub struct Config {
 
     #[serde(default)]
     pub decompress_zip: DecompressZipConfig,
+
+    #[serde(default)]
+    pub download_redirect: Option<DownloadRedirectConfig>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -445,6 +452,7 @@ impl Config {
             imports: ImportConfig::default(),
             lifecycle: default_lifecycle_config(),
             decompress_zip: DecompressZipConfig::default(),
+            download_redirect: None,
         }
     }
 
@@ -586,6 +594,30 @@ mod tests {
         let mut config = Config::build_default();
         config.crypto.master_key = FILE_KEY.to_owned();
         config
+    }
+
+    #[test]
+    fn download_redirect_is_opt_in_via_toml() {
+        assert!(Config::build_default().download_redirect.is_none());
+        assert!(
+            toml::from_str::<Config>("")
+                .unwrap()
+                .download_redirect
+                .is_none()
+        );
+
+        let enabled: Config = toml::from_str(
+            "[download_redirect]\ngateway_url = 'http://gateway.example'\nrules = [{ bucket = 'public' }]",
+        )
+        .unwrap();
+        assert_eq!(
+            enabled
+                .download_redirect
+                .unwrap()
+                .location("public", "logo.png", None, "bafyexample", false)
+                .as_deref(),
+            Some("http://gateway.example/ipfs/bafyexample"),
+        );
     }
 
     #[test]

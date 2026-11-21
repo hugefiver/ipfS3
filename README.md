@@ -18,6 +18,25 @@ New buckets default to `private`. The owner can change the [bucket ACL](docs/loc
 
 **Prometheus:** set `IPFS_S3_METRICS_BIND=127.0.0.1:9090` (or `[metrics].bind` in TOML) and scrape `http://127.0.0.1:9090/metrics`. The optional listener serves in-process S3 and pin timings without querying Kubo or the database. It does not reserve a bucket name on the S3 port.
 
+### Redirect downloads to IPFS
+
+Use `[download_redirect]` in [the example configuration](config.example.toml) to send clients directly to a path-style IPFS HTTP gateway. When a download is redirected, `GetObject` returns `307 Temporary Redirect` with `Location: <gateway_url>/ipfs/<version CID>`. The target must be reachable by the client and able to serve that CID. The S3 signature and query string are not copied into the URL.
+
+A rule can match `bucket`, key `prefix` (e.g. `public/`), `filename_glob` (e.g. `*.zip`, matched against the last path component), `user`, and `anonymous` (`true` for unsigned requests, `false` for signed). All specified conditions must match. Bucket and user names are exact; a session matches its issuing user. An unsigned request still needs anonymous read access. Private buckets follow the same routing rules after authorization.
+
+Set the rule's `mode` to `redirect` (default), `on_request`, or `proxy`. A matching `proxy` overrides all other matches; otherwise `redirect` takes precedence over `on_request`. With no matching rule, S3 serves the download itself.
+
+Clients can set `X-IPFS3-Download-Gateway` on a GET:
+
+- Omit it to follow the default: `redirect` sends a 307; `on_request` and `proxy` stream through S3.
+- `prefer` requests a 307 when a rule permits it, otherwise S3 serves the content.
+- `require` requests a 307 or `406 Not Acceptable` when the request cannot be redirected.
+- `proxy` requires S3 to serve the content, even when a `redirect` rule matches.
+
+The choice is made before the redirect. A failure at the destination does not trigger a retry through S3.
+
+Redirects apply to plaintext `STANDARD` objects, including valid byte-range requests. The client must follow cross-host redirects and send the `Range` header to the destination for partial downloads. The destination serves its own HTTP headers; use `HeadObject` for S3 metadata. Encrypted objects, requests carrying an SSE-C key, and `STANDARD_IA` reads stay on the S3 gateway.
+
 ## Hardening boundaries
 
 - **Mutation leases:** Standard content mutations use a 120-second database-clock
