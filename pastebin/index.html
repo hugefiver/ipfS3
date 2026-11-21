@@ -1,0 +1,164 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Publish text, files, and ZIP directories to ipfS3 and share anonymous IPFS or public S3 links.">
+  <meta name="referrer" content="no-referrer">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; connect-src https: http://localhost:* http://127.0.0.1:* http://[::1]:*; img-src 'self'; base-uri 'none'; form-action 'self'; object-src 'none'">
+  <title>ipfS3 Pastebin</title>
+  <link rel="stylesheet" href="./styles.css">
+  <script type="module" src="./app.js"></script>
+</head>
+<body>
+  <a class="skip-link" href="#publish">Skip to publishing</a>
+  <header class="site-header">
+    <a class="wordmark" href="./" aria-label="ipfS3 Pastebin home">ipfS3 <span>/ Pastebin</span></a>
+    <nav aria-label="Page sections">
+      <a href="#publish">Publish</a>
+      <a href="#instance">Instance</a>
+      <a href="./README.md">Guide</a>
+    </nav>
+  </header>
+
+  <main>
+    <section class="intro" aria-labelledby="page-title">
+      <p class="eyebrow">Signed upload · anonymous sharing</p>
+      <h1 id="page-title">Share a file, not your credentials.</h1>
+      <p>Publish UTF-8 text, an ordinary file, or a ZIP directory. Credentials stay in this tab; share links contain only object metadata.</p>
+    </section>
+
+    <noscript><p class="notice error">JavaScript is required for WebCrypto signing. No content has been uploaded.</p></noscript>
+    <div id="page-alert" class="notice error" role="alert" hidden></div>
+
+    <section id="shared-selection" class="panel shared-selection" aria-labelledby="shared-title" hidden>
+      <p class="eyebrow">Selected share link</p>
+      <h2 id="shared-title">Open shared item</h2>
+      <p id="shared-description"></p>
+      <div id="shared-partial" class="notice warning" role="status" hidden>The directory was only partially extracted.</div>
+      <a id="shared-open" class="button primary shared-open" target="_blank" rel="noopener noreferrer">Open</a>
+      <button id="shared-download" class="button primary" type="button" hidden>Download raw object</button>
+      <button id="shared-list" class="button primary" type="button" hidden>List public directory</button>
+      <p id="shared-status" role="status" aria-live="polite"></p>
+      <div id="shared-entries" class="table-wrap" hidden>
+        <table><thead><tr><th scope="col">Name</th><th scope="col">Size</th><th scope="col">Public S3</th></tr></thead><tbody id="shared-entry-rows"></tbody></table>
+      </div>
+      <p class="hint">This link changes no instance settings. Directory listing runs only when you activate it.</p>
+    </section>
+
+    <div class="workbench">
+      <section id="publish" class="panel" aria-labelledby="publish-title">
+        <div class="section-heading">
+          <div><p class="step">01</p><h2 id="publish-title">Publish</h2></div>
+          <span id="limit-label" class="meta"></span>
+        </div>
+
+        <form id="publish-form">
+          <fieldset class="mode-picker">
+            <legend>Content type</legend>
+            <label><input type="radio" name="mode" value="text" checked><span>Text</span></label>
+            <label><input type="radio" name="mode" value="file"><span>File</span></label>
+            <label><input type="radio" name="mode" value="directory"><span>ZIP directory</span></label>
+          </fieldset>
+
+          <div class="field">
+            <label for="content-name">File name</label>
+            <input id="content-name" name="name" value="paste.txt" maxlength="255" required autocomplete="off">
+            <p class="hint">ZIP uploads preserve safe entry names under a unique prefix.</p>
+          </div>
+
+          <div id="text-panel" class="field">
+            <label for="text-content">Text</label>
+            <textarea id="text-content" rows="12" spellcheck="false" placeholder="Paste UTF-8 text here"></textarea>
+          </div>
+
+          <div id="file-panel" class="field" hidden>
+            <label for="file-content">Choose file</label>
+            <input id="file-content" type="file">
+            <p id="file-hint" class="hint">The selected file stays local until you publish.</p>
+          </div>
+
+          <details class="credentials">
+            <summary>Publishing credentials <span>memory only</span></summary>
+            <div class="credential-grid">
+              <div class="field">
+                <label for="access-key">Access key ID</label>
+                <input id="access-key" autocomplete="off" required>
+              </div>
+              <div class="field">
+                <label for="secret-key">Secret access key</label>
+                <input id="secret-key" type="password" autocomplete="new-password" required>
+              </div>
+              <div class="field full-width">
+                <label for="session-token">Session token <span class="optional">optional</span></label>
+                <input id="session-token" type="password" autocomplete="off">
+              </div>
+            </div>
+          </details>
+
+          <div class="form-actions">
+            <button id="publish-button" class="button primary" type="submit">Publish to ipfS3</button>
+            <span id="publish-status" role="status" aria-live="polite"></span>
+          </div>
+        </form>
+      </section>
+
+      <aside id="instance" class="panel instance-panel" aria-labelledby="instance-title">
+        <div class="section-heading"><div><p class="step">02</p><h2 id="instance-title">Instance</h2></div></div>
+        <p class="hint">Only these non-secret settings are saved in this browser. Changing the S3 endpoint clears all credential fields.</p>
+        <form id="settings-form">
+          <div class="field"><label for="endpoint">S3 endpoint origin</label><input id="endpoint" type="url" required></div>
+          <div class="field"><label for="bucket">Bucket</label><input id="bucket" required></div>
+          <div class="field"><label for="region">Region</label><input id="region" required></div>
+          <div class="field"><label for="max-upload">Upload limit (bytes)</label><input id="max-upload" type="number" min="1" step="1" required><p class="hint">You can lower this tab’s limit, but not exceed the deployment maximum.</p></div>
+          <div class="field"><label for="ipfs-gateway">Public IPFS gateway</label><input id="ipfs-gateway" type="url" required></div>
+          <div class="form-actions settings-actions">
+            <button class="button secondary" type="submit">Save instance</button>
+            <button id="reset-settings" class="button text-button" type="button">Reset defaults</button>
+          </div>
+          <p id="settings-status" role="status" aria-live="polite"></p>
+        </form>
+        <div class="security-note">
+          <h3>Preview isolation</h3>
+          <p>Uploads open only as top-level pages on a different origin. Shared fragments never change signing settings or trigger network requests. Public S3 links appear after your explicit anonymous HEAD check.</p>
+        </div>
+      </aside>
+    </div>
+
+    <section id="result" class="result" aria-labelledby="result-title" hidden>
+      <div class="section-heading">
+        <div><p class="step">03</p><h2 id="result-title">Share result</h2></div>
+        <span id="result-kind" class="badge"></span>
+      </div>
+      <div id="partial-notice" class="notice warning" role="status" hidden></div>
+      <dl class="metadata">
+        <div><dt>Name</dt><dd id="result-name"></dd></div>
+        <div><dt>Key</dt><dd id="result-key"></dd></div>
+        <div><dt>CID</dt><dd id="result-cid"></dd></div>
+      </dl>
+      <div class="share-field">
+        <label for="share-url">Share link <span id="share-selection-label" class="optional"></span></label>
+        <div><input id="share-url" readonly placeholder="Choose Share beside a preview or raw link"><button id="copy-share" class="button secondary" type="button" disabled>Copy link</button></div>
+        <p id="copy-status" role="status" aria-live="polite"></p>
+      </div>
+
+      <div class="link-grid">
+        <section><h3>inbrowser.link</h3><p class="hint">Top-level preview on an isolated origin.</p><div id="inbrowser-links" class="link-list"></div></section>
+        <section><h3>Public IPFS gateway</h3><p id="gateway-label" class="hint"></p><div id="gateway-links" class="link-list"></div></section>
+        <section><h3>Public S3</h3><p class="hint">No credentials are sent. CORS must permit this site.</p><button id="check-public" class="button secondary" type="button">Check anonymous access</button><p id="public-status" role="status" aria-live="polite"></p><div id="s3-links" class="link-list"></div></section>
+      </div>
+
+      <section id="entries-section" class="object-list" aria-labelledby="entries-title" hidden>
+        <h3 id="entries-title">Extracted entries</h3>
+        <div class="table-wrap"><table><thead><tr><th scope="col">Name</th><th scope="col">Size</th><th scope="col">IPFS preview / raw</th><th scope="col">Public S3</th></tr></thead><tbody id="entry-rows"></tbody></table></div>
+      </section>
+      <section id="failures-section" class="object-list" aria-labelledby="failures-title" hidden>
+        <h3 id="failures-title">Failed entries</h3>
+        <div class="table-wrap"><table><thead><tr><th scope="col">Name</th><th scope="col">Code</th><th scope="col">Message</th></tr></thead><tbody id="failure-rows"></tbody></table></div>
+      </section>
+    </section>
+  </main>
+
+  <footer><p>Expiration ends the bucket’s storage commitment; it does not erase copies already reachable through IPFS.</p><a href="./README.md#deployment">Deployment and retention guide</a></footer>
+</body>
+</html>

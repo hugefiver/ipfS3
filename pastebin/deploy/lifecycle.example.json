@@ -1,0 +1,11 @@
+{
+  "Rules": [
+    {
+      "ID": "pastebin-retention",
+      "Status": "Enabled",
+      "Filter": {},
+      "Expiration": { "Days": 30 },
+      "NoncurrentVersionExpiration": { "NoncurrentDays": 7 }
+    }
+  ]
+}

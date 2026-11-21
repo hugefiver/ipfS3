@@ -5,6 +5,8 @@ An S3-compatible gateway backed by IPFS (Kubo). Translates S3 API calls into Kub
 [![CI](https://github.com/hugefiver/ipfS3/actions/workflows/ci.yml/badge.svg)](https://github.com/hugefiver/ipfS3/actions/workflows/ci.yml)
 [![License: AAAPL](https://img.shields.io/badge/License-AAAPL-blue.svg)](LICENSE.md)
 
+The [static Pastebin](pastebin/README.md) lets a credential holder publish text, a file, or a ZIP as a UnixFS directory from a browser. Deploy its static assets as-is; readers can open a share without S3 credentials.
+
 ## Project status
 
 - **S3 API:** Bucket and object CRUD, batch delete, ListObjects v1/v2, multipart uploads, object versioning, per-version tagging and path-style bucket CORS. [s3s](https://github.com/s3s-project/s3s) verifies SigV4 with configured access keys, including presigned GET and PUT.

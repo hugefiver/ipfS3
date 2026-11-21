@@ -1,0 +1,9 @@
+[decompress_zip]
+unixfs_directory_root = true
+max_archive_bytes = 16777216
+max_decompressed_bytes = 67108864
+max_single_entry_bytes = 67108864
+max_entries = 1000
+max_metadata_bytes = 16777216
+max_staged_adds = 1000
+processing_deadline_secs = 120

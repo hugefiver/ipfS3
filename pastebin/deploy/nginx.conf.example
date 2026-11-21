@@ -1,0 +1,21 @@
+upstream ipfs_s3_backend {
+    server 127.0.0.1:9000;
+}
+
+server {
+    listen 443 ssl;
+    server_name s3.example.com;
+
+    # Match config.js maxUploadBytes and decompress_zip.max_archive_bytes.
+    client_max_body_size 16m;
+    client_body_timeout 60s;
+
+    # Dedicated path-style S3 virtual host: preserve bucket roots and object paths.
+    location / {
+        proxy_pass http://ipfs_s3_backend;
+        proxy_http_version 1.1;
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_request_buffering on;
+    }
+}

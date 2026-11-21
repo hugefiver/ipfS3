@@ -1,0 +1,17 @@
+{
+  "CORSRules": [
+    {
+      "ID": "static-pastebin-publisher",
+      "AllowedOrigins": ["https://pastebin.example.com"],
+      "AllowedMethods": ["PUT", "HEAD", "GET"],
+      "AllowedHeaders": ["authorization", "content-type", "x-amz-*", "x-ipfs3-download-gateway"],
+      "ExposeHeaders": [
+        "ETag",
+        "x-amz-meta-ipfs-cid",
+        "x-ipfs-s3-zip-root-cid",
+        "x-ipfs-s3-zip-root-status"
+      ],
+      "MaxAgeSeconds": 600
+    }
+  ]
+}
