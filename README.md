@@ -408,6 +408,14 @@ revalidation, and version-aware ownership guards make execution safe across
 multiple gateway replicas. Lifecycle deletion retains Kubo pins and never
 calls `pin/rm`.
 
+**Set a bucket's storage period.** The [30-day rule](deploy/lifecycle/expire-after-30-days.json) applies to every key in a bucket. To use it on a new `pastes` bucket:
+
+```console
+aws --endpoint-url http://localhost:9000 s3api put-bucket-lifecycle-configuration --bucket pastes --lifecycle-configuration file://deploy/lifecycle/expire-after-30-days.json
+```
+
+Change `Expiration.Days` to set the period. The command replaces the bucket's complete lifecycle configuration; merge this rule with any rules you want to keep. At expiry, ipfS3's storage commitment for the current object ends. The lifecycle worker removes the unversioned object or creates a delete marker in a versioning-enabled bucket. Historical versions remain readable by version ID until separately deleted or expired by `NoncurrentVersionExpiration`. Expiry does not reclaim Kubo blocks or revoke an IPFS link: a gateway or another node may continue serving the CID.
+
 `AbortIncompleteMultipartUpload` is supported with all-objects or prefix selectors.
 `DaysAfterInitiation=N` becomes due at the next UTC midnight after N full days
 from initiation, using the database UTC clock; uploading parts does not reset it.
