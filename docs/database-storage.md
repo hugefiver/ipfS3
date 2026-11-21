@@ -17,7 +17,7 @@ For databases **older than file-pins**, the old ledger must be an exact ordered 
 - `m20261109_000001_pin_cid_comparisons`
 - `m20261110_000001_requeue_retained`
 
-For earlier layouts, first use the previous gateway's documented upgrade path to reach a supported layout. Before running the file-pin upgrade, stop accepting writes, drain and stop every old gateway and worker using the database, back up the database, and release the old remote pins on their original backup providers. Keep the backup until you've verified you can restore it. If the old Cluster configuration uses `min_replicas` or `verifier_limits`, remove those options before starting the new gateway; the current adapter records service acknowledgments.
+For earlier layouts, first use the previous gateway's documented upgrade path to reach a supported layout. Before **any** upgrade, drain and stop every gateway and worker writing to this database and take a backup. The quota migration counts retained object versions once; older writers do not maintain that count. For a pre-file-pins upgrade, also release the old remote pins on their original backup providers. Keep the backup until you've verified you can restore it. If the old Cluster configuration uses `min_replicas` or `verifier_limits`, remove those options before starting the new gateway; the current adapter records service acknowledgments.
 
 Run the new binary with the deployment's configuration:
 
