@@ -861,6 +861,7 @@ pub enum ImportFailure<'a> {
     InvalidZip,
     BoundArtifactUnavailable,
     BoundArtifactMismatch,
+    QuotaExceeded,
 }
 
 impl ImportFailure<'_> {
@@ -870,14 +871,13 @@ impl ImportFailure<'_> {
             Self::InvalidZip => "invalid_zip",
             Self::BoundArtifactUnavailable => "bound_artifact_unavailable",
             Self::BoundArtifactMismatch => "bound_artifact_mismatch",
+            Self::QuotaExceeded => crate::import::ImportFailureCode::QuotaExceeded.as_str(),
         }
     }
 }
 
-/// Permanently fail an invalid input ONLY while the original worker still
-/// owns a pending execution. Do not turn DB/transport uncertainty into a
-/// failure: this call itself propagates the error for caller reconciliation.
-/// No retry scheduling or attempt budget is persisted in this intake schema.
+/// Persist a confirmed failure and its receipt while the original worker still
+/// owns the execution. A publication rejection occurs after manifest admission.
 pub async fn fail_if_owned(
     db: &DatabaseConnection,
     claim: &execution::Claim,
@@ -895,9 +895,14 @@ pub async fn fail_if_owned(
         return Ok(false);
     };
     let now = crate::store::database_clock::database_now(&tx).await?;
+    let expected_state = if matches!(failure, ImportFailure::QuotaExceeded) {
+        "admitted"
+    } else {
+        "pending"
+    };
     if snapshot.source != "import"
         || snapshot.bucket != hint.bucket
-        || snapshot.state != "pending"
+        || snapshot.state != expected_state
         || snapshot.epoch != claim.epoch
         || snapshot.worker.as_deref() != Some(&claim.worker)
         || snapshot.lease_until.is_none_or(|until| until <= now)
@@ -922,9 +927,9 @@ pub async fn fail_if_owned(
         }
     }
     let changed = tx.execute(sql(&tx,
-        "UPDATE zip_v2_executions SET state='fenced',terminal_result=?,updated_at=? WHERE id=? AND epoch=? AND worker=? AND state='pending'",
-        "UPDATE zip_v2_executions SET state='fenced',terminal_result=$1,updated_at=$2 WHERE id=$3 AND epoch=$4 AND worker=$5 AND state='pending'",
-        vec![failure.code().into(),now.into(),claim.batch_id.clone().into(),claim.epoch.into(),claim.worker.clone().into()])).await?;
+        "UPDATE zip_v2_executions SET state='fenced',terminal_result=?,updated_at=? WHERE id=? AND epoch=? AND worker=? AND state=?",
+        "UPDATE zip_v2_executions SET state='fenced',terminal_result=$1,updated_at=$2 WHERE id=$3 AND epoch=$4 AND worker=$5 AND state=$6",
+        vec![failure.code().into(),now.into(),claim.batch_id.clone().into(),claim.epoch.into(),claim.worker.clone().into(),expected_state.into()])).await?;
     if changed.rows_affected() != 1 {
         return Err(stale());
     }

@@ -204,6 +204,7 @@ enum RunError {
     DigestMismatch(String),
     BoundArtifactUnavailable,
     BoundArtifactMismatch,
+    QuotaExceeded,
     Fenced,
 }
 
@@ -266,6 +267,17 @@ pub(super) async fn execute_claim(
                 import_intake::ImportFailure::BoundArtifactMismatch
             };
             let _ = import_intake::fail_if_owned(state.store.db(), claim, failure).await;
+        }
+        Err(RunError::QuotaExceeded) => {
+            if let Err(error) = import_intake::fail_if_owned(
+                state.store.db(),
+                claim,
+                import_intake::ImportFailure::QuotaExceeded,
+            )
+            .await
+            {
+                tracing::warn!(%error, batch_id = %claim.batch_id, "ZIP import quota settlement failed");
+            }
         }
         Err(RunError::Retry) => {
             // Epoch is durable across process restarts. A failed claim retains
@@ -719,6 +731,7 @@ async fn execute_inner(
         Err(AppError::StaleContentMutation | AppError::InvalidPinningRequest(_)) => {
             Err(RunError::Fenced)
         }
+        Err(AppError::QuotaExceeded) => Err(RunError::QuotaExceeded),
         Err(error) => {
             // An unknown DB commit outcome is not proof of rollback. The next
             // due claim reconciles the committed receipt or retries the exact

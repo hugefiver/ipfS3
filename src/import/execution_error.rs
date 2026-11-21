@@ -147,6 +147,9 @@ pub(crate) fn map_publication_error(
     if matches!(error, AppError::StaleImportOwnership) {
         return ImportExecutionError::Superseded;
     }
+    if matches!(error, AppError::QuotaExceeded) {
+        return terminal_failure(ImportFailureCode::QuotaExceeded, "bucket quota exceeded");
+    }
     let retryable = matches!(error, AppError::Database(_) | AppError::Internal(_));
     failure_to_execution(ImportFailure {
         code: ImportFailureCode::PublicationFailed,

@@ -1253,7 +1253,8 @@ pub(crate) async fn delete_unversioned_current_in_transaction(
         resources::release_owner(db, &current.id, now).await?;
         tags::replace_object_tags(db, &current.id, &[]).await?;
     }
-    crate::store::object_version::remove_null_slot(db, bucket, key).await?;
+    let removed_bytes = crate::store::object_version::remove_null_slot(db, bucket, key).await?;
+    crate::store::bucket::settle_usage(db, bucket, -removed_bytes).await?;
     Ok(DeleteVersionResult {
         version_id: None,
         deleted_delete_marker: false,
@@ -1351,6 +1352,7 @@ pub(crate) async fn delete_exact_in_transaction(
         }
         resources::release_owner(db, &object.id, now).await?;
         tags::replace_object_tags(db, &object.id, &[]).await?;
+        crate::store::bucket::settle_usage(db, bucket, -object.size).await?;
     }
     let deleted_delete_marker = resolved.kind == VersionKind::DeleteMarker;
     let _ = crate::store::object_version::remove_and_promote(db, &selected).await?;
@@ -1666,13 +1668,14 @@ async fn publish_in_transaction_with_batch(
     }
     let publication_time = crate::store::database_clock::database_now(db).await?;
 
-    let publication_result = write_object_version_and_update_lifecycle(
+    let (publication_result, delta) = write_object_version_and_update_lifecycle(
         db,
         &request.object,
         versioning_state,
         publication_time,
     )
     .await?;
+    crate::store::bucket::settle_usage(db, &request.object.bucket, delta).await?;
     tags::replace_object_tags(db, &object_id, &request.tags).await?;
 
     if let Some(decision) = decided.map(|snapshot| &snapshot.decision) {
@@ -1816,7 +1819,7 @@ async fn write_object_version_and_update_lifecycle(
     object: &PublicationObject,
     state: BucketVersioningState,
     now: DateTime<Utc>,
-) -> AppResult<PublicationResult> {
+) -> AppResult<(PublicationResult, i64)> {
     if object.logical_size < 0 {
         return Err(invalid_publication(
             "logical object size cannot be negative",
@@ -1842,18 +1845,22 @@ async fn write_object_version_and_update_lifecycle(
         resources::release_owner(db, &displaced_object_id, now).await?;
         tags::replace_object_tags(db, &displaced_object_id, &[]).await?;
     }
-    let public_version_id =
-        crate::store::object_version::install_content_version(db, state, &inserted, now).await?;
+    let (public_version_id, delta) =
+        crate::store::object_version::install_content_version_with_delta(db, state, &inserted, now)
+            .await?;
     let version_id = match state {
         BucketVersioningState::Unversioned => None,
         BucketVersioningState::Enabled | BucketVersioningState::Suspended => {
             Some(public_version_id)
         }
     };
-    Ok(PublicationResult {
-        object_id: object.id.clone(),
-        version_id,
-    })
+    Ok((
+        PublicationResult {
+            object_id: object.id.clone(),
+            version_id,
+        },
+        delta,
+    ))
 }
 
 fn invalid_publication(message: &str) -> AppError {

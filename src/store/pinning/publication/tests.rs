@@ -43,6 +43,7 @@ use crate::{
     },
 };
 
+mod bucket_quota;
 mod delete_lock_tests;
 mod hot_receipt_tests;
 mod publication_lease_tests;
@@ -766,6 +767,10 @@ async fn lifecycle_current_expiration_applies_each_current_versioning_state() {
                 created_delete_marker: false,
             }
         )
+    );
+    assert_eq!(
+        sql_count(&db, "SELECT used_bytes n FROM buckets WHERE name='bucket'").await,
+        7
     );
     assert!(versions_for(&db, "unversioned").await.is_empty());
     assert!(matches!(

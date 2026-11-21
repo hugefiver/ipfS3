@@ -4,11 +4,11 @@ The gateway keeps S3 metadata and durable work in SQLite or PostgreSQL. Object b
 
 ## Initialize an empty database
 
-Normal startup installs the final schema directly and records `m20261121_000001_bucket_acl` in `seaql_migrations`. It doesn't run the historical migration chain. On a current database startup reads the latest ledger marker; it doesn't rerun DDL or audit the catalog. It refuses nonempty databases with an older or missing marker. PostgreSQL serializes concurrent empty-schema initialization using a transaction-scoped advisory lock.
+Normal startup installs the final schema directly and records `m20261122_000001_bucket_quota` in `seaql_migrations`. It doesn't run the historical migration chain. On a current database startup reads the latest ledger marker; it doesn't rerun DDL or audit the catalog. It refuses nonempty databases with an older or missing marker. PostgreSQL serializes concurrent empty-schema initialization using a transaction-scoped advisory lock.
 
 ## Upgrade an existing database
 
-From `m20261120_000001_file_pins`, `--upgrade-database` adds the nullable bucket ACL column. It preserves pin resources and references, object data and in-flight uploads; no remote pins need to be released. Existing buckets keep their signed-access behavior until the recorded owner sets a [bucket default](local-policies.md#bucket-defaults).
+`--upgrade-database` adds [bucket quotas](bucket-quota.md) and initializes logical usage from all addressable object versions. Existing buckets start without a limit. From `m20261120_000001_file_pins`, the upgrade also adds the nullable bucket ACL column. It preserves pin resources and references, object data and in-flight uploads; no remote pins need to be released. Existing buckets keep their signed-access behavior until the recorded owner sets a [bucket default](local-policies.md#bucket-defaults).
 
 For databases **older than file-pins**, the old ledger must be an exact ordered prefix of the list below, with at least the first two entries. A matching last entry alone doesn't make an old ledger eligible.
 

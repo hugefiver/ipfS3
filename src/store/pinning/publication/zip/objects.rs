@@ -59,17 +59,20 @@ pub(super) async fn publish_objects(
     let mut bindings = Vec::with_capacity(paths.len());
     let mut source = None;
     let mut outputs = Vec::with_capacity(paths.len());
+    let mut net_bytes = 0i128;
     for object in ordered {
         let path = paths.get(object.key.as_str()).copied();
         let (row_id, result) = if existing.contains(&object.key) {
             maintenance.checkpoint(tx).await?;
-            let result =
+            let (result, delta) =
                 super::super::write_object_version_and_update_lifecycle(tx, object, state, now)
                     .await?;
+            net_bytes += i128::from(delta);
             let binding =
                 binding_for_published_object(tx, path.unwrap_or("source"), &object.id).await?;
             (binding.version_row_id, result)
         } else {
+            net_bytes += i128::from(object.logical_size);
             let row_id = Uuid::new_v4().to_string();
             let public_id =
                 (state == BucketVersioningState::Enabled).then(|| Uuid::new_v4().to_string());
@@ -111,6 +114,12 @@ pub(super) async fn publish_objects(
         results.push((object.key.clone(), result));
     }
 
+    crate::store::bucket::settle_usage(
+        tx,
+        request.capture.bucket(),
+        net_bytes.try_into().map_err(|_| AppError::QuotaExceeded)?,
+    )
+    .await?;
     let selected = select_zip_intents(selection, &request.manifest, source.as_ref(), &outputs)
         .map_err(|error| invalid_publication(&error.to_string()))?;
     let snapshots = source.into_iter().zip(selected.source_decision).chain(

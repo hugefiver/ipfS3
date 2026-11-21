@@ -192,6 +192,30 @@ pub async fn get<C: ConnectionTrait>(db: &C, name: &str) -> AppResult<bucket::Mo
         .ok_or_else(|| AppError::NoSuchBucket(name.to_owned()))
 }
 
+/// Settle the net change of one publication or deletion on its locked bucket row.
+/// Non-growing writes remain possible after an operator lowers the limit.
+pub(crate) async fn settle_usage<C: ConnectionTrait>(
+    db: &C,
+    name: &str,
+    delta: i64,
+) -> AppResult<()> {
+    if delta == 0 {
+        return Ok(());
+    }
+    let updated = db
+        .execute(sea_orm::Statement::from_sql_and_values(
+            db.get_database_backend(),
+            "UPDATE buckets SET used_bytes = used_bytes + $1 WHERE name = $2 \
+         AND ($1 < 0 OR $1 <= COALESCE(quota_bytes, 9223372036854775807) - used_bytes)",
+            [delta.into(), name.into()],
+        ))
+        .await?;
+    if updated.rows_affected() == 0 {
+        return Err(AppError::QuotaExceeded);
+    }
+    Ok(())
+}
+
 pub async fn get_versioning_state<C: ConnectionTrait>(
     db: &C,
     bucket_name: &str,

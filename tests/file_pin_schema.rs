@@ -10,8 +10,10 @@ async fn upgrade(db: &DatabaseConnection) {
         INSERT INTO seaql_migrations VALUES ('m20261027_000001_schema_baseline',0),('m20261108_000001_current_pinning_config',0),('m20261109_000001_pin_cid_comparisons',0),('m20261110_000001_requeue_retained',0);
         CREATE TABLE buckets(name TEXT PRIMARY KEY, owner TEXT);
         INSERT INTO buckets VALUES ('legacy','owner');
-        CREATE TABLE object_versions(id TEXT PRIMARY KEY);
-        INSERT INTO object_versions VALUES ('v1');
+        CREATE TABLE objects(id TEXT PRIMARY KEY, size BIGINT NOT NULL);
+        INSERT INTO objects VALUES ('file',3);
+        CREATE TABLE object_versions(id TEXT PRIMARY KEY, bucket TEXT NOT NULL, kind TEXT NOT NULL, object_id TEXT);
+        INSERT INTO object_versions VALUES ('v1','legacy','object','file');
         CREATE TABLE object_tags(object_id TEXT, key TEXT, value TEXT);
         INSERT INTO object_tags VALUES ('file','env','production');
         CREATE TABLE import_job_requests(job_id TEXT PRIMARY KEY, metadata_json TEXT);
@@ -63,12 +65,13 @@ async fn upgrade(db: &DatabaseConnection) {
     let bucket = db
         .query_one(Statement::from_string(
             backend,
-            "SELECT owner,canned_acl FROM buckets WHERE name='legacy'",
+            "SELECT owner,canned_acl,used_bytes FROM buckets WHERE name='legacy'",
         ))
         .await
         .unwrap()
         .unwrap();
     assert_eq!(bucket.try_get::<String>("", "owner").unwrap(), "owner");
+    assert_eq!(bucket.try_get::<i64>("", "used_bytes").unwrap(), 3);
     assert_eq!(
         bucket.try_get::<Option<String>>("", "canned_acl").unwrap(),
         None
@@ -105,7 +108,9 @@ async fn upgrade(db: &DatabaseConnection) {
 
 async fn upgrade_file_pin_bucket_acl(db: &DatabaseConnection) {
     run_migrations(db).await.unwrap();
-    db.execute_unprepared("ALTER TABLE buckets DROP COLUMN canned_acl;
+    db.execute_unprepared("ALTER TABLE buckets DROP COLUMN quota_bytes;
+        ALTER TABLE buckets DROP COLUMN used_bytes;
+        ALTER TABLE buckets DROP COLUMN canned_acl;
         UPDATE seaql_migrations SET version='m20261120_000001_file_pins';
         INSERT INTO buckets(name, owner) VALUES ('photos','alice');
         INSERT INTO multipart_uploads(upload_id,object_id,bucket,key) VALUES ('upload','pending','photos','video');
@@ -116,7 +121,7 @@ async fn upgrade_file_pin_bucket_acl(db: &DatabaseConnection) {
     initialization::upgrade_existing(db).await.unwrap();
     run_migrations(db).await.unwrap();
     let row = db.query_one(Statement::from_string(db.get_database_backend(),
-        "SELECT b.owner,b.canned_acl,p.cid AS part,r.handle FROM buckets b
+        "SELECT b.owner,b.canned_acl,b.used_bytes,p.cid AS part,r.handle FROM buckets b
          JOIN multipart_uploads u ON b.name=u.bucket JOIN multipart_parts p ON u.upload_id=p.upload_id,
          pin_refs f JOIN pin_resources r ON f.provider=r.provider AND f.cid=r.cid
          WHERE b.name='photos' AND f.owner_object_id='file'" )).await.unwrap().unwrap();
@@ -125,6 +130,7 @@ async fn upgrade_file_pin_bucket_acl(db: &DatabaseConnection) {
         row.try_get::<Option<String>>("", "canned_acl").unwrap(),
         None
     );
+    assert_eq!(row.try_get::<i64>("", "used_bytes").unwrap(), 0);
     assert_eq!(row.try_get::<String>("", "part").unwrap(), "part-cid");
     assert_eq!(row.try_get::<String>("", "handle").unwrap(), "handle");
     assert!(
@@ -132,6 +138,62 @@ async fn upgrade_file_pin_bucket_acl(db: &DatabaseConnection) {
             .await
             .is_err()
     );
+}
+
+async fn upgrade_bucket_quota(db: &DatabaseConnection) {
+    run_migrations(db).await.unwrap();
+    db.execute_unprepared("ALTER TABLE buckets DROP COLUMN quota_bytes;
+        ALTER TABLE buckets DROP COLUMN used_bytes;
+        UPDATE seaql_migrations SET version='m20261121_000001_bucket_acl';
+        INSERT INTO buckets(name,canned_acl) VALUES ('files','public-read'),('empty',NULL);
+        INSERT INTO objects(id,bucket,key,cid,size,etag,is_latest) VALUES
+            ('current','files','live','shared-cid',11,'shared-cid',TRUE),
+            ('null-slot','files','live','shared-cid',11,'shared-cid',FALSE),
+            ('masked','files','hidden','masked-cid',5000000000,'masked-cid',FALSE),
+            ('unlinked','files','unlinked','unlinked-cid',100,'unlinked-cid',TRUE);
+        INSERT INTO object_versions(id,bucket,key,version_id,kind,object_id,sequence,is_latest,lifecycle_age_started_at,created_at,updated_at) VALUES
+            ('current-version','files','live','opaque','object','current',2,TRUE,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP),
+            ('null-version','files','live',NULL,'object','null-slot',1,FALSE,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP),
+            ('masked-version','files','hidden','old','object','masked',1,FALSE,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP),
+            ('marker','files','hidden','marker','delete_marker',NULL,2,TRUE,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)").await.unwrap();
+    assert!(run_migrations(db).await.is_err());
+    initialization::upgrade_existing(db).await.unwrap();
+    run_migrations(db).await.unwrap();
+
+    let rows = db
+        .query_all(Statement::from_string(
+            db.get_database_backend(),
+            "SELECT name,canned_acl,quota_bytes,used_bytes FROM buckets ORDER BY name",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    for (row, (name, acl, used)) in rows.iter().zip([
+        ("empty", None, 0),
+        ("files", Some("public-read"), 5_000_000_022),
+    ]) {
+        assert_eq!(row.try_get::<String>("", "name").unwrap(), name);
+        assert_eq!(
+            row.try_get::<Option<String>>("", "canned_acl")
+                .unwrap()
+                .as_deref(),
+            acl
+        );
+        assert_eq!(row.try_get::<Option<i64>>("", "quota_bytes").unwrap(), None);
+        assert_eq!(row.try_get::<i64>("", "used_bytes").unwrap(), used);
+    }
+}
+
+#[tokio::test]
+async fn sqlite_upgrade_backfills_bucket_usage_for_addressable_versions() {
+    let db = Database::connect("sqlite::memory:").await.unwrap();
+    upgrade_bucket_quota(&db).await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated IPFS_S3_TEST_POSTGRES_URL"]
+async fn postgres_upgrade_backfills_bucket_usage_for_addressable_versions() {
+    postgres::with_schema(|db| async move { upgrade_bucket_quota(&db).await }).await;
 }
 
 #[tokio::test]

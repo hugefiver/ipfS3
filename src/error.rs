@@ -166,6 +166,9 @@ pub enum AppError {
     #[error("bucket already exists: {0}")]
     BucketAlreadyExists(String),
 
+    #[error("bucket storage quota exceeded")]
+    QuotaExceeded,
+
     #[error("bucket not empty: {0}")]
     BucketNotEmpty(String),
 
@@ -303,6 +306,11 @@ impl From<AppError> for S3Error {
             } => delete_marker_error(version_id, *created_at, *current),
             AppError::BucketAlreadyExists(_) => s3_error!(BucketAlreadyOwnedByYou, "{}", e),
             AppError::BucketNotEmpty(_) => s3_error!(BucketNotEmpty, "{}", e),
+            AppError::QuotaExceeded => import_route_error(
+                "QuotaExceeded",
+                http::StatusCode::FORBIDDEN,
+                "bucket storage quota exceeded",
+            ),
             AppError::NoSuchUpload(_) => s3_error!(NoSuchUpload, "{}", e),
             AppError::InvalidPart(_) => s3_error!(InvalidPart, "{}", e),
             AppError::InvalidPartOrder => s3_error!(InvalidPartOrder, "{}", e),

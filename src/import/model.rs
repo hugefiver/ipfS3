@@ -176,6 +176,7 @@ pub enum ImportFailureCode {
     InvalidArchive,
     DecompressionLimitExceeded,
     PublicationFailed,
+    QuotaExceeded,
     JobDeadlineExceeded,
 }
 
@@ -194,6 +195,7 @@ impl ImportFailureCode {
             Self::InvalidArchive => "invalid_archive",
             Self::DecompressionLimitExceeded => "decompression_limit_exceeded",
             Self::PublicationFailed => "publication_failed",
+            Self::QuotaExceeded => "quota_exceeded",
             Self::JobDeadlineExceeded => "job_deadline_exceeded",
         }
     }

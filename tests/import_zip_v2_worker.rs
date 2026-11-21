@@ -195,6 +195,60 @@ async fn claimed_cid_import_finishes_without_publishing_a_source_object() {
 }
 
 #[tokio::test]
+async fn quota_rejection_terminally_fails_an_admitted_zip_import() {
+    let harness = start_import_harness(ImportHarnessConfig {
+        max_attempts: 3,
+        ..ImportHarnessConfig::default()
+    })
+    .await;
+    let db = harness.state.store.db();
+    db.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Sqlite,
+        "UPDATE buckets SET quota_bytes=1 WHERE name=?",
+        [harness.bucket.clone().into()],
+    ))
+    .await
+    .unwrap();
+    harness.set_cat_body(CID, legal_single_entry_zip());
+
+    let id = submit(&harness, "quota-rejection", &cid_xml()).await;
+    assert_eq!(wait_for_state(&harness, &id).await, "failed");
+    let settled = execution::read(db, &id).await.unwrap().unwrap();
+    assert_eq!(settled.state, "fenced");
+    assert_eq!(settled.epoch, 1);
+    assert_eq!(settled.terminal_result.as_deref(), Some("quota_exceeded"));
+
+    let request = db
+        .query_one(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "SELECT job_state, receipt_metadata FROM zip_v2_import_requests WHERE batch_id=?",
+            [id.clone().into()],
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        request.try_get::<String>("", "job_state").unwrap(),
+        "failed"
+    );
+    let receipt: String = request.try_get("", "receipt_metadata").unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&receipt).unwrap(),
+        serde_json::json!({"code": "quota_exceeded"})
+    );
+    assert_eq!(object_version::Entity::find().count(db).await.unwrap(), 0);
+
+    expire_claim(&harness, &id).await;
+    assert!(
+        import_intake::pending_ids(db, "", 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    harness.shutdown().await;
+}
+
+#[tokio::test]
 async fn url_first_verified_read_is_replayed_without_a_second_get_after_source_changes() {
     let harness = start_import_harness(ImportHarnessConfig::default()).await;
     let archive = legal_single_entry_zip();

@@ -25,8 +25,8 @@ use http::{HeaderMap, HeaderValue, StatusCode};
 use ipfs_s3_gateway::state::AppState;
 use ipfs_s3_gateway::store;
 use sea_orm::{
-    ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder,
-    TransactionTrait,
+    ColumnTrait, ConnectionTrait, DatabaseBackend, DatabaseConnection, EntityTrait, PaginatorTrait,
+    QueryFilter, QueryOrder, Statement, TransactionTrait,
 };
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -1849,6 +1849,47 @@ async fn test_combined_import_zip_fatal_error_preserves_previous_objects() {
         harness.captured_add_file_bytes(),
         vec![old_body.clone(), old_body, invalid_archive]
     );
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn quota_rejection_terminally_fails_plain_and_legacy_zip_imports() {
+    let harness = start_import_harness(ImportHarnessConfig {
+        max_attempts: 3,
+        ..ImportHarnessConfig::default()
+    })
+    .await;
+    let db = harness.state.store.db();
+    db.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Sqlite,
+        "UPDATE buckets SET quota_bytes=1 WHERE name=?",
+        [harness.bucket.clone().into()],
+    ))
+    .await
+    .unwrap();
+    let archive = legal_single_entry_zip();
+    harness.set_cat_body(IMPORT_CID, archive.clone());
+    harness
+        .source
+        .set_reply("/quota.zip", TestHttpsReply::chunked(archive));
+    let source = import_url_xml(&harness.source.url("/quota.zip"));
+
+    for (key, query) in [
+        ("plain.bin", "ipfs3-import"),
+        ("archive.zip", "ipfs3-import&decompress-zip=out"),
+    ] {
+        let accepted = post_import(&harness, &harness.bucket, key, query, &source, None).await;
+        let job_id = accepted_import_job_id(&accepted);
+        let failed = wait_for_import_state(&harness, &job_id, &["failed"]).await;
+        assert_eq!(failed.failure_code.as_deref(), Some("quota_exceeded"));
+        assert_eq!(failed.attempts, 1);
+        assert!(failed.completed_at.is_some());
+        assert!(failed.locked_until.is_none());
+    }
+
+    let counts = import_side_effect_counts(&harness).await;
+    assert_eq!(counts.objects, 0);
+    assert_eq!(counts.results, 0);
     harness.shutdown().await;
 }
 

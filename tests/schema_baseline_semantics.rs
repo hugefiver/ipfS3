@@ -8,6 +8,26 @@ async fn behavior(db: &DatabaseConnection) {
     db.execute_unprepared("INSERT INTO buckets(name) VALUES('semantics'); INSERT INTO objects(id,bucket,key,cid,size,etag) VALUES('tagged','semantics','tagged','cid',1,'cid'); INSERT INTO object_tags(object_id,key,value) VALUES('tagged','k','v')")
         .await
         .unwrap();
+    let bucket = db
+        .query_one(Statement::from_string(
+            db.get_database_backend(),
+            "SELECT quota_bytes,used_bytes FROM buckets WHERE name='semantics'",
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        bucket.try_get::<Option<i64>>("", "quota_bytes").unwrap(),
+        None
+    );
+    assert_eq!(bucket.try_get::<i64>("", "used_bytes").unwrap(), 0);
+    for sql in [
+        "UPDATE buckets SET quota_bytes=0 WHERE name='semantics'",
+        "UPDATE buckets SET quota_bytes=5000000000 WHERE name='semantics'",
+        "UPDATE buckets SET quota_bytes=NULL WHERE name='semantics'",
+    ] {
+        db.execute_unprepared(sql).await.unwrap();
+    }
     assert_eq!(
         db.execute_unprepared(
             "UPDATE residency_backfill SET claim_epoch=1 WHERE id='hot_verification'"
@@ -20,6 +40,8 @@ async fn behavior(db: &DatabaseConnection) {
     for sql in [
         "UPDATE buckets SET versioning_status='unknown' WHERE name='semantics'",
         "UPDATE buckets SET canned_acl='unknown' WHERE name='semantics'",
+        "UPDATE buckets SET quota_bytes=-1 WHERE name='semantics'",
+        "UPDATE buckets SET quota_bytes=9223372036854775808 WHERE name='semantics'",
         "INSERT INTO object_tags(object_id,key,value) VALUES('missing','k','v')",
         "INSERT INTO bucket_lifecycle_configs(bucket,canonical_json,revision,created_at,updated_at) VALUES('semantics','{bad',1,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
         "INSERT INTO bucket_lifecycle_configs(bucket,canonical_json,revision,created_at,updated_at) VALUES('semantics','{}',0,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",

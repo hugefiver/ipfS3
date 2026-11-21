@@ -516,18 +516,23 @@ pub(crate) async fn remove_null_slot<C: ConnectionTrait>(
     db: &C,
     bucket_name: &str,
     key: &str,
-) -> AppResult<()> {
-    if let Some(selected) = one_version(
-        db,
-        bucket_name,
-        key,
-        &VersionSelector::Exact(PublicVersionId::Null),
-        true,
-    )
-    .await?
-        && version_kind(&selected)? == VersionKind::Object
-    {
-        super::residency::release_version_reference_in_transaction(db, &selected.id).await?;
+) -> AppResult<i64> {
+    let query = object_version::Entity::find()
+        .inner_join(object::Entity)
+        .select_only()
+        .column(object_version::Column::Id)
+        .column(object::Column::Size)
+        .filter(object_version::Column::Bucket.eq(bucket_name))
+        .filter(object_version::Column::Key.eq(key))
+        .filter(object_version::Column::VersionId.is_null());
+    let query = if db.get_database_backend() == DatabaseBackend::Postgres {
+        query.lock_exclusive()
+    } else {
+        query
+    };
+    let removed = query.into_tuple::<(String, i64)>().one(db).await?;
+    if let Some((id, _)) = &removed {
+        super::residency::release_version_reference_in_transaction(db, id).await?;
     }
     let result = object_version::Entity::delete_many()
         .filter(object_version::Column::Bucket.eq(bucket_name))
@@ -538,7 +543,7 @@ pub(crate) async fn remove_null_slot<C: ConnectionTrait>(
     if result.rows_affected > 1 {
         return Err(invalid_version_index());
     }
-    Ok(())
+    Ok(removed.map_or(0, |(_, size)| size))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -599,30 +604,41 @@ async fn prepare_install<C: ConnectionTrait>(
     bucket_name: &str,
     key: &str,
     now: DateTime<Utc>,
-) -> AppResult<(i64, PublicVersionId)> {
+) -> AppResult<(i64, PublicVersionId, i64)> {
     let _ = lock_current_row(db, bucket_name, key).await?;
     let sequence = allocate_next_sequence(db, bucket_name, key).await?;
-    let version_id = match state {
+    demote_current_version(db, bucket_name, key, now).await?;
+    let (version_id, removed_bytes) = match state {
         BucketVersioningState::Enabled => {
-            demote_current_version(db, bucket_name, key, now).await?;
-            PublicVersionId::Opaque(uuid::Uuid::new_v4().to_string())
+            (PublicVersionId::Opaque(uuid::Uuid::new_v4().to_string()), 0)
         }
-        BucketVersioningState::Suspended | BucketVersioningState::Unversioned => {
-            demote_current_version(db, bucket_name, key, now).await?;
-            remove_null_slot(db, bucket_name, key).await?;
-            PublicVersionId::Null
-        }
+        BucketVersioningState::Suspended | BucketVersioningState::Unversioned => (
+            PublicVersionId::Null,
+            remove_null_slot(db, bucket_name, key).await?,
+        ),
     };
-    Ok((sequence, version_id))
+    Ok((sequence, version_id, removed_bytes))
 }
 
+#[cfg(test)]
 pub(crate) async fn install_content_version<C: ConnectionTrait>(
     db: &C,
     state: BucketVersioningState,
     object: &object::Model,
     now: DateTime<Utc>,
 ) -> AppResult<String> {
-    let (sequence, version_id) =
+    let (version, delta) = install_content_version_with_delta(db, state, object, now).await?;
+    bucket::settle_usage(db, &object.bucket, delta).await?;
+    Ok(version)
+}
+
+pub(crate) async fn install_content_version_with_delta<C: ConnectionTrait>(
+    db: &C,
+    state: BucketVersioningState,
+    object: &object::Model,
+    now: DateTime<Utc>,
+) -> AppResult<(String, i64)> {
+    let (sequence, version_id, removed_bytes) =
         prepare_install(db, state, &object.bucket, &object.key, now).await?;
     let public_version_id = version_id.as_s3_str().to_owned();
     insert_version_row(
@@ -637,7 +653,7 @@ pub(crate) async fn install_content_version<C: ConnectionTrait>(
     )
     .await?;
     super::object::set_only_latest(db, &object.bucket, &object.key, Some(&object.id)).await?;
-    Ok(public_version_id)
+    Ok((public_version_id, object.size - removed_bytes))
 }
 
 pub(crate) async fn install_delete_marker<C: ConnectionTrait>(
@@ -647,7 +663,9 @@ pub(crate) async fn install_delete_marker<C: ConnectionTrait>(
     key: &str,
     now: DateTime<Utc>,
 ) -> AppResult<String> {
-    let (sequence, version_id) = prepare_install(db, state, bucket_name, key, now).await?;
+    let (sequence, version_id, removed_bytes) =
+        prepare_install(db, state, bucket_name, key, now).await?;
+    bucket::settle_usage(db, bucket_name, -removed_bytes).await?;
     let public_version_id = version_id.as_s3_str().to_owned();
     insert_version_row(
         db,

@@ -117,6 +117,67 @@ async fn test_create_and_put_and_get_plain_object() {
 }
 
 #[tokio::test]
+async fn bucket_quota_applies_to_signed_put_copy_and_selected_multipart_completion() {
+    use super::common::{
+        IMPORT_CID, signed_complete_multipart, signed_copy,
+        signed_create_multipart_upload_with_tagging, signed_delete_object, signed_upload_part,
+        xml_element_text,
+    };
+    let harness = start_harness(scripted(
+        &[IMPORT_CID; 6],
+        vec![(IMPORT_CID, b"x".to_vec())],
+    ))
+    .await;
+    harness
+        .state
+        .store
+        .db()
+        .execute_unprepared("UPDATE buckets SET quota_bytes=1")
+        .await
+        .unwrap();
+    let put = |key| signed_put(&harness, key, &[], b"x".to_vec(), HeaderMap::new());
+    assert_eq!(put("source").await.status(), StatusCode::OK);
+    assert_s3_error(
+        put("other").await,
+        StatusCode::FORBIDDEN,
+        "QuotaExceeded",
+        "",
+    )
+    .await;
+    let copy = signed_copy(&harness, "source", "copied", HeaderMap::new()).await;
+    assert_s3_error(copy, StatusCode::FORBIDDEN, "QuotaExceeded", "").await;
+
+    let create = signed_create_multipart_upload_with_tagging(&harness, "mpu", "").await;
+    let id = xml_element_text(&create.text().await.unwrap(), "UploadId");
+    for part in [1, 2] {
+        assert_eq!(
+            signed_upload_part(&harness, "mpu", &id, part, b"x".to_vec())
+                .await
+                .status(),
+            StatusCode::OK
+        );
+    }
+    let rejected = signed_complete_multipart(&harness, "mpu", &id, 2, IMPORT_CID).await;
+    assert_s3_error(rejected, StatusCode::FORBIDDEN, "QuotaExceeded", "").await;
+    assert_latest_absent(&harness, "mpu").await;
+    assert_eq!(
+        signed_delete_object(&harness, "source").await.status(),
+        StatusCode::NO_CONTENT
+    );
+    let complete = signed_complete_multipart(&harness, "mpu", &id, 2, IMPORT_CID).await;
+    assert_eq!(complete.status(), StatusCode::OK);
+    assert_eq!(
+        signed_get(&harness, "mpu")
+            .await
+            .bytes()
+            .await
+            .unwrap()
+            .as_ref(),
+        b"x"
+    );
+}
+
+#[tokio::test]
 async fn test_harness_captures_kubo_file_bytes_and_updates_cat_body() {
     let payload = b"captured exact bytes".to_vec();
     let harness = start_harness(scripted(&["QmCaptured"], vec![])).await;
