@@ -25,6 +25,12 @@ use_server_modtime = true
 
 `list_version = 2` is the recommended rclone path, but the gateway also implements ListObjects v1 for SDK and legacy-client compatibility. `use_server_modtime = true` uses S3 `LastModified` rather than treating the CID ETag as MD5 metadata.
 
+## Download redirects
+
+With a path-style Kubo 0.43.0 HTTP gateway as the redirect target, curl 8.22.0 (`-L`) and rclone 1.76.0 (`cat`, including `--offset` and `--count`) follow the 307 for both full and ranged downloads. AWS CLI 2.42.1 (`s3api get-object` and `s3 cp`) and MinIO mc `RELEASE.2025-08-13T08-35-41Z` (`cat`) stop at the 307 rather than fetching the CID. All four clients can read through the S3 proxy, including byte ranges.
+
+For mixed clients, use `mode = "on_request"` so ordinary downloads stay on S3. An mc caller can also override a default redirect with `mc cat --custom-header 'X-IPFS3-Download-Gateway:proxy' ALIAS/BUCKET/KEY`.
+
 ## Result definitions
 
 - `PASSED`: the listed commands and assertions actually executed successfully.
