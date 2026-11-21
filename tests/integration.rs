@@ -19,6 +19,9 @@ use support::pinning::{PinningHarnessConfig, TEST_CID};
 #[path = "integration/basics.rs"]
 mod basics;
 
+#[path = "integration/bucket_acl.rs"]
+mod bucket_acl;
+
 #[path = "integration/common.rs"]
 mod common;
 

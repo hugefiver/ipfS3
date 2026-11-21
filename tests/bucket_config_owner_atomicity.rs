@@ -63,6 +63,7 @@ async fn replace_bucket(
         created_at: Set(Utc::now()),
         owner: Set(Some(owner.to_owned())),
         versioning_status: Set(None),
+        canned_acl: Set(None),
     }
     .insert(txn)
     .await?;

@@ -12,16 +12,22 @@ mod fixtures;
 #[cfg(any(test, feature = "historical-fixtures"))]
 pub use fixtures::*;
 
-pub const VERSION: &str = "m20261120_000001_file_pins";
+const FILE_PIN_VERSION: &str = "m20261120_000001_file_pins";
+pub const VERSION: &str = "m20261121_000001_bucket_acl";
 pub(super) const CREATE_LEDGER: &str = "CREATE TABLE IF NOT EXISTS seaql_migrations (version VARCHAR NOT NULL PRIMARY KEY, applied_at BIGINT NOT NULL)";
 
-async fn finish<C: ConnectionTrait>(db: &C) -> Result<(), DbErr> {
+async fn index_file_pins<C: ConnectionTrait>(db: &C) -> Result<(), DbErr> {
     let revision = match db.get_database_backend() {
         DatabaseBackend::Sqlite => "json_extract(pin_decision,'$.control_revision')",
         DatabaseBackend::Postgres => "(pin_decision::jsonb->>'control_revision')",
         _ => return Err(DbErr::Migration("unsupported database".into())),
     };
     db.execute_unprepared(&format!("CREATE UNIQUE INDEX object_versions_pin_revision ON object_versions({revision}) WHERE pin_decision IS NOT NULL")).await?;
+    Ok(())
+}
+
+async fn install_bucket_acl<C: ConnectionTrait>(db: &C) -> Result<(), DbErr> {
+    db.execute_unprepared("ALTER TABLE buckets ADD COLUMN canned_acl TEXT CHECK (canned_acl IN ('private', 'public-read', 'public-read-write', 'authenticated-read'))").await?;
     db.execute(Statement::from_sql_and_values(
         db.get_database_backend(),
         "INSERT INTO seaql_migrations(version,applied_at) VALUES ($1,$2)",
@@ -33,7 +39,8 @@ async fn finish<C: ConnectionTrait>(db: &C) -> Result<(), DbErr> {
 
 pub(super) async fn install<C: ConnectionTrait>(db: &C) -> Result<(), DbErr> {
     baseline::install(db).await?;
-    finish(db).await
+    index_file_pins(db).await?;
+    install_bucket_acl(db).await
 }
 
 pub(super) async fn upgrade<C: ConnectionTrait>(db: &C) -> Result<(), DbErr> {
@@ -50,14 +57,17 @@ pub(super) async fn upgrade<C: ConnectionTrait>(db: &C) -> Result<(), DbErr> {
     if versions.last().map(String::as_str) == Some(VERSION) {
         return Ok(());
     }
-    if !history::supported(&versions) {
-        return Err(DbErr::Migration(
-            "unsupported source schema: upgrade the previous gateway layout to m20261108_000001_current_pinning_config or later before the file pin upgrade".into(),
-        ));
+    if versions.last().map(String::as_str) != Some(FILE_PIN_VERSION) {
+        if !history::supported(&versions) {
+            return Err(DbErr::Migration(
+                "unsupported source schema: upgrade the previous gateway layout to m20261108_000001_current_pinning_config or later before the file pin upgrade".into(),
+            ));
+        }
+        remove_legacy::run(db).await?;
+        db.execute_unprepared("ALTER TABLE object_versions ADD COLUMN pin_decision TEXT")
+            .await?;
+        db.execute_unprepared(baseline::FILE_PINS).await?;
+        index_file_pins(db).await?;
     }
-    remove_legacy::run(db).await?;
-    db.execute_unprepared("ALTER TABLE object_versions ADD COLUMN pin_decision TEXT")
-        .await?;
-    db.execute_unprepared(baseline::FILE_PINS).await?;
-    finish(db).await
+    install_bucket_acl(db).await
 }

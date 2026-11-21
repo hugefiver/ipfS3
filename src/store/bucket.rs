@@ -11,36 +11,35 @@ use super::{
 };
 
 pub async fn create<C: ConnectionTrait>(db: &C, name: &str, owner: Option<&str>) -> AppResult<()> {
-    // Pre-check existence to avoid relying on backend-specific error strings.
-    if exists(db, name).await? {
-        return Err(AppError::BucketAlreadyExists(name.to_owned()));
-    }
+    create_with_acl(db, name, owner, None).await
+}
 
+pub(crate) async fn create_with_acl<C: ConnectionTrait>(
+    db: &C,
+    name: &str,
+    owner: Option<&str>,
+    canned_acl: Option<&str>,
+) -> AppResult<()> {
     let model = bucket::ActiveModel {
         name: Set(name.to_owned()),
         created_at: Set(Utc::now()),
         owner: Set(owner.map(|s| s.to_owned())),
         versioning_status: Set(None),
+        canned_acl: Set(canned_acl.map(str::to_owned)),
     };
 
-    // Concurrent inserts may still race past the exists() check. If the unique
-    // constraint fires, normalize it to BucketAlreadyExists; any other error
-    // propagates as-is.
-    match bucket::Entity::insert(model).exec(db).await {
-        Ok(_) => Ok(()),
-        Err(e) => {
-            let msg = e.to_string().to_lowercase();
-            if msg.contains("unique")
-                || msg.contains("duplicate")
-                || msg.contains("primary key")
-                || msg.contains("constraint")
-            {
-                Err(AppError::BucketAlreadyExists(name.to_owned()))
-            } else {
-                Err(AppError::from(e))
-            }
-        }
+    let inserted = bucket::Entity::insert(model)
+        .on_conflict(
+            sea_orm::sea_query::OnConflict::column(bucket::Column::Name)
+                .do_nothing()
+                .to_owned(),
+        )
+        .exec_without_returning(db)
+        .await?;
+    if inserted == 0 {
+        return Err(AppError::BucketAlreadyExists(name.to_owned()));
     }
+    Ok(())
 }
 
 pub async fn exists<C: ConnectionTrait>(db: &C, name: &str) -> AppResult<bool> {
@@ -154,11 +153,38 @@ pub async fn delete<C: ConnectionTrait + TransactionTrait>(db: &C, name: &str) -
 }
 
 pub async fn list<C: ConnectionTrait>(db: &C) -> AppResult<Vec<bucket::Model>> {
-    let buckets = bucket::Entity::find().all(db).await?;
+    Ok(bucket::Entity::find().all(db).await?)
+}
+
+pub async fn list_for_owner<C: ConnectionTrait>(
+    db: &C,
+    owner: &str,
+) -> AppResult<Vec<bucket::Model>> {
+    let buckets = bucket::Entity::find()
+        .filter(bucket::Column::Owner.eq(owner))
+        .all(db)
+        .await?;
     Ok(buckets)
 }
 
-#[allow(dead_code)]
+pub(crate) async fn set_acl_for_owner<C: ConnectionTrait>(
+    db: &C,
+    name: &str,
+    owner: &str,
+    canned_acl: &str,
+) -> AppResult<()> {
+    let result = bucket::Entity::update_many()
+        .col_expr(bucket::Column::CannedAcl, Expr::value(canned_acl))
+        .filter(bucket::Column::Name.eq(name))
+        .filter(bucket::Column::Owner.eq(owner))
+        .exec(db)
+        .await?;
+    if result.rows_affected == 0 {
+        return Err(AppError::AccessDenied("bucket owner changed".to_owned()));
+    }
+    Ok(())
+}
+
 pub async fn get<C: ConnectionTrait>(db: &C, name: &str) -> AppResult<bucket::Model> {
     bucket::Entity::find_by_id(name.to_owned())
         .one(db)

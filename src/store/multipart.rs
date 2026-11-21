@@ -242,6 +242,20 @@ pub async fn get_upload<C: ConnectionTrait>(
         .ok_or_else(|| AppError::NoSuchUpload(upload_id.to_owned()))
 }
 
+pub(crate) async fn get_upload_for_key<C: ConnectionTrait>(
+    db: &C,
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+) -> AppResult<multipart_upload::Model> {
+    multipart_upload::Entity::find_by_id(upload_id.to_owned())
+        .filter(multipart_upload::Column::Bucket.eq(bucket))
+        .filter(multipart_upload::Column::Key.eq(key))
+        .one(db)
+        .await?
+        .ok_or_else(|| AppError::NoSuchUpload(upload_id.to_owned()))
+}
+
 pub async fn delete_upload<C: ConnectionTrait>(db: &C, upload_id: &str) -> AppResult<()> {
     let result = multipart_upload::Entity::delete_by_id(upload_id.to_owned())
         .exec(db)

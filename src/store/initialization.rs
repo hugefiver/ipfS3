@@ -86,8 +86,8 @@ pub async fn open(db: &DatabaseConnection) -> Result<(), DbErr> {
     }
 }
 
-/// Run with the old gateway stopped and its remote pins released by the operator.
-/// Startup never calls this destructive migration.
+/// Run with the old gateway stopped. Pre-file-pin layouts also require the operator
+/// to release legacy remote pins before upgrading. Startup never upgrades existing databases.
 pub async fn upgrade_existing(db: &DatabaseConnection) -> Result<(), DbErr> {
     let tx = db.begin().await?;
     match db.get_database_backend() {

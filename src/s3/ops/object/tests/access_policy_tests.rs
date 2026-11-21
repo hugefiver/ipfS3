@@ -64,6 +64,102 @@ prefix = 'blocked/'
 }
 
 #[tokio::test]
+async fn anonymous_public_put_publishes_ordinary_tags_and_automatic_pins_only() {
+    use axum::{body::Body, error_handling::HandleError};
+    use http::{Method, Request, StatusCode};
+    use tower::ServiceExt as _;
+
+    let kubo = kubo_server(PIN_CID).await;
+    let mut state = test_state(kubo.uri()).await;
+    Arc::get_mut(&mut state).unwrap().pinning =
+        configured_coordinator(&kubo.uri(), "always", "all", "");
+    let db = state.store.db();
+    crate::store::bucket::create_with_acl(
+        db,
+        "bucket",
+        Some("test-owner"),
+        Some("public-read-write"),
+    )
+    .await
+    .unwrap();
+    let mut builder =
+        s3s::service::S3ServiceBuilder::new(crate::s3::handler::S3Impl::new(state.clone()));
+    builder.set_auth(crate::auth::GatewayAuth::new(state.clone()));
+    builder.set_access(access::GatewayAccess(state.clone()));
+    let app = axum::Router::new().fallback_service(HandleError::new(
+        builder.build(),
+        |_: s3s::HttpError| async { StatusCode::INTERNAL_SERVER_ERROR },
+    ));
+
+    for request in [
+        Request::put("/bucket/pin")
+            .header("x-amz-tagging", "ipfs-s3%3Apin=true")
+            .header("content-length", "4")
+            .body(Body::from("body"))
+            .unwrap(),
+        Request::put("/bucket/zip")
+            .header("x-ipfs3-zip-contract", "v2")
+            .header("content-length", "4")
+            .body(Body::from("body"))
+            .unwrap(),
+    ] {
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+    assert!(kubo.received_requests().await.unwrap().is_empty());
+
+    let request = Request::put("/bucket/plain")
+        .header("x-amz-tagging", "team=writers")
+        .header("content-length", "4")
+        .body(Body::from("body"))
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    for (method, uri) in [
+        (Method::GET, "/bucket/plain?tagging"),
+        (Method::DELETE, "/bucket/plain"),
+    ] {
+        let request = Request::builder()
+            .method(method)
+            .uri(uri)
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(request).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+    let version = crate::store::object_version::resolve_version(
+        db,
+        "bucket",
+        "plain",
+        &VersionSelector::Current,
+    )
+    .await
+    .unwrap();
+    let decision = crate::store::pinning::decision::read_for_version(db, &version.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(decision.origin.principal_id, access::ANONYMOUS_ORIGIN);
+    let owner = version.object.unwrap().id;
+    assert_eq!(
+        crate::store::pinning::tags::list_object_tags(db, &owner)
+            .await
+            .unwrap(),
+        vec![ObjectTag::new("team", "writers")]
+    );
+    let references = pin_references(db, &owner).await;
+    assert_eq!(references.len(), 2);
+    assert!(
+        references
+            .iter()
+            .all(|reference| reference.source == "automatic")
+    );
+}
+
+#[tokio::test]
 async fn unbound_session_is_rejected_for_object_reads_and_writes() {
     let (mut state, kubo) = versioned_read_state().await;
     let mut cfg = crate::config::Config::default_for_test();
@@ -93,6 +189,15 @@ async fn reads_and_copy_authorize_the_selected_version_and_write_request_tags() 
     let (state, kubo, historical) = policy_state().await;
     let source = "source.txt";
     let destination = "copy.txt";
+    let destination_bucket = "copy-target";
+    crate::store::bucket::create_with_acl(
+        state.store.db(),
+        destination_bucket,
+        Some("test-owner"),
+        Some("private"),
+    )
+    .await
+    .unwrap();
     let version = Some(historical.as_str());
     let mut replacement = http::HeaderMap::new();
     replacement.insert("x-amz-tagging-directive", "REPLACE".parse().unwrap());
@@ -156,15 +261,22 @@ async fn reads_and_copy_authorize_the_selected_version_and_write_request_tags() 
     .unwrap();
     assert_eq!(head.output.version_id.as_deref(), version);
 
-    let copy = copy_object(
-        &state,
-        copy_request_version(source, version, destination, replacement),
-    )
-    .await
-    .unwrap();
+    let mut denied_copy = copy_request_version(source, None, destination, replacement.clone());
+    denied_copy.input.bucket = destination_bucket.to_owned();
+    assert_eq!(
+        copy_object(&state, denied_copy)
+            .await
+            .unwrap_err()
+            .code()
+            .as_str(),
+        "AccessDenied"
+    );
+    let mut request = copy_request_version(source, version, destination, replacement);
+    request.input.bucket = destination_bucket.to_owned();
+    let copy = copy_object(&state, request).await.unwrap();
     assert_eq!(copy.output.copy_source_version_id.as_deref(), version);
     assert_eq!(
-        crate::store::object::get_latest(state.store.db(), "bucket", destination)
+        crate::store::object::get_latest(state.store.db(), destination_bucket, destination)
             .await
             .unwrap()
             .cid,
@@ -208,7 +320,6 @@ async fn object_reads_query_tags_only_when_policy_needs_them() {
         .unwrap();
         assert_eq!(head.output.version_id.as_deref(), version);
         let statements = std::mem::take(&mut *statements.lock().unwrap());
-        assert!(statements.iter().any(|sql| sql.contains("object_versions")));
         assert_eq!(
             statements
                 .iter()
@@ -293,12 +404,18 @@ async fn definite_delete_denials_preserve_error_order_without_mutating() {
         ]
     );
     let sql = std::mem::take(&mut *statements.lock().unwrap());
+    // Only the shared bucket lookup is needed when every item is denied or malformed.
     assert_eq!(
         sql.iter()
             .filter(|sql| sql.starts_with("SELECT") && sql.contains("buckets"))
             .count(),
         1
     );
+    assert!(!sql.iter().any(|sql| {
+        sql.contains("object_versions")
+            || sql.contains("object_tags")
+            || sql.starts_with("UPDATE \"buckets\"")
+    }));
     let current = crate::store::object::get_latest(state.store.db(), "bucket", key)
         .await
         .unwrap();

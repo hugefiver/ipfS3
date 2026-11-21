@@ -19,6 +19,7 @@ async fn behavior(db: &DatabaseConnection) {
     );
     for sql in [
         "UPDATE buckets SET versioning_status='unknown' WHERE name='semantics'",
+        "UPDATE buckets SET canned_acl='unknown' WHERE name='semantics'",
         "INSERT INTO object_tags(object_id,key,value) VALUES('missing','k','v')",
         "INSERT INTO bucket_lifecycle_configs(bucket,canonical_json,revision,created_at,updated_at) VALUES('semantics','{bad',1,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
         "INSERT INTO bucket_lifecycle_configs(bucket,canonical_json,revision,created_at,updated_at) VALUES('semantics','{}',0,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",

@@ -58,7 +58,20 @@ struct UserRules {
     buckets: HashMap<String, Vec<Rule>>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BucketGrant {
+    Legacy,
+    Owner,
+    None,
+    Read,
+    ReadWrite,
+}
+
 pub struct Scope<'a> {
+    grant: BucketGrant,
+    owner: bool,
+    anonymous: bool,
+    bucket_exists: bool,
     user: Option<&'a UserRules>,
     user_bucket: Option<&'a Vec<Rule>>,
     bucket: Option<&'a Vec<Rule>>,
@@ -106,16 +119,59 @@ impl Policies {
     pub fn scope(&self, user: &str, bucket: Option<&str>) -> Scope<'_> {
         let user = self.users.get(user);
         Scope {
+            grant: BucketGrant::Legacy,
+            owner: false,
+            anonymous: false,
+            bucket_exists: false,
             user,
             user_bucket: user.and_then(|user| bucket.and_then(|bucket| user.buckets.get(bucket))),
             bucket: bucket.and_then(|bucket| self.buckets.get(bucket)),
         }
     }
+
+    pub(crate) fn bucket_scope(
+        &self,
+        user: Option<&str>,
+        bucket: &str,
+        owner: Option<&str>,
+        canned_acl: Option<&str>,
+    ) -> Scope<'_> {
+        let mut scope = self.scope(user.unwrap_or(""), Some(bucket));
+        scope.bucket_exists = true;
+        scope.owner = user.is_some() && user == owner;
+        scope.anonymous = user.is_none();
+        scope.grant = match canned_acl {
+            None if user.is_some() => BucketGrant::Legacy,
+            Some(_) if scope.owner => BucketGrant::Owner,
+            Some("public-read-write") => BucketGrant::ReadWrite,
+            Some("public-read") => BucketGrant::Read,
+            Some("authenticated-read") if user.is_some() => BucketGrant::Read,
+            _ => BucketGrant::None,
+        };
+        scope
+    }
 }
 
 impl Scope<'_> {
+    pub(crate) fn bucket_exists(&self) -> bool {
+        self.bucket_exists
+    }
+
+    pub(crate) fn has_public_write_grant(&self) -> bool {
+        self.grant == BucketGrant::ReadWrite
+    }
+
+    pub(crate) fn without_public_grants(mut self) -> Self {
+        if matches!(self.grant, BucketGrant::Read | BucketGrant::ReadWrite) {
+            self.grant = BucketGrant::None;
+        }
+        self
+    }
+
     pub fn is_unrestricted(&self) -> bool {
-        self.user.is_none() && self.bucket.is_none()
+        matches!(self.grant, BucketGrant::Legacy | BucketGrant::Owner)
+            && self.user.is_none()
+            && self.bucket.is_none()
     }
 
     pub fn needs_existing_tags(&self, context: &Context<'_>) -> bool {
@@ -127,6 +183,10 @@ impl Scope<'_> {
     }
 
     pub(crate) fn decision(&self, context: &Context<'_>) -> Decision {
+        let management = matches!(context.action, Action::GetBucketAcl | Action::PutBucketAcl);
+        if management && !self.owner {
+            return Decision::Deny;
+        }
         if self.is_unrestricted() {
             return Decision::Allow;
         }
@@ -140,10 +200,35 @@ impl Scope<'_> {
             .chain(self.user_bucket.into_iter().flatten())
             .chain(self.bucket.into_iter().flatten());
 
-        let mut allow = false;
+        let mut allow = management
+            || match self.grant {
+                BucketGrant::Owner => true,
+                BucketGrant::Read | BucketGrant::ReadWrite => {
+                    use Action::*;
+                    match context.action {
+                        HeadBucket | GetBucketLocation | ListObjects | ListObjectsV2
+                        | ListObjectVersions | GetObject | HeadObject => true,
+                        PutObject
+                        | CreateMultipartUpload
+                        | UploadPart
+                        | CompleteMultipartUpload => {
+                            self.grant == BucketGrant::ReadWrite
+                                && matches!(context.resource, Resource::Object(_))
+                                && !context.request_tags.is_some_and(|tags| {
+                                    tags.iter().any(|tag| tag.key.starts_with("ipfs-s3:"))
+                                })
+                        }
+                        _ => false,
+                    }
+                }
+                BucketGrant::Legacy | BucketGrant::None => false,
+            };
         let mut pending_allow = false;
         let mut pending_deny = false;
-        for rule in rules.filter(|rule| rule.matches_request(context)) {
+        for rule in rules.filter(|rule| {
+            (!self.anonymous || matches!(rule.effect, Effect::Deny))
+                && rule.matches_request(context)
+        }) {
             match (
                 rule.effect,
                 rule.existing_tags.as_ref(),

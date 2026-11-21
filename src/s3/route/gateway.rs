@@ -230,7 +230,10 @@ mod tests {
             (Method::POST, "/bucket/key?ipfs3-import"),
             (Method::GET, "/bucket/key?ipfs3-import=job"),
             (Method::PUT, "/bucket/key?decompress-zip=prefix"),
-            (Method::POST, "/bucket/key?uploadId=id"),
+            (
+                Method::POST,
+                "/bucket/key?uploadId=id&X-Amz-Signature=incomplete",
+            ),
         ] {
             assert!(gateway.is_match(
                 &method,
@@ -240,6 +243,7 @@ mod tests {
             ));
         }
         for (method, uri) in [
+            (Method::POST, "/bucket/key?uploadId=id"),
             (Method::PUT, "/bucket/key?ipfs3-import"),
             (Method::POST, "/bucket/key?uploads"),
             (Method::GET, "/bucket/key?unrelated=true"),
@@ -309,6 +313,18 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(access_checks, 1);
         assert_eq!(dispatches, 1);
+
+        let (status, access_checks, dispatches, _) = call_through_s3_service(
+            Method::POST,
+            "archive.zip",
+            &[("uploadId", "missing")],
+            HeaderMap::new(),
+            b"<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>part</ETag></Part></CompleteMultipartUpload>".to_vec(),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!((access_checks, dispatches), (1, 1));
 
         let (status, access_checks, dispatches, _) = call_through_s3_service(
             Method::GET,

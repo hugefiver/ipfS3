@@ -4,11 +4,13 @@ The gateway keeps S3 metadata and durable work in SQLite or PostgreSQL. Object b
 
 ## Initialize an empty database
 
-Normal startup installs the final schema directly and records `m20261120_000001_file_pins` in `seaql_migrations`. It doesn't run the historical migration chain. On a current database startup reads the latest ledger marker; it doesn't rerun DDL or audit the catalog. It refuses nonempty databases with an older or missing marker. PostgreSQL serializes concurrent empty-schema initialization using a transaction-scoped advisory lock.
+Normal startup installs the final schema directly and records `m20261121_000001_bucket_acl` in `seaql_migrations`. It doesn't run the historical migration chain. On a current database startup reads the latest ledger marker; it doesn't rerun DDL or audit the catalog. It refuses nonempty databases with an older or missing marker. PostgreSQL serializes concurrent empty-schema initialization using a transaction-scoped advisory lock.
 
 ## Upgrade an existing database
 
-The old ledger must be an exact ordered prefix of the list below, with at least the first two entries. A matching last entry alone doesn't make an old ledger eligible.
+From `m20261120_000001_file_pins`, `--upgrade-database` adds the nullable bucket ACL column. It preserves pin resources and references, object data and in-flight uploads; no remote pins need to be released. Existing buckets keep their signed-access behavior until the recorded owner sets a [bucket default](local-policies.md#bucket-defaults).
+
+For databases **older than file-pins**, the old ledger must be an exact ordered prefix of the list below, with at least the first two entries. A matching last entry alone doesn't make an old ledger eligible.
 
 - `m20261027_000001_schema_baseline`
 - `m20261108_000001_current_pinning_config`
@@ -26,7 +28,7 @@ ipfs-s3-gateway --upgrade-database
 
 Check `storage.database_url` and any `IPFS_S3_DATABASE_URL` override before running the command. It opens that database and runs the schema change in a transaction without starting HTTP, workers, or Kubo or provider operations. If the connection is lost during commit, establish the database outcome before proceeding. Start only upgraded gateway and worker binaries after the upgrade succeeds. There's no down migration.
 
-The upgrade removes the old pin tables and management triggers and creates empty `pin_refs` and `pin_resources` tables. It retains buckets, object versions, ordinary tags, multipart uploads, ZIP and import records, lifecycle configuration, and residency. It doesn't recover remote handles, replay old pin requests, or rebuild references from S3 tags. For any file that still needs remote pinning, [submit a fresh signed request under the current policy](../README.md#standard-s3-tag-control).
+The upgrade from a pre-file-pins schema removes the old pin tables and management triggers and creates empty `pin_refs` and `pin_resources` tables. It retains buckets, object versions, ordinary tags, multipart uploads, ZIP and import records, lifecycle configuration, and residency. It doesn't recover remote handles, replay old pin requests, or rebuild references from S3 tags. For any file that still needs remote pinning, [submit a fresh signed request under the current policy](../README.md#standard-s3-tag-control).
 
 ## Durable import requests
 

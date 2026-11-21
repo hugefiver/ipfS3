@@ -30,7 +30,8 @@ impl WarningCode {
     }
 }
 
-/// Both identifiers are opaque and assigned after authentication. For guarded
+/// Opaque publication provenance assigned at admission. `principal_id` records
+/// the authenticated subject or the reserved anonymous origin. For guarded
 /// publications, `request_id` is the exact mutation ID, MPU upload ID, or import
 /// job ID; the publication API rejects a capture from another admission.
 /// Do not use object keys, tag values or provider response text here.
@@ -49,15 +50,15 @@ impl DecisionOrigin {
     }
 
     fn valid(&self) -> bool {
-        [&self.principal_id, &self.request_id]
-            .into_iter()
-            .all(|id| {
-                !id.is_empty()
-                    && id.len() <= 128
-                    && id
-                        .bytes()
-                        .all(|byte| byte.is_ascii_alphanumeric() || b"-_:.".contains(&byte))
-            })
+        let valid_id = |id: &str| {
+            !id.is_empty()
+                && id.len() <= 128
+                && id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"-_:.".contains(&byte))
+        };
+        (self.principal_id == crate::access::ANONYMOUS_ORIGIN || valid_id(&self.principal_id))
+            && valid_id(&self.request_id)
     }
 }
 
@@ -245,6 +246,15 @@ mod tests {
     use super::*;
     use crate::pinning::config::{LeaseDuration, ProviderMode};
     use crate::pinning::tags::ContentMode;
+
+    #[test]
+    fn anonymous_provenance_is_valid_only_as_the_exact_principal_id() {
+        let anonymous = crate::access::ANONYMOUS_ORIGIN;
+        assert!(DecisionOrigin::new(anonymous, "anon-upload").valid());
+        assert!(DecisionOrigin::new("ipfs-s3:anonymous", "upload").valid());
+        assert!(!DecisionOrigin::new(format!("{anonymous}-other"), "upload").valid());
+        assert!(!DecisionOrigin::new("owner", anonymous).valid());
+    }
 
     #[test]
     fn legacy_unknown_snapshot_is_identifiable_and_cannot_become_manual() {

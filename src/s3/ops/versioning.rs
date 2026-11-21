@@ -4,7 +4,9 @@ use s3s::dto::*;
 use s3s::{S3Request, S3Response, S3Result};
 
 use crate::{
+    access::{authorize, authorize_bucket},
     error::AppError,
+    iam::{Action, Resource},
     state::AppState,
     store::object_version::{BucketVersioningState, ResolvedVersion, VersionCursor, VersionKind},
 };
@@ -201,6 +203,14 @@ pub async fn list_object_versions(
     state: &Arc<AppState>,
     req: S3Request<ListObjectVersionsInput>,
 ) -> S3Result<S3Response<ListObjectVersionsOutput>> {
+    let model = authorize_bucket(
+        state,
+        &req,
+        Action::ListObjectVersions,
+        &req.input.bucket,
+        Resource::Prefix(req.input.prefix.as_deref().unwrap_or("")),
+    )
+    .await?;
     let input = req.input;
     let bucket = input.bucket;
     let prefix = input.prefix.unwrap_or_default();
@@ -212,7 +222,7 @@ pub async fn list_object_versions(
     let url_encode = url_encoding_requested(encoding_type.as_ref());
 
     let versioning_state =
-        crate::store::bucket::get_versioning_state(state.store.db(), &bucket).await?;
+        BucketVersioningState::from_db_value(model.versioning_status.as_deref())?;
     let cursor = crate::store::object_version::validate_version_cursor(
         state.store.db(),
         &bucket,
@@ -273,8 +283,16 @@ pub async fn get_bucket_versioning(
     state: &Arc<AppState>,
     req: S3Request<GetBucketVersioningInput>,
 ) -> S3Result<S3Response<GetBucketVersioningOutput>> {
+    let model = authorize_bucket(
+        state,
+        &req,
+        Action::GetBucketVersioning,
+        &req.input.bucket,
+        Resource::Bucket,
+    )
+    .await?;
     let versioning_state =
-        crate::store::bucket::get_versioning_state(state.store.db(), &req.input.bucket).await?;
+        BucketVersioningState::from_db_value(model.versioning_status.as_deref())?;
     let status = match versioning_state {
         BucketVersioningState::Unversioned => None,
         BucketVersioningState::Enabled => Some(BucketVersioningStatus::from_static(
@@ -295,8 +313,15 @@ pub async fn put_bucket_versioning(
     state: &Arc<AppState>,
     req: S3Request<PutBucketVersioningInput>,
 ) -> S3Result<S3Response<PutBucketVersioningOutput>> {
+    authorize(
+        state,
+        &req,
+        Action::PutBucketVersioning,
+        Some(&req.input.bucket),
+        Resource::Bucket,
+    )
+    .await?;
     let input = req.input;
-    crate::store::bucket::get(state.store.db(), &input.bucket).await?;
 
     if input.mfa.is_some() {
         return Err(AppError::InvalidArgument("MFA delete is not supported".to_owned()).into());
@@ -532,6 +557,30 @@ mod tests {
                 .map(BucketVersioningStatus::as_str),
             Some(BucketVersioningStatus::SUSPENDED)
         );
+    }
+
+    #[tokio::test]
+    async fn get_bucket_versioning_reuses_the_authorization_read() {
+        use s3s::S3 as _;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let mut state = state_with_bucket().await;
+        let reads = Arc::new(AtomicUsize::new(0));
+        let observed = reads.clone();
+        let mut db = state.store.db().clone();
+        db.set_metric_callback(move |info| {
+            let sql = &info.statement.sql;
+            if sql.starts_with("SELECT") && sql.contains("FROM \"buckets\"") {
+                observed.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        Arc::get_mut(&mut state).unwrap().store = store::Store::new(db);
+
+        crate::s3::handler::S3Impl::new(state)
+            .get_bucket_versioning(get_request("bucket"))
+            .await
+            .unwrap();
+        assert_eq!(reads.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
@@ -822,6 +871,64 @@ mod tests {
         assert_eq!(third.is_truncated, Some(false));
         assert_eq!(third.next_key_marker, None);
         assert_eq!(third.next_version_id_marker, None);
+    }
+
+    #[tokio::test]
+    async fn anonymous_list_versions_authorizes_before_validating_markers() {
+        use axum::{body::Body, error_handling::HandleError};
+        use http::{Request, StatusCode};
+        use tower::ServiceExt as _;
+
+        let mut state = state_with_bucket().await;
+        store::bucket::create_with_acl(
+            state.store.db(),
+            "public-bucket",
+            Some("owner"),
+            Some("public-read"),
+        )
+        .await
+        .unwrap();
+        let mut config = crate::config::Config::default_for_test();
+        config.auth = toml::from_str(
+            r#"
+[[policy]]
+effect = 'deny'
+bucket = 'public-bucket'
+prefix = 'blocked/'
+actions = ['ListObjectVersions']
+"#,
+        )
+        .unwrap();
+        Arc::get_mut(&mut state).unwrap().credentials =
+            crate::auth::GatewayCredentials::from_config(&config).unwrap();
+        let mut builder =
+            s3s::service::S3ServiceBuilder::new(crate::s3::handler::S3Impl::new(state.clone()));
+        builder.set_auth(crate::auth::GatewayAuth::new(state.clone()));
+        builder.set_access(crate::access::GatewayAccess(state));
+        let app = axum::Router::new().fallback_service(HandleError::new(
+            builder.build(),
+            |_: s3s::HttpError| async { StatusCode::INTERNAL_SERVER_ERROR },
+        ));
+
+        for (uri, expected) in [
+            ("/public-bucket?versions&prefix=open%2F", StatusCode::OK),
+            (
+                "/public-bucket?versions&prefix=open%2F&version-id-marker=null",
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "/public-bucket?versions&prefix=blocked%2F&version-id-marker=null",
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                "/missing-bucket?versions&version-id-marker=null",
+                StatusCode::FORBIDDEN,
+            ),
+        ] {
+            let request = Request::get(uri).body(Body::empty()).unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), expected, "{uri}");
+        }
     }
 
     #[tokio::test]

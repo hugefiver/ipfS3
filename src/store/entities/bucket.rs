@@ -8,6 +8,7 @@ pub struct Model {
     pub created_at: DateTimeUtc,
     pub owner: Option<String>,
     pub versioning_status: Option<String>,
+    pub canned_acl: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

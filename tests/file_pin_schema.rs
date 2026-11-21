@@ -8,6 +8,8 @@ async fn upgrade(db: &DatabaseConnection) {
     let backend = db.get_database_backend();
     db.execute_unprepared("CREATE TABLE seaql_migrations(version TEXT PRIMARY KEY,applied_at BIGINT NOT NULL);
         INSERT INTO seaql_migrations VALUES ('m20261027_000001_schema_baseline',0),('m20261108_000001_current_pinning_config',0),('m20261109_000001_pin_cid_comparisons',0),('m20261110_000001_requeue_retained',0);
+        CREATE TABLE buckets(name TEXT PRIMARY KEY, owner TEXT);
+        INSERT INTO buckets VALUES ('legacy','owner');
         CREATE TABLE object_versions(id TEXT PRIMARY KEY);
         INSERT INTO object_versions VALUES ('v1');
         CREATE TABLE object_tags(object_id TEXT, key TEXT, value TEXT);
@@ -58,6 +60,19 @@ async fn upgrade(db: &DatabaseConnection) {
         "original"
     );
     assert_eq!(row.try_get::<String>("", "custom_id").unwrap(), "customer");
+    let bucket = db
+        .query_one(Statement::from_string(
+            backend,
+            "SELECT owner,canned_acl FROM buckets WHERE name='legacy'",
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(bucket.try_get::<String>("", "owner").unwrap(), "owner");
+    assert_eq!(
+        bucket.try_get::<Option<String>>("", "canned_acl").unwrap(),
+        None
+    );
     db.execute_unprepared("UPDATE import_job_requests SET metadata_json='updated'")
         .await
         .unwrap();
@@ -86,6 +101,49 @@ async fn upgrade(db: &DatabaseConnection) {
             .unwrap();
         assert!(result.is_empty());
     }
+}
+
+async fn upgrade_file_pin_bucket_acl(db: &DatabaseConnection) {
+    run_migrations(db).await.unwrap();
+    db.execute_unprepared("ALTER TABLE buckets DROP COLUMN canned_acl;
+        UPDATE seaql_migrations SET version='m20261120_000001_file_pins';
+        INSERT INTO buckets(name, owner) VALUES ('photos','alice');
+        INSERT INTO multipart_uploads(upload_id,object_id,bucket,key) VALUES ('upload','pending','photos','video');
+        INSERT INTO multipart_parts(upload_id,part_number,cid,size,etag) VALUES ('upload',1,'part-cid',5,'part-etag');
+        INSERT INTO pin_resources(provider,cid,logical_size,status,handle) VALUES ('remote','pinned-cid',5,'accepted','handle');
+        INSERT INTO pin_refs(owner_object_id,provider,cid,source,policy_id,content_mode,expires_at) VALUES ('file','remote','pinned-cid','manual','policy','object',99)").await.unwrap();
+    assert!(run_migrations(db).await.is_err());
+    initialization::upgrade_existing(db).await.unwrap();
+    run_migrations(db).await.unwrap();
+    let row = db.query_one(Statement::from_string(db.get_database_backend(),
+        "SELECT b.owner,b.canned_acl,p.cid AS part,r.handle FROM buckets b
+         JOIN multipart_uploads u ON b.name=u.bucket JOIN multipart_parts p ON u.upload_id=p.upload_id,
+         pin_refs f JOIN pin_resources r ON f.provider=r.provider AND f.cid=r.cid
+         WHERE b.name='photos' AND f.owner_object_id='file'" )).await.unwrap().unwrap();
+    assert_eq!(row.try_get::<String>("", "owner").unwrap(), "alice");
+    assert_eq!(
+        row.try_get::<Option<String>>("", "canned_acl").unwrap(),
+        None
+    );
+    assert_eq!(row.try_get::<String>("", "part").unwrap(), "part-cid");
+    assert_eq!(row.try_get::<String>("", "handle").unwrap(), "handle");
+    assert!(
+        db.execute_unprepared("UPDATE buckets SET canned_acl='unknown'")
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn sqlite_upgrades_file_pin_buckets_without_replacing_pin_or_mpu_data() {
+    let db = Database::connect("sqlite::memory:").await.unwrap();
+    upgrade_file_pin_bucket_acl(&db).await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated IPFS_S3_TEST_POSTGRES_URL"]
+async fn postgres_upgrades_file_pin_buckets_without_replacing_pin_or_mpu_data() {
+    postgres::with_schema(|db| async move { upgrade_file_pin_bucket_acl(&db).await }).await;
 }
 
 #[tokio::test]

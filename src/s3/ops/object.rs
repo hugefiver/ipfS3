@@ -8,6 +8,7 @@ use futures_util::{Stream, StreamExt};
 use s3s::dto::*;
 use s3s::{S3Request, S3Response, S3Result};
 
+use crate::access;
 use crate::crypto::EncryptionMode;
 use crate::crypto::chunker::{EncryptedRange, decrypt_chunk_stream};
 use crate::error::{AppError, AppResult};
@@ -748,6 +749,13 @@ fn object_policy_denied() -> AppError {
     AppError::AccessDenied("Access Denied".to_owned())
 }
 
+fn object_version_selector(version_id: Option<&str>) -> AppResult<VersionSelector> {
+    match version_id {
+        Some(version) => PublicVersionId::parse_s3(version).map(VersionSelector::Exact),
+        None => Ok(VersionSelector::Current),
+    }
+}
+
 struct SelectedS3Object {
     object: object::Model,
     version_row_id: String,
@@ -759,7 +767,7 @@ struct SelectedS3Object {
 
 async fn select_s3_object(
     state: &Arc<AppState>,
-    scope: Scope<'_>,
+    scope: &Scope<'_>,
     action: Action,
     bucket: &str,
     key: &str,
@@ -772,25 +780,26 @@ async fn select_s3_object(
         Decision::Deny => return Err(object_policy_denied().into()),
         Decision::NeedsExistingTags => true,
     };
-    let selector = match version_id {
-        Some(version_id) => VersionSelector::Exact(PublicVersionId::parse_s3(version_id)?),
-        None => VersionSelector::Current,
+    let selector = object_version_selector(version_id)?;
+    let snapshot = if scope.bucket_exists() {
+        crate::store::object_version::read_snapshot_projected(
+            state.store.db(),
+            bucket,
+            key,
+            &selector,
+            copy_source_tags || needs_existing_tags,
+        )
+        .await
+    } else {
+        Err(AppError::NoSuchBucket(bucket.to_owned()))
     };
-    let snapshot = crate::store::object_version::read_snapshot_projected(
-        state.store.db(),
-        bucket,
-        key,
-        &selector,
-        copy_source_tags || needs_existing_tags,
-    )
-    .await;
     if needs_existing_tags {
         match &snapshot {
-            Ok(snapshot) => check_object_policy(&scope, &context, None, Some(&snapshot.tags))?,
+            Ok(snapshot) => check_object_policy(scope, &context, None, Some(&snapshot.tags))?,
             Err(
                 AppError::NoSuchBucket(_) | AppError::NoSuchKey(_) | AppError::NoSuchVersion { .. },
             ) => {
-                check_object_policy(&scope, &context, None, Some(&[]))?;
+                check_object_policy(scope, &context, None, Some(&[]))?;
             }
             Err(_) => {}
         }
@@ -851,10 +860,25 @@ pub async fn put_object(
     let key = &req.input.key;
     let content_type = req.input.content_type.clone();
     let db = state.store.db();
-    let principal = principal_id(state, &req)?;
+    let principal = access::subject(state, &req)?;
+    if principal.is_none() && !access::anonymous_http(&req) {
+        return Err(s3s::s3_error!(
+            AccessDenied,
+            "authenticated principal is required"
+        ));
+    }
     let tags = parse_publication_tags(&req.headers)?;
+    if principal.is_none() && tags.iter().any(|tag| tag.key.starts_with("ipfs-s3:")) {
+        return Err(object_policy_denied().into());
+    }
+    let scope = access::bucket_scope(state, db, principal, bucket).await?;
+    let scope = if principal.is_some() && access::has_zip_controls(&req.headers, &req.uri) {
+        scope.without_public_grants()
+    } else {
+        scope
+    };
     check_object_policy(
-        &state.credentials.policies.scope(&principal, Some(bucket)),
+        &scope,
         &object_access_context(Action::PutObject, key, None),
         Some(&tags),
         None,
@@ -867,11 +891,10 @@ pub async fn put_object(
         state.pinning.zip_root_default(),
     )?;
 
-    // Validate the bucket exists.
-    let exists = crate::store::bucket::exists(db, bucket).await?;
-    if !exists {
+    if !scope.bucket_exists() {
         return Err(s3s::s3_error!(NoSuchBucket, "bucket not found: {}", bucket));
     }
+    let origin = principal.unwrap_or(access::ANONYMOUS_ORIGIN).to_owned();
 
     let enc_mode = determine_encryption_mode(&req.headers)?;
     let sse_c_headers = match enc_mode {
@@ -888,7 +911,7 @@ pub async fn put_object(
         .ok_or_else(|| s3s::s3_error!(IncompleteBody, "request body is missing"))?;
 
     let preflight =
-        capture_publication_decision(state, bucket, key, &tags, &principal, PREFLIGHT_MUTATION_ID)?;
+        capture_publication_decision(state, bucket, key, &tags, &origin, PREFLIGHT_MUTATION_ID)?;
 
     let mutation_guard = crate::store::import::ownership::admit_content_mutation(
         db,
@@ -905,7 +928,7 @@ pub async fn put_object(
         bucket,
         key,
         &tags,
-        &principal,
+        &origin,
         &mutation_guard.mutation_id,
     )
     .and_then(|captured| {
@@ -1032,7 +1055,7 @@ pub async fn get_object(
     let key = &req.input.key;
     let selected = select_s3_object(
         state,
-        crate::access::scope(state, &req, Some(bucket))?,
+        &access::request_bucket_scope(state, &req, bucket).await?,
         Action::GetObject,
         bucket,
         key,
@@ -1142,7 +1165,7 @@ pub async fn head_object(
     let key = &req.input.key;
     let selected = select_s3_object(
         state,
-        crate::access::scope(state, &req, Some(bucket))?,
+        &access::request_bucket_scope(state, &req, bucket).await?,
         Action::HeadObject,
         bucket,
         key,
@@ -1197,21 +1220,12 @@ async fn delete_object_item(
     scope: &Scope<'_>,
     (bucket, key): (&str, &str),
     version_id: Option<&str>,
-    bucket_prechecked: bool,
+    selector: VersionSelector,
 ) -> AppResult<crate::store::object_version::DeleteVersionResult> {
-    let selector = match version_id {
-        Some(version_id) => VersionSelector::Exact(PublicVersionId::parse_s3(version_id)?),
-        None => VersionSelector::Current,
-    };
     let context = object_access_context(Action::DeleteObject, key, version_id);
     let authorize_tags = match scope.decision(&context) {
         Decision::Allow => None,
-        Decision::Deny => {
-            if !bucket_prechecked && !crate::store::bucket::exists(db, bucket).await? {
-                return Err(AppError::NoSuchBucket(bucket.to_owned()));
-            }
-            return Err(object_policy_denied());
-        }
+        Decision::Deny => return Err(object_policy_denied()),
         Decision::NeedsExistingTags => {
             Some(|tags: &[ObjectTag]| check_object_policy(scope, &context, None, Some(tags)))
         }
@@ -1238,15 +1252,14 @@ pub async fn delete_object(
         version_id,
         ..
     } = &req.input;
-    let scope = state.credentials.policies.scope(&principal, Some(bucket));
-    let result = delete_object_item(
-        state.store.db(),
-        &scope,
-        (bucket, key),
-        version_id.as_deref(),
-        false,
-    )
-    .await?;
+    let version_id = version_id.as_deref();
+    let selector = object_version_selector(version_id)?;
+    let db = state.store.db();
+    let scope = access::bucket_scope(state, db, Some(&principal), bucket).await?;
+    if !scope.bucket_exists() {
+        return Err(AppError::NoSuchBucket(bucket.to_owned()).into());
+    }
+    let result = delete_object_item(db, &scope, (bucket, key), version_id, selector).await?;
     Ok(S3Response::new(DeleteObjectOutput {
         delete_marker: (result.created_delete_marker || result.deleted_delete_marker)
             .then_some(true),
@@ -1298,12 +1311,10 @@ pub async fn delete_objects(
     }
     let principal = principal_id(state, &req)?;
     let db = state.store.db();
-
-    if !crate::store::bucket::exists(db, bucket).await? {
+    let scope = access::bucket_scope(state, db, Some(&principal), bucket).await?;
+    if !scope.bucket_exists() {
         return Err(s3s::s3_error!(NoSuchBucket, "bucket not found: {}", bucket));
     }
-
-    let scope = state.credentials.policies.scope(&principal, Some(bucket));
     let quiet = delete.quiet.unwrap_or(false);
     let mut deleted = Vec::new();
     let mut errors = Vec::new();
@@ -1311,15 +1322,14 @@ pub async fn delete_objects(
     for object in &delete.objects {
         let key = &object.key;
         let incoming_version_id = &object.version_id;
-        match delete_object_item(
-            db,
-            &scope,
-            (bucket, key),
-            incoming_version_id.as_deref(),
-            true,
-        )
-        .await
-        {
+        let version_id = incoming_version_id.as_deref();
+        let result = match object_version_selector(version_id) {
+            Ok(selector) => {
+                delete_object_item(db, &scope, (bucket, key), version_id, selector).await
+            }
+            Err(error) => Err(error),
+        };
+        match result {
             Ok(result) if !quiet => {
                 let exact_version_id = incoming_version_id.clone();
                 let delete_marker_version_id = if result.created_delete_marker {
@@ -1373,11 +1383,9 @@ pub async fn copy_object(
     let db = state.store.db();
     let principal = principal_id(state, &req)?;
     let replacement_tags = copy_replacement_tags(&req.headers)?;
+    let dst_scope = access::bucket_scope(state, db, Some(&principal), dst_bucket).await?;
     check_object_policy(
-        &state
-            .credentials
-            .policies
-            .scope(&principal, Some(dst_bucket)),
+        &dst_scope,
         &object_access_context(Action::CopyObject, dst_key, None),
         replacement_tags.as_deref(),
         None,
@@ -1398,13 +1406,17 @@ pub async fn copy_object(
         }
     };
 
+    let src_scope;
+    let src_scope = if &src_bucket == dst_bucket {
+        &dst_scope
+    } else {
+        src_scope = access::bucket_scope(state, db, Some(&principal), &src_bucket).await?;
+        &src_scope
+    };
     let inherit_tags = replacement_tags.is_none();
     let selected_source = select_s3_object(
         state,
-        state
-            .credentials
-            .policies
-            .scope(&principal, Some(&src_bucket)),
+        src_scope,
         Action::GetObject,
         &src_bucket,
         &src_key,
@@ -1439,9 +1451,7 @@ pub async fn copy_object(
         None
     };
 
-    // Validate destination bucket exists.
-    let dst_exists = crate::store::bucket::exists(db, dst_bucket).await?;
-    if !dst_exists {
+    if !dst_scope.bucket_exists() {
         return Err(s3s::s3_error!(
             NoSuchBucket,
             "bucket not found: {}",

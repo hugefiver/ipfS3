@@ -360,7 +360,9 @@ pub(super) async fn complete(
     }) {
         return Err(conflict());
     }
-    let scope = access::scope(state, &req, Some(&intake.bucket))?;
+    let scope = access::scope(state, &req, Some(&intake.bucket))
+        .await?
+        .without_public_grants();
     if req.headers.contains_key("x-amz-tagging") || !scope.is_unrestricted() {
         let contract: serde_json::Value =
             serde_json::from_str(&admitted.request_contract).map_err(|_| conflict())?;

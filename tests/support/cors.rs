@@ -149,6 +149,7 @@ pub fn gateway_router(state: Arc<AppState>, imports: Arc<ImportCoordinator>) -> 
     let mut builder = S3ServiceBuilder::new(s3_impl);
     builder.set_validation(AwsNameValidation::new());
     builder.set_auth(GatewayAuth::new(state.clone()));
+    builder.set_access(ipfs_s3_gateway::access::GatewayAccess(state.clone()));
     builder.set_route(GatewayRoute::new(state.clone(), imports));
 
     Router::new()

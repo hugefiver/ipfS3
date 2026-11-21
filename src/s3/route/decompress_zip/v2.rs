@@ -759,9 +759,6 @@ pub(super) async fn put(
     if has_sse_header(&req.headers) {
         return Err(failure("ZIP v2 does not support encryption"));
     }
-    if !crate::store::bucket::exists(state.store.db(), &parsed.bucket).await? {
-        return Err(s3s::s3_error!(NoSuchBucket, "bucket not found"));
-    }
     let tags = super::parse_publication_tags(&req.headers)?;
     let crate::zip::options::ZipOptions::V2(incoming_options) = &controls.options else {
         return Err(failure("ZIP v2 requires negotiated controls"));
@@ -1362,7 +1359,7 @@ pub(super) async fn status(state: &AppState, req: S3Request<Body>) -> S3Result<S
         return Err(failure("invalid ZIP v2 batch query"));
     }
     let principal = crate::s3::ops::object::principal_id(state, &req)?;
-    let scope = access::scope(state, &req, Some(&bucket))?;
+    let scope = access::scope(state, &req, Some(&bucket)).await?;
     let id = &query[0].1;
     let found = execution::read(state.store.db(), id)
         .await

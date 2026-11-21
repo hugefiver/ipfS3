@@ -114,7 +114,7 @@ impl ImportObjectRoute {
             }
         }
 
-        let scope = access::scope(&self.state, &req, Some(&parsed_query.bucket))?;
+        let scope = access::scope(&self.state, &req, Some(&parsed_query.bucket)).await?;
         super::authorize_zip(
             &scope,
             Action::ImportObject,
@@ -479,7 +479,7 @@ impl ImportObjectRoute {
     async fn status(&self, req: S3Request<Body>) -> S3Result<S3Response<Body>> {
         let parsed = parse_status_query(&req.uri)?;
         let principal = crate::s3::ops::object::principal_id(&self.state, &req)?;
-        let scope = access::scope(&self.state, &req, Some(&parsed.bucket))?;
+        let scope = access::scope(&self.state, &req, Some(&parsed.bucket)).await?;
         if let Some(status) = import_intake::read_for_path(
             self.state.store.db(),
             &parsed.job_id,

@@ -33,7 +33,7 @@ pub(super) async fn authorized_tags(
         request_tags,
         existing_tags: None,
     };
-    let scope = state.credentials.policies.scope(principal, Some(bucket));
+    let scope = crate::access::bucket_scope(state, txn, Some(principal), bucket).await?;
     let denied = || AppError::AccessDenied("access denied by policy".into());
     let needs_tags = match scope.decision(&context) {
         Decision::Allow => false,
@@ -53,7 +53,9 @@ pub(super) async fn authorized_tags(
         Ok(())
     };
 
-    let selected = if matches!(
+    let selected = if !scope.bucket_exists() {
+        Err(AppError::NoSuchBucket(bucket.to_owned()))
+    } else if matches!(
         action,
         Action::PutObjectTagging | Action::DeleteObjectTagging
     ) {

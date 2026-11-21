@@ -14,7 +14,7 @@ An S3-compatible gateway backed by IPFS (Kubo). Translates S3 API calls into Kub
 - **Import and ZIP:** Signed CID or allowlisted HTTPS imports have durable job status and fenced publication. ZIP extraction supports direct PUT, multipart completion and import, with durable batch results and optional UnixFS directory roots.
 - **Metadata and deployment:** SQLite or PostgreSQL via SeaORM. The two-gateway profile shares PostgreSQL and Kubo; the same-host Cluster profile adds private-swarm pinset replication. See [database initialization and upgrades](docs/database-storage.md).
 
-Static credentials work without additional configuration. Use [local user and bucket policies](docs/local-policies.md) to restrict access and [local session credentials](docs/local-sessions.md) for temporary signed S3 access. `ExpectedBucketOwner` independently compares a supplied value with the bucket owner. Pin-provider dispatch limits do not limit S3 requests.
+New buckets default to `private`. The owner can change the [bucket ACL](docs/local-policies.md#bucket-defaults) with `aws s3api put-bucket-acl`; existing objects inherit the change. Use [local policies](docs/local-policies.md#scope-and-precedence) to share a prefix or deny specific operations, and [local session credentials](docs/local-sessions.md) for temporary signed S3 access. `ExpectedBucketOwner` independently compares a supplied value with the bucket owner. Pin-provider dispatch limits do not limit S3 requests.
 
 **Prometheus:** set `IPFS_S3_METRICS_BIND=127.0.0.1:9090` (or `[metrics].bind` in TOML) and scrape `http://127.0.0.1:9090/metrics`. The optional listener serves in-process S3 and pin timings without querying Kubo or the database. It does not reserve a bucket name on the S3 port.
 

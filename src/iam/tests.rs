@@ -219,6 +219,84 @@ fn existing_tags_are_loaded_only_if_they_can_change_the_decision() {
 }
 
 #[test]
+fn public_grant_respects_version_tag_denies_and_never_delegates_bucket_rules_to_anonymous() {
+    let policies = compile(
+        r#"
+        [[policy]]
+        effect = "allow"
+        bucket = "photos"
+        actions = ["DeleteObject", "PutBucketAcl"]
+
+        [[policy]]
+        effect = "deny"
+        bucket = "photos"
+        actions = ["GetObject"]
+        version = "null"
+        existing_tags = { hidden = "yes" }
+
+        [[policy]]
+        effect = "deny"
+        user = "owner"
+        actions = ["GetBucketAcl"]
+    "#,
+    )
+    .unwrap();
+    let public = |user| policies.bucket_scope(user, "photos", Some("owner"), Some("public-read"));
+    let get = context(Action::GetObject, Resource::Object("photo"));
+    for user in [None, Some("owner"), Some("reader")] {
+        let scope = public(user);
+        assert!(scope.allows(&get));
+        let version = Context {
+            version: Some("null"),
+            ..get
+        };
+        assert!(scope.needs_existing_tags(&version));
+        assert!(!scope.allows(&Context {
+            existing_tags: Some(&[ObjectTag::new("hidden", "yes")]),
+            ..version
+        }));
+        assert!(scope.allows(&Context {
+            existing_tags: Some(&[]),
+            ..version
+        }));
+    }
+    let delete = context(Action::DeleteObject, Resource::Object("photo"));
+    assert!(!public(None).allows(&delete));
+    assert!(public(Some("reader")).allows(&delete));
+    let set_acl = context(Action::PutBucketAcl, Resource::Bucket);
+    assert!(!public(Some("reader")).allows(&set_acl));
+    assert!(public(Some("owner")).allows(&set_acl));
+    assert!(!public(Some("owner")).allows(&context(Action::GetBucketAcl, Resource::Bucket)));
+}
+
+#[test]
+fn canned_grants_distinguish_signature_and_ordinary_writes_without_legacy_fallback() {
+    let policies = Policies::default();
+    let scope = |user, acl| policies.bucket_scope(user, "bucket", Some("owner"), acl);
+    let list = context(Action::ListObjectsV2, Resource::Prefix(""));
+    assert!(!scope(None, None).allows(&list));
+    assert!(scope(Some("reader"), None).allows(&list));
+    assert!(!scope(Some("reader"), Some("private")).allows(&list));
+    assert!(scope(Some("owner"), Some("private")).allows(&list));
+    assert!(!scope(None, Some("authenticated-read")).allows(&list));
+    assert!(scope(Some("reader"), Some("authenticated-read")).allows(&list));
+
+    let write = context(Action::CreateMultipartUpload, Resource::Object("photo"));
+    assert!(!scope(None, Some("public-read")).allows(&write));
+    let public = scope(None, Some("public-read-write"));
+    assert!(public.allows(&write));
+    assert!(!public.allows(&Context {
+        resource: Resource::Prefix("extract/"),
+        ..write
+    }));
+    assert!(!public.allows(&Context {
+        request_tags: Some(&[ObjectTag::new("ipfs-s3:pin", "true")]),
+        ..write
+    }));
+    assert!(!public.without_public_grants().allows(&write));
+}
+
+#[test]
 fn invalid_scope_and_unbindable_conditions_are_rejected_at_startup() {
     for config in [
         r#"actions = ["GetObject"]"#,

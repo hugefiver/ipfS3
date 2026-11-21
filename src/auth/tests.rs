@@ -28,6 +28,25 @@ fn auth_config_rejects_unknown_fields_and_unknown_policy_users() {
 }
 
 #[test]
+fn anonymous_provenance_is_reserved_without_blocking_the_legacy_static_key() {
+    let mut cfg = config();
+    let legacy_key = "ipfs-s3:anonymous";
+    cfg.auth.credentials[0].access_key = legacy_key.to_owned();
+    let credentials = GatewayCredentials::from_config(&cfg).unwrap();
+    assert_eq!(credentials.secret_key(legacy_key).unwrap().expose(), "test");
+    assert_eq!(
+        credentials
+            .principal(legacy_key, &HeaderMap::new(), &Uri::from_static("/"))
+            .unwrap(),
+        legacy_key
+    );
+    assert!(credentials.issue_session(legacy_key, 60).is_ok());
+
+    cfg.auth.credentials[0].access_key = crate::access::ANONYMOUS_ORIGIN.to_owned();
+    assert!(GatewayCredentials::from_config(&cfg).is_err());
+}
+
+#[test]
 fn issuance_requires_known_subject_valid_duration_and_separate_key_namespace() {
     let mut cfg = config();
     let credentials = GatewayCredentials::from_config(&cfg).unwrap();

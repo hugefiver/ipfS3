@@ -888,7 +888,7 @@ impl DecompressZipRoute {
         )?
         .ok_or_else(|| s3s::s3_error!(InternalError, "missing ZIP controls"))?;
         let (bucket, key) = parse_path_bucket_key(&req.uri)?;
-        let scope = access::scope(&self.state, &req, Some(&bucket))?;
+        let scope = access::scope(&self.state, &req, Some(&bucket)).await?;
         super::authorize_zip(
             &scope,
             Action::DecompressZip,
@@ -915,13 +915,6 @@ impl DecompressZipRoute {
             return Err(s3s::s3_error!(
                 InvalidArgument,
                 "decompress-zip does not support server-side encryption in MVP"
-            ));
-        }
-        if !crate::store::bucket::exists(self.state.store.db(), &parsed.bucket).await? {
-            return Err(s3s::s3_error!(
-                NoSuchBucket,
-                "bucket not found: {}",
-                parsed.bucket
             ));
         }
 
@@ -1260,7 +1253,9 @@ impl DecompressZipRoute {
             {
                 Ok(found) => {
                     if let Some(receipt) = found.completed() {
-                        let scope = access::scope(&self.state, &req, Some(&bucket))?;
+                        let scope = access::scope(&self.state, &req, Some(&bucket))
+                            .await?
+                            .without_public_grants();
                         if !scope.is_unrestricted() {
                             let (prefix, captured) = legacy_capture.ok_or_else(mpu_zip_conflict)?;
                             let tags: Vec<ObjectTag> = serde_json::from_value(
@@ -1593,7 +1588,7 @@ impl S3Route for DecompressZipRoute {
         &self,
         method: &Method,
         uri: &Uri,
-        _headers: &HeaderMap,
+        headers: &HeaderMap,
         _extensions: &mut http::Extensions,
     ) -> bool {
         (*method == Method::PUT && crate::s3::query::query_key_is_present(uri, "decompress-zip"))
@@ -1601,7 +1596,8 @@ impl S3Route for DecompressZipRoute {
                 && crate::s3::query::query_key_is_present(uri, "ipfs3-zip-batch"))
             || (*method == Method::POST
                 && crate::s3::query::query_key_is_present(uri, "uploadId")
-                && !crate::s3::query::query_key_is_present(uri, "uploads"))
+                && !crate::s3::query::query_key_is_present(uri, "uploads")
+                && access::has_auth_material(headers, uri))
     }
 
     async fn call(&self, req: S3Request<Body>) -> S3Result<S3Response<Body>> {
@@ -2515,7 +2511,7 @@ mod tests {
                 &mut extensions,
             )
         );
-        assert!(route.is_match(
+        assert!(!route.is_match(
             &Method::POST,
             &"/bucket/archive.zip?uploadId=abc".parse::<Uri>().unwrap(),
             &HeaderMap::new(),
@@ -2524,7 +2520,7 @@ mod tests {
         assert!(
             route.is_match(
                 &Method::POST,
-                &"/bucket/archive.zip?uploadId=abc&decompress-zip=prefix/"
+                &"/bucket/archive.zip?uploadId=abc&decompress-zip=prefix/&X-Amz-Signature=signature"
                     .parse::<Uri>()
                     .unwrap(),
                 &HeaderMap::new(),

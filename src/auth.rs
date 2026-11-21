@@ -47,6 +47,11 @@ impl GatewayCredentials {
             .transpose()?;
         let mut static_keys = HashMap::new();
         for credential in &auth.credentials {
+            // A configured key can also become a session subject without signing directly.
+            anyhow::ensure!(
+                credential.access_key != crate::access::ANONYMOUS_ORIGIN,
+                "static credential uses the reserved anonymous provenance ID"
+            );
             anyhow::ensure!(
                 sessions.is_none() || !session::is_temporary_id(&credential.access_key),
                 "static credential uses a reserved temporary key ID"

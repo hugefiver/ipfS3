@@ -26,6 +26,9 @@ use super::object::{
     ByteCounter, determine_encryption_mode, extract_custom_metadata, extract_sse_c_key,
 };
 
+// Only unsigned HTTP Create emits this prefix; signed uploads use bare UUIDs.
+const ANONYMOUS_UPLOAD_PREFIX: &str = "anon-";
+
 #[cfg(test)]
 fn parse_decompress_upload_options(uri: &http::Uri) -> S3Result<(Option<String>, bool)> {
     let query = crate::s3::query::decoded_query_pairs(uri)?;
@@ -109,7 +112,20 @@ pub async fn create_multipart_upload(
         .as_ref()
         .map(|c| c.options.clone())
         .unwrap_or(crate::zip::options::ZipOptions::Legacy);
-    let scope = access::scope(state, &req, Some(bucket))?;
+    let subject = access::subject(state, &req)?;
+    if subject.is_none()
+        && (!access::anonymous_http(&req)
+            || is_zip
+            || tags.iter().any(|tag| tag.key.starts_with("ipfs-s3:")))
+    {
+        return Err(s3s::s3_error!(AccessDenied));
+    }
+    let scope = access::scope(state, &req, Some(bucket)).await?;
+    let scope = if is_zip {
+        scope.without_public_grants()
+    } else {
+        scope
+    };
     crate::s3::route::authorize_zip(
         &scope,
         Action::CreateMultipartUpload,
@@ -122,12 +138,7 @@ pub async fn create_multipart_upload(
         Some(&tags),
     )?;
 
-    // Validate the bucket exists.
     let db = state.store.db();
-    let exists = crate::store::bucket::exists(db, bucket).await?;
-    if !exists {
-        return Err(s3s::s3_error!(NoSuchBucket, "bucket not found: {}", bucket));
-    }
 
     if decompress_zip_target.is_some()
         && [
@@ -147,8 +158,13 @@ pub async fn create_multipart_upload(
     let enc_mode = determine_encryption_mode(&req.headers)?;
     let metadata = extract_custom_metadata(&req.headers);
     let object_id = uuid::Uuid::new_v4().to_string();
-    let upload_id = uuid::Uuid::new_v4().to_string();
-    let principal = super::object::principal_id(state, &req)?;
+    let id = uuid::Uuid::new_v4();
+    let upload_id = if subject.is_some() {
+        id.to_string()
+    } else {
+        format!("{ANONYMOUS_UPLOAD_PREFIX}{id}")
+    };
+    let principal = subject.unwrap_or(access::ANONYMOUS_ORIGIN).to_owned();
     if let crate::zip::options::ZipOptions::V2(requested_options) = zip_options {
         let prefix = decompress_zip_target
             .as_deref()
@@ -549,6 +565,44 @@ fn checked_part_plaintext_size(observed: i64, chunk_size: usize) -> S3Result<i64
         .ok_or_else(|| s3s::s3_error!(InvalidPart, "multipart part plaintext size overflow"))
 }
 
+fn upload_tags(
+    upload: &crate::store::entities::multipart_upload::Model,
+) -> S3Result<Vec<ObjectTag>> {
+    crate::store::pinning::tags::tags_from_json(&upload.tags_json)
+        .map_err(|_| s3s::s3_error!(InternalError, "invalid persisted multipart upload tags"))
+}
+
+fn anonymous_continuation<T>(
+    req: &S3Request<T>,
+    scope: &crate::iam::Scope<'_>,
+    upload: &crate::store::entities::multipart_upload::Model,
+) -> S3Result<bool> {
+    if access::anonymous_http(req) {
+        return Ok(true);
+    }
+    // Only legacy, unclassified ordinary uploads support credential-free embedded callers.
+    if req.credentials.is_none()
+        && (!scope.is_unrestricted() || upload.decompress_zip_target.is_some())
+    {
+        return Err(s3s::s3_error!(
+            AccessDenied,
+            "authenticated principal is required"
+        ));
+    }
+    Ok(false)
+}
+
+fn require_anonymous_upload(
+    upload: &crate::store::entities::multipart_upload::Model,
+) -> S3Result<()> {
+    if !upload.upload_id.starts_with(ANONYMOUS_UPLOAD_PREFIX)
+        || upload.decompress_zip_target.is_some()
+    {
+        return Err(s3s::s3_error!(AccessDenied));
+    }
+    Ok(())
+}
+
 /// Upload a single part of an initiated multipart upload.
 ///
 /// The part bytes are streamed into Kubo (optionally encrypted first), the
@@ -571,15 +625,28 @@ pub async fn upload_part(
     }
 
     let db = state.store.db();
-
-    let upload = crate::store::multipart::get_upload(db, upload_id).await?;
-
-    if upload.bucket != *bucket || upload.key != *key {
-        return Err(s3s::s3_error!(
-            InvalidArgument,
-            "bucket/key mismatch for upload_id"
-        ));
+    let scope = access::scope(state, &req, Some(bucket)).await?;
+    crate::s3::route::authorize_zip(&scope, Action::UploadPart, key, None, None, None)?;
+    let upload = crate::store::multipart::get_upload_for_key(db, bucket, key, upload_id).await?;
+    if anonymous_continuation(&req, &scope, &upload)? {
+        require_anonymous_upload(&upload)?;
     }
+    if scope.has_public_write_grant()
+        && (upload.decompress_zip_target.is_some()
+            || upload_tags(&upload)?
+                .iter()
+                .any(|tag| tag.key.starts_with("ipfs-s3:")))
+    {
+        crate::s3::route::authorize_zip(
+            &scope.without_public_grants(),
+            Action::UploadPart,
+            key,
+            None,
+            None,
+            None,
+        )?;
+    }
+
     let upload_target = MultipartUploadTargetIdentity {
         bucket: upload.bucket.clone(),
         key: upload.key.clone(),
@@ -1663,12 +1730,21 @@ pub async fn complete_multipart_upload_inner(
         req.input.if_match.is_some() || req.input.if_none_match.is_some(),
     )?;
     let bucket = &req.input.bucket;
-    let scope = access::scope(state, &req, Some(bucket))?;
+    let scope = access::scope(state, &req, Some(bucket)).await?;
     let completion_attempt_id = uuid::Uuid::new_v4().to_string();
     let key = &req.input.key;
     let upload_id = &req.input.upload_id;
     let db = state.store.db();
-    if crate::store::multipart::v2_zip::read_by_upload(db, upload_id)
+    if access::anonymous_http(&req) {
+        crate::s3::route::authorize_zip(
+            &scope,
+            Action::CompleteMultipartUpload,
+            key,
+            None,
+            None,
+            None,
+        )?;
+    } else if crate::store::multipart::v2_zip::read_by_upload(db, upload_id)
         .await?
         .is_some()
     {
@@ -1712,7 +1788,21 @@ pub async fn complete_multipart_upload_inner(
         last_pn = pn;
     }
 
-    let upload = crate::store::multipart::get_upload(db, upload_id).await?;
+    let upload = match crate::store::multipart::get_upload_for_key(db, bucket, key, upload_id).await
+    {
+        Err(error @ crate::error::AppError::NoSuchUpload(_)) => {
+            crate::s3::route::authorize_zip(
+                &scope,
+                Action::CompleteMultipartUpload,
+                key,
+                None,
+                None,
+                Some(&[]),
+            )?;
+            return Err(error.into());
+        }
+        result => result?,
+    };
     let encryption_object_id = upload.object_id.clone();
     let upload_target = MultipartUploadTargetIdentity {
         bucket: upload.bucket.clone(),
@@ -1721,13 +1811,15 @@ pub async fn complete_multipart_upload_inner(
         initiated_at: upload.created_at,
     };
 
-    if upload.bucket != *bucket || upload.key != *key {
-        return Err(s3s::s3_error!(
-            InvalidArgument,
-            "bucket/key mismatch for upload_id"
-        ));
+    if anonymous_continuation(&req, &scope, &upload)? {
+        require_anonymous_upload(&upload)?;
     }
-
+    let persisted_decision = crate::store::multipart::decision_from_upload(&upload)?;
+    let scope = if upload.decompress_zip_target.is_some() {
+        scope.without_public_grants()
+    } else {
+        scope
+    };
     let decompress_zip_target = upload
         .decompress_zip_target
         .as_deref()
@@ -1761,8 +1853,7 @@ pub async fn complete_multipart_upload_inner(
         }
     }
 
-    let tags = crate::store::pinning::tags::tags_from_json(&upload.tags_json)
-        .map_err(|_| s3s::s3_error!(InternalError, "invalid persisted multipart upload tags"))?;
+    let tags = upload_tags(&upload)?;
     crate::s3::route::authorize_zip(
         &scope,
         Action::CompleteMultipartUpload,
@@ -1799,7 +1890,6 @@ pub async fn complete_multipart_upload_inner(
     } else {
         None
     };
-    let persisted_decision = crate::store::multipart::decision_from_upload(&upload)?;
     let pin_decision = if let Some(intent) = &zip_intent {
         if persisted_decision.as_ref() != Some(intent.source_decision()) {
             return Err(s3s::s3_error!(
@@ -2244,15 +2334,7 @@ pub async fn list_parts(
     let upload_id = &req.input.upload_id;
     let db = state.store.db();
 
-    let upload = crate::store::multipart::get_upload(db, upload_id).await?;
-
-    if upload.bucket != *bucket || upload.key != *key {
-        return Err(s3s::s3_error!(
-            InvalidArgument,
-            "bucket/key mismatch for upload_id"
-        ));
-    }
-
+    crate::store::multipart::get_upload_for_key(db, bucket, key, upload_id).await?;
     let parts = crate::store::multipart::list_parts(db, upload_id).await?;
 
     let parts_dto: Vec<Part> = parts
@@ -2790,7 +2872,7 @@ mod tests {
                 .unwrap(),
             headers: http::HeaderMap::new(),
             extensions: http::Extensions::new(),
-            credentials: None,
+            credentials: Some(test_credentials()),
             region: None,
             service: None,
             trailing_headers: None,
@@ -2818,7 +2900,7 @@ mod tests {
                 .unwrap(),
             headers: http::HeaderMap::new(),
             extensions: http::Extensions::new(),
-            credentials: None,
+            credentials: Some(test_credentials()),
             region: None,
             service: None,
             trailing_headers: None,
@@ -3273,6 +3355,13 @@ mod tests {
         }
     }
 
+    fn test_credentials() -> s3s::auth::Credentials {
+        s3s::auth::Credentials {
+            access_key: "test".into(),
+            secret_key: s3s::auth::SecretKey::from("test"),
+        }
+    }
+
     fn multipart_create_request(bucket: &str, key: &str) -> S3Request<CreateMultipartUploadInput> {
         S3Request {
             input: CreateMultipartUploadInput {
@@ -3284,13 +3373,174 @@ mod tests {
             uri: format!("/{bucket}/{key}?uploads").parse().unwrap(),
             headers: http::HeaderMap::new(),
             extensions: http::Extensions::new(),
-            credentials: Some(s3s::auth::Credentials {
-                access_key: "test".into(),
-                secret_key: s3s::auth::SecretKey::from("test"),
-            }),
+            credentials: Some(test_credentials()),
             region: None,
             service: None,
             trailing_headers: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn public_write_does_not_authorize_zip_intake_or_manual_pin_parts() {
+        let kubo = multipart_kubo(&["QmPart"]).await;
+        let mut state = test_state_with_bucket_and_kubo("fixture", kubo.uri()).await;
+        Arc::get_mut(&mut state).unwrap().pinning =
+            configured_pinning_coordinator("request", "one", "", false);
+        crate::store::bucket::create_with_acl(
+            state.store.db(),
+            "test-bucket",
+            Some("owner"),
+            Some("public-read-write"),
+        )
+        .await
+        .unwrap();
+        let source_only = || {
+            let mut req = multipart_create_request("test-bucket", "archive.zip");
+            req.uri = "/test-bucket/archive.zip?uploads&decompress-zip=out/"
+                .parse()
+                .unwrap();
+            req.headers
+                .insert(crate::zip::options::ZIP_CONTRACT, "v2".parse().unwrap());
+            req.headers.insert(
+                crate::zip::options::PUBLISH_EXTRACTED,
+                "false".parse().unwrap(),
+            );
+            req
+        };
+        let denied = create_multipart_upload(&state, source_only())
+            .await
+            .unwrap_err();
+        assert_eq!(denied.code().as_str(), "AccessDenied");
+        let mut owner = source_only();
+        owner.credentials.as_mut().unwrap().access_key = "owner".into();
+        let id = create_multipart_upload(&state, owner)
+            .await
+            .unwrap()
+            .output
+            .upload_id
+            .unwrap();
+        assert!(
+            crate::store::multipart::v2_zip::read_by_upload(state.store.db(), &id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        let mut create = multipart_create_request_with_tagging(
+            "test-bucket",
+            "archive.zip",
+            "ipfs-s3%3Apin=true",
+        );
+        create.credentials.as_mut().unwrap().access_key = "owner".into();
+        let id = create_multipart_upload(&state, create)
+            .await
+            .unwrap()
+            .output
+            .upload_id
+            .unwrap();
+        let denied = upload_part(&state, upload_part_request(&id, b"part"))
+            .await
+            .unwrap_err();
+        assert_eq!(denied.code().as_str(), "AccessDenied");
+        assert!(kubo.received_requests().await.unwrap().is_empty());
+        let mut owner_part = upload_part_request(&id, b"part");
+        owner_part.credentials.as_mut().unwrap().access_key = "owner".into();
+        assert_eq!(
+            upload_part(&state, owner_part)
+                .await
+                .unwrap()
+                .output
+                .e_tag
+                .unwrap()
+                .value(),
+            "QmPart"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_static_key_signs_mpu_that_anonymous_requests_cannot_resume() {
+        use axum::{body::Body, error_handling::HandleError};
+        use http::{Method, Request, StatusCode};
+        use tower::ServiceExt as _;
+
+        let legacy_key = "ipfs-s3:anonymous";
+        let mut config = crate::config::Config::default_for_test();
+        config.auth.credentials[0].access_key = legacy_key.to_owned();
+        let mut state = test_state_with_bucket("fixture").await;
+        Arc::get_mut(&mut state).unwrap().credentials =
+            crate::auth::GatewayCredentials::from_config(&config).unwrap();
+        crate::store::bucket::create_with_acl(
+            state.store.db(),
+            "test-bucket",
+            Some(legacy_key),
+            Some("public-read-write"),
+        )
+        .await
+        .unwrap();
+        let mut builder =
+            s3s::service::S3ServiceBuilder::new(crate::s3::handler::S3Impl::new(state.clone()));
+        builder.set_auth(crate::auth::GatewayAuth::new(state.clone()));
+        builder.set_access(access::GatewayAccess(state.clone()));
+        let app = axum::Router::new().fallback_service(HandleError::new(
+            builder.build(),
+            |_: s3s::HttpError| async { StatusCode::INTERNAL_SERVER_ERROR },
+        ));
+        let uri = crate::s3::sigv4::presign_sigv4_query(
+            &Method::POST,
+            "http://localhost",
+            "test-bucket",
+            "archive.zip",
+            &[("uploads", "")],
+            legacy_key,
+            "test",
+            None,
+            60,
+            chrono::Utc::now(),
+        );
+        let create = Request::post(uri)
+            .header("host", "localhost")
+            .header("content-length", "0")
+            .body(Body::empty())
+            .unwrap();
+        let created = app.clone().oneshot(create).await.unwrap();
+        let status = created.status();
+        let body = axum::body::to_bytes(created.into_body(), 8192)
+            .await
+            .unwrap();
+        let xml = std::str::from_utf8(&body).unwrap();
+        assert_eq!(status, StatusCode::OK, "{xml}");
+        let id = xml
+            .split_once("<UploadId>")
+            .unwrap()
+            .1
+            .split_once("</UploadId>")
+            .unwrap()
+            .0;
+        assert!(uuid::Uuid::parse_str(id).is_ok());
+        let upload = crate::store::multipart::get_upload(state.store.db(), id)
+            .await
+            .unwrap();
+        let decision = crate::store::multipart::decision_from_upload(&upload)
+            .unwrap()
+            .unwrap();
+        assert_eq!(decision.origin.principal_id, legacy_key);
+
+        let complete = r#"<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>"QmPart"</ETag></Part></CompleteMultipartUpload>"#;
+        for request in [
+            Request::put(format!(
+                "/test-bucket/archive.zip?partNumber=1&uploadId={id}"
+            ))
+            .header("content-length", "4")
+            .body(Body::from("part"))
+            .unwrap(),
+            Request::post(format!("/test-bucket/archive.zip?uploadId={id}"))
+                .header("content-type", "application/xml")
+                .header("content-length", complete.len().to_string())
+                .body(Body::from(complete))
+                .unwrap(),
+        ] {
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
         }
     }
 
@@ -5058,8 +5308,8 @@ mod tests {
                 0
             );
             if zip {
-                let unauthenticated = complete_request(&upload_id, part_etag.value());
-                assert!(unauthenticated.credentials.is_none());
+                let mut unauthenticated = complete_request(&upload_id, part_etag.value());
+                unauthenticated.credentials = None;
                 let denied = complete_multipart_upload_inner(&state, unauthenticated)
                     .await
                     .unwrap_err();
@@ -5232,8 +5482,8 @@ mod tests {
             .await
             .unwrap();
             if zip {
-                let unauthenticated = complete_request(&upload_id, "QmPart");
-                assert!(unauthenticated.credentials.is_none());
+                let mut unauthenticated = complete_request(&upload_id, "QmPart");
+                unauthenticated.credentials = None;
                 let denied = complete_multipart_upload_inner(&state, unauthenticated)
                     .await
                     .unwrap_err();

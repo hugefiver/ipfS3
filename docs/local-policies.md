@@ -27,13 +27,36 @@ request_tags = { team = "media", state = "approved" }
 existing_tags = { team = "media" }
 ```
 
+## Bucket defaults
+
+A signed `CreateBucket` assigns the bucket to the caller's stable user. Omit `x-amz-acl` for `private`, or choose one of the four bucket categories. The owner can read or change it through `GetBucketAcl` and `PutBucketAcl`. Changes apply to subsequent requests for existing objects, versions and ordinary multipart uploads. There are no per-object ACLs: setting an ACL on an upload does not make an individual object private inside a public bucket. Use a private bucket or a directory deny for that boundary.
+
+| Canned ACL | Additional access beyond the bucket owner |
+|---|---|
+| `private` | None. A directory policy can still share a specific prefix. |
+| `authenticated-read` | Authenticated gateway users can list the bucket's contents and read objects. |
+| `public-read` | The same ordinary reads, including unsigned requests. |
+| `public-read-write` | Public read plus ordinary uploads, including writes to an existing key and multipart upload. This does not grant deletion, bucket administration, manual pin requests or archive extraction. |
+
+```console
+aws --endpoint-url http://localhost:9000 s3api create-bucket --bucket media
+aws --endpoint-url http://localhost:9000 s3api put-bucket-acl --bucket media --acl authenticated-read
+aws --endpoint-url http://localhost:9000 s3api get-bucket-acl --bucket media
+```
+
+`ListBuckets` returns only buckets owned by the signed user. To use a shared or public bucket, address it by name. These permissions govern the S3 gateway; plaintext accessible through an IPFS node by CID is outside the bucket ACL.
+
 ## Scope and precedence
 
-Any rule with a `user` puts that user under policy in **every** bucket and on service-wide operations. A `bucket` on a user rule limits where that rule can match. A bucket-only rule puts every user under policy for that bucket. The gateway considers all matching user and bucket rules: an explicit `deny` wins, otherwise at least one `allow` must match. A request outside both scopes retains the gateway's default access for authenticated users.
+Bucket defaults and directory rules are separate. An explicit matching `deny` wins, even for the owner. Otherwise either the bucket default or a matching policy `allow` can grant the operation. A rule with both `user` and `bucket` applies only to that combination. Bucket-only allow rules share with authenticated gateway users, not anonymous callers. Bucket-only denies also restrict anonymous requests on public buckets. Only the owner can manage the bucket ACL.
+
+Buckets upgraded without an ACL retain their earlier signed-access policy until the recorded owner sets a category. They do not acquire anonymous access. `GetBucketAcl` returns `InvalidBucketState` to the owner until the first `PutBucketAcl`. A legacy bucket with no recorded owner is not automatically assigned to a user.
+
+`ipfs-s3/anonymous` is reserved for recording anonymous upload provenance. It cannot be configured as a user and grants no permissions. The static access key ID `ipfs-s3:anonymous` remains a regular user ID.
 
 A rule needs `effect`, a non-empty `actions` list, and at least one of `user` and `bucket`. Use the exact, case-sensitive names in [the supported action list](../src/iam/action.rs). An omitted `prefix` covers all keys in the rule's scope. A configured prefix is a literal key prefix; `docs/` and `docs` differ. For a listing or an operation that writes a subtree, one allow must cover the whole requested prefix. A deny on any overlapping prefix also denies the whole operation; the gateway does not filter out denied descendants. To list the example bucket, request a narrower prefix such as `public/releases/`.
 
-Service-wide `ListBuckets` uses user rules without a `bucket` or `prefix`. Bucket administration actions such as `HeadBucket` and `PutBucketVersioning` do not take a key prefix.
+Service-wide `ListBuckets` uses user rules without a `bucket` or `prefix`. A user named by any policy needs a matching service-level allow to list their own buckets. Bucket administration actions such as `HeadBucket` and `PutBucketVersioning` do not take a key prefix.
 
 ## Conditions
 

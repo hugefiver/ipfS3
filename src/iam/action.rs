@@ -7,6 +7,8 @@ pub enum Action {
     ListBuckets,
     CreateBucket,
     DeleteBucket,
+    GetBucketAcl,
+    PutBucketAcl,
     HeadBucket,
     GetBucketLocation,
     GetBucketVersioning,
@@ -48,6 +50,8 @@ impl Action {
             ListBuckets
             | CreateBucket
             | DeleteBucket
+            | GetBucketAcl
+            | PutBucketAcl
             | HeadBucket
             | GetBucketLocation
             | GetBucketVersioning
