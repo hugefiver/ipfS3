@@ -9,7 +9,7 @@ use s3s::{S3Request, S3Result};
 use crate::{iam::Scope, state::AppState};
 
 pub(crate) fn subject<'a, T>(state: &AppState, req: &'a S3Request<T>) -> S3Result<Option<&'a str>> {
-    if let Some(principal) = req.extensions.get::<Principal>() {
+    if let Some(principal) = req.extensions.get::<SessionPrincipal>() {
         return Ok(Some(&principal.0));
     }
     let Some(credentials) = &req.credentials else {
@@ -44,6 +44,6 @@ pub(crate) fn scope<'a, T>(
     Ok(policies.scope(user, bucket))
 }
 
-/// Stable local user behind a verified static or temporary credential.
-#[derive(Clone, Debug)]
-struct Principal(String);
+/// Stable local user behind a verified temporary credential.
+#[derive(Clone)]
+struct SessionPrincipal(String);

@@ -4,7 +4,7 @@ use sea_orm::{
 
 use crate::{
     error::{AppError, AppResult},
-    pinning::decision::ExtensionDecision,
+    pinning::{decision::ExtensionDecision, tags::ObjectTag},
     store::entities::object_version,
 };
 
@@ -37,6 +37,17 @@ pub async fn replace_for_version_in_transaction<C: ConnectionTrait>(
     decision: &ExtensionDecision,
 ) -> AppResult<()> {
     let tags = super::tags::list_object_tags(db, object_id).await?;
+    replace_for_version_with_tags_in_transaction(db, version_row_id, object_id, decision, tags)
+        .await
+}
+
+pub(crate) async fn replace_for_version_with_tags_in_transaction<C: ConnectionTrait>(
+    db: &C,
+    version_row_id: &str,
+    object_id: &str,
+    decision: &ExtensionDecision,
+    tags: Vec<ObjectTag>,
+) -> AppResult<()> {
     decision
         .replay_policy(tags)
         .map_err(|_| AppError::Internal("extension decision does not match version tags".into()))?;

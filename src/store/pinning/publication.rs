@@ -1035,13 +1035,12 @@ async fn publication_result_for_internal_object<C: ConnectionTrait>(
     })
 }
 
-pub(crate) async fn delete_version_authorized(
+pub(crate) async fn delete_version_with_admission(
     db: &DatabaseConnection,
     bucket: &str,
     key: &str,
     selector: VersionSelector,
-    needs_existing_tags: bool,
-    authorize: impl Fn(Option<&[ObjectTag]>) -> AppResult<()> + Send + Sync,
+    authorize_tags: Option<impl Fn(&[ObjectTag]) -> AppResult<()> + Send + Sync>,
     now: DateTime<Utc>,
 ) -> AppResult<DeleteVersionResult> {
     for retry in 0..=MAX_TRANSACTION_RETRIES {
@@ -1050,7 +1049,7 @@ pub(crate) async fn delete_version_authorized(
             lock_bucket_for_ownership(&txn, bucket).await?;
             let state = crate::store::bucket::get_versioning_state(&txn, bucket).await?;
             let current = crate::store::object_version::lock_current_row(&txn, bucket, key).await?;
-            if needs_existing_tags {
+            if let Some(authorize_tags) = &authorize_tags {
                 // Tagging locks the same version row before writing tags. In a suspended
                 // bucket a simple delete displaces the null slot, even if it is not current.
                 let object_id = match (&selector, state) {
@@ -1075,9 +1074,7 @@ pub(crate) async fn delete_version_authorized(
                     Some(id) => tags::list_object_tags(&txn, &id).await?,
                     None => Vec::new(),
                 };
-                authorize(Some(&existing_tags))?;
-            } else {
-                authorize(None)?;
+                authorize_tags(&existing_tags)?;
             }
 
             // Admission can supersede active imports, so it must be covered by the

@@ -111,20 +111,32 @@ impl GatewayCredentials {
 
     /// Resolve only a credential already authenticated by s3s.
     pub fn principal(&self, verified_ak: &str, headers: &HeaderMap, uri: &Uri) -> S3Result<String> {
+        Ok(self
+            .session_subject(verified_ak, headers, uri)?
+            .unwrap_or_else(|| verified_ak.to_owned()))
+    }
+
+    /// A configured static ID is already the subject; only sessions need a separate binding.
+    pub(crate) fn session_subject(
+        &self,
+        verified_ak: &str,
+        headers: &HeaderMap,
+        uri: &Uri,
+    ) -> S3Result<Option<String>> {
+        if let Some(signer) = &self.sessions
+            && session::is_temporary_id(verified_ak)
+        {
+            let token = session::request_token(headers, uri)?;
+            let subject = signer.verify(verified_ak, &token, chrono::Utc::now().timestamp())?;
+            if !self.static_keys.contains_key(&subject) {
+                return Err(s3s::s3_error!(InvalidToken));
+            }
+            return Ok(Some(subject));
+        }
         if self.static_keys.contains_key(verified_ak) {
-            return Ok(verified_ak.to_owned());
+            return Ok(None);
         }
-        let signer = self
-            .sessions
-            .as_ref()
-            .filter(|_| session::is_temporary_id(verified_ak))
-            .ok_or_else(|| s3s::s3_error!(InvalidAccessKeyId))?;
-        let token = session::request_token(headers, uri)?;
-        let subject = signer.verify(verified_ak, &token, chrono::Utc::now().timestamp())?;
-        if !self.static_keys.contains_key(&subject) {
-            return Err(s3s::s3_error!(InvalidToken));
-        }
-        Ok(subject)
+        Err(s3s::s3_error!(InvalidAccessKeyId))
     }
 }
 

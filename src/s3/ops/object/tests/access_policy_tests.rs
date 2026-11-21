@@ -26,6 +26,13 @@ user = 'test-owner'
 bucket = 'bucket'
 actions = ['PutObject', 'CopyObject']
 request_tags = { owner = 'team' }
+
+[[policy]]
+effect = 'deny'
+user = 'test-owner'
+bucket = 'bucket'
+actions = ['DeleteObject']
+prefix = 'blocked/'
 "#,
     )
     .unwrap();
@@ -87,6 +94,9 @@ async fn reads_and_copy_authorize_the_selected_version_and_write_request_tags() 
     let source = "source.txt";
     let destination = "copy.txt";
     let version = Some(historical.as_str());
+    let mut replacement = http::HeaderMap::new();
+    replacement.insert("x-amz-tagging-directive", "REPLACE".parse().unwrap());
+    replacement.insert("x-amz-tagging", "owner=team".parse().unwrap());
     let denied = [
         get_object(&state, get_object_request(source, None, Default::default()))
             .await
@@ -106,6 +116,12 @@ async fn reads_and_copy_authorize_the_selected_version_and_write_request_tags() 
         copy_object(
             &state,
             copy_request_version(source, version, destination, Default::default()),
+        )
+        .await
+        .unwrap_err(),
+        copy_object(
+            &state,
+            copy_request_version("missing", version, destination, replacement.clone()),
         )
         .await
         .unwrap_err(),
@@ -140,18 +156,9 @@ async fn reads_and_copy_authorize_the_selected_version_and_write_request_tags() 
     .unwrap();
     assert_eq!(head.output.version_id.as_deref(), version);
 
-    let mut headers = http::HeaderMap::new();
-    headers.insert(
-        "x-amz-tagging-directive",
-        http::HeaderValue::from_static("REPLACE"),
-    );
-    headers.insert(
-        "x-amz-tagging",
-        http::HeaderValue::from_static("owner=team"),
-    );
     let copy = copy_object(
         &state,
-        copy_request_version(source, version, destination, headers),
+        copy_request_version(source, version, destination, replacement),
     )
     .await
     .unwrap();
@@ -210,6 +217,92 @@ async fn object_reads_query_tags_only_when_policy_needs_them() {
             tag_queries,
         );
     }
+}
+
+#[tokio::test]
+async fn definite_delete_denials_preserve_error_order_without_mutating() {
+    let (mut state, _kubo, _) = policy_state().await;
+    let key = "blocked/object";
+    publish_versioned_read_object(
+        &state,
+        "blocked-owner",
+        key,
+        "QmBlocked",
+        false,
+        None,
+        None,
+        vec![ObjectTag::new("owner", "team")],
+    )
+    .await;
+    let statements = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed = statements.clone();
+    let mut db = state.store.db().clone();
+    db.set_metric_callback(move |info| {
+        observed.lock().unwrap().push(info.statement.sql.clone());
+    });
+    Arc::get_mut(&mut state).unwrap().store = crate::store::Store::new(db);
+
+    for (bucket, version, expected) in [
+        ("missing", Some("not-a-version"), "InvalidArgument"),
+        ("missing", None, "NoSuchBucket"),
+        ("bucket", None, "AccessDenied"),
+    ] {
+        let mut request = delete_object_version_request(key, version);
+        request.input.bucket = bucket.to_owned();
+        assert_eq!(
+            delete_object(&state, request)
+                .await
+                .unwrap_err()
+                .code()
+                .as_str(),
+            expected
+        );
+        let sql = std::mem::take(&mut *statements.lock().unwrap());
+        assert!(!sql.iter().any(|sql| {
+            sql.contains("object_versions")
+                || sql.contains("object_tags")
+                || sql.starts_with("UPDATE \"buckets\"")
+        }));
+    }
+
+    let batch = delete_objects(
+        &state,
+        delete_objects_version_request(
+            vec![
+                (key.to_owned(), None),
+                (key.to_owned(), Some("not-a-version".to_owned())),
+                (key.to_owned(), None),
+            ],
+            false,
+        ),
+    )
+    .await
+    .unwrap()
+    .output;
+    assert!(batch.deleted.is_none());
+    let errors = batch.errors.unwrap();
+    assert_eq!(
+        errors
+            .iter()
+            .map(|error| error.code.as_deref())
+            .collect::<Vec<_>>(),
+        [
+            Some("AccessDenied"),
+            Some("InvalidArgument"),
+            Some("AccessDenied")
+        ]
+    );
+    let sql = std::mem::take(&mut *statements.lock().unwrap());
+    assert_eq!(
+        sql.iter()
+            .filter(|sql| sql.starts_with("SELECT") && sql.contains("buckets"))
+            .count(),
+        1
+    );
+    let current = crate::store::object::get_latest(state.store.db(), "bucket", key)
+        .await
+        .unwrap();
+    assert_eq!(current.id, "blocked-owner");
 }
 
 #[tokio::test]

@@ -65,7 +65,7 @@ pub struct Scope<'a> {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Decision {
+pub(crate) enum Decision {
     Allow,
     Deny,
     NeedsExistingTags,
@@ -126,7 +126,7 @@ impl Scope<'_> {
         self.decision(context) == Decision::Allow
     }
 
-    fn decision(&self, context: &Context<'_>) -> Decision {
+    pub(crate) fn decision(&self, context: &Context<'_>) -> Decision {
         if self.is_unrestricted() {
             return Decision::Allow;
         }

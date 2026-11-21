@@ -2,7 +2,7 @@ use sea_orm::DatabaseTransaction;
 
 use crate::{
     error::{AppError, AppResult},
-    iam::{Action, Context, Resource},
+    iam::{Action, Context, Decision, Resource},
     pinning::tags::ObjectTag,
     state::AppState,
     store::{
@@ -34,20 +34,21 @@ pub(super) async fn authorized_tags(
         existing_tags: None,
     };
     let scope = state.credentials.policies.scope(principal, Some(bucket));
-    let needs_tags = scope.needs_existing_tags(&context);
     let denied = || AppError::AccessDenied("access denied by policy".into());
-    if !needs_tags && !scope.allows(&context) {
-        return Err(denied());
-    }
+    let needs_tags = match scope.decision(&context) {
+        Decision::Allow => false,
+        Decision::Deny => return Err(denied()),
+        Decision::NeedsExistingTags => true,
+    };
 
     let finish = |stored: &[ObjectTag]| -> AppResult<()> {
-        if needs_tags {
-            if !scope.allows(&Context {
+        if needs_tags
+            && !scope.allows(&Context {
                 existing_tags: Some(stored),
                 ..context
-            }) {
-                return Err(denied());
-            }
+            })
+        {
+            return Err(denied());
         }
         Ok(())
     };
@@ -76,7 +77,10 @@ pub(super) async fn authorized_tags(
         }
     };
     let stored = match selected.object.as_ref() {
-        Some(owner) if action != Action::GetPinningStatus || needs_tags => {
+        Some(owner)
+            if needs_tags
+                || matches!(action, Action::GetObjectTagging | Action::PutObjectTagging) =>
+        {
             tags::list_object_tags(txn, &owner.id).await?
         }
         _ => Vec::new(),

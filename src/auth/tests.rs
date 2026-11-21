@@ -1,6 +1,8 @@
-use http::{HeaderMap, HeaderValue, Uri, header::AUTHORIZATION};
+use http::{Extensions, HeaderMap, HeaderValue, Method, Uri, header::AUTHORIZATION};
+use s3s::{S3Request, auth::Credentials};
 
 use super::*;
+use crate::access::{bind_custom, subject};
 
 fn config() -> Config {
     let mut config = Config::default_for_test();
@@ -52,8 +54,70 @@ fn issuance_requires_known_subject_valid_duration_and_separate_key_namespace() {
             .expose(),
         "test"
     );
+    assert_eq!(
+        static_only
+            .principal(
+                &session.access_key_id,
+                &HeaderMap::new(),
+                &Uri::from_static("/")
+            )
+            .unwrap(),
+        session.access_key_id
+    );
     cfg.auth.session_signing_key = Some("not-hex".into());
     assert!(GatewayCredentials::from_config(&cfg).is_err());
+}
+
+#[tokio::test]
+async fn custom_access_binds_only_verified_session_subjects() {
+    let mut cfg = config();
+    cfg.storage.database_url = "sqlite::memory:".into();
+    let state = AppState::new_with_env(&cfg, |_| None).await.unwrap();
+    let mut req = S3Request {
+        input: (),
+        method: Method::GET,
+        uri: Uri::from_static("/"),
+        headers: HeaderMap::new(),
+        extensions: Extensions::new(),
+        credentials: Some(Credentials {
+            access_key: "test".into(),
+            secret_key: SecretKey::from("test"),
+        }),
+        region: None,
+        service: None,
+        trailing_headers: None,
+    };
+    bind_custom(&state, &mut req).unwrap();
+    assert!(req.extensions.is_empty());
+    assert_eq!(subject(&state, &req).unwrap(), Some("test"));
+
+    req.credentials.as_mut().unwrap().access_key = "unknown".into();
+    assert_eq!(
+        bind_custom(&state, &mut req).unwrap_err().code().as_str(),
+        "InvalidAccessKeyId"
+    );
+
+    let session = state.credentials.issue_session("test", 60).unwrap();
+    req.credentials = Some(Credentials {
+        access_key: session.access_key_id,
+        secret_key: session.secret_access_key.into(),
+    });
+    assert_eq!(
+        bind_custom(&state, &mut req).unwrap_err().code().as_str(),
+        "InvalidToken"
+    );
+    req.uri = format!(
+        "/?X-Amz-Signature=sig&X-Amz-Security-Token={}",
+        session.session_token
+    )
+    .parse()
+    .unwrap();
+    assert_eq!(
+        subject(&state, &req).unwrap_err().code().as_str(),
+        "InvalidToken"
+    );
+    bind_custom(&state, &mut req).unwrap();
+    assert_eq!(subject(&state, &req).unwrap(), Some("test"));
 }
 
 #[test]

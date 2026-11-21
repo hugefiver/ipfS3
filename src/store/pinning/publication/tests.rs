@@ -2628,21 +2628,20 @@ async fn authorized_delete_uses_displaced_null_tags_without_superseding_on_denia
         admit_content_mutation(&db, "bucket", "key", None, SupersedeReason::PutObject, now)
             .await
             .unwrap();
-    let authorize = |tags: Option<&[ObjectTag]>| {
-        if tags == Some(allow_tags.as_slice()) {
+    let authorize = |tags: &[ObjectTag]| {
+        if tags == allow_tags.as_slice() {
             Ok(())
         } else {
             Err(AppError::AccessDenied("not deletable".to_owned()))
         }
     };
     let version_rows = versions_for(&db, "key").await;
-    let denied = delete_version_authorized(
+    let denied = delete_version_with_admission(
         &db,
         "bucket",
         "key",
         VersionSelector::Current,
-        true,
-        authorize,
+        Some(authorize),
         now,
     )
     .await;
@@ -2662,13 +2661,12 @@ async fn authorized_delete_uses_displaced_null_tags_without_superseding_on_denia
     tags::replace_object_tags(&db, "null-content", &allow_tags)
         .await
         .unwrap();
-    let deleted = delete_version_authorized(
+    let deleted = delete_version_with_admission(
         &db,
         "bucket",
         "key",
         VersionSelector::Current,
-        true,
-        authorize,
+        Some(authorize),
         now,
     )
     .await

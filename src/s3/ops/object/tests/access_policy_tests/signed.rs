@@ -29,8 +29,12 @@ async fn signed_copy_batch_delete_and_presigned_lists_obey_literal_object_scope(
         ("two", "team_%/private"),
         ("three", "TeamXA/elsewhere"),
     ] {
-        publish_versioned_read_object(&state, id, key, "QmExample", false, None, None, vec![])
-            .await;
+        let tags = if id == "one" {
+            vec![crate::pinning::tags::ObjectTag::new("owner", "team")]
+        } else {
+            vec![]
+        };
+        publish_versioned_read_object(&state, id, key, "QmExample", false, None, None, tags).await;
     }
     let mut builder =
         s3s::service::S3ServiceBuilder::new(crate::s3::handler::S3Impl::new(state.clone()));
@@ -108,6 +112,39 @@ async fn signed_copy_batch_delete_and_presigned_lists_obey_literal_object_scope(
             copy.text().await.unwrap()
         );
     }
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "x-amz-copy-source",
+        "/bucket/Team_%25/owned".parse().unwrap(),
+    );
+    let copy = send_sigv4(
+        Method::PUT,
+        &endpoint,
+        "bucket",
+        "Team_%/copy",
+        &[],
+        vec![],
+        headers,
+        "test",
+    )
+    .await;
+    assert_eq!(
+        copy.status(),
+        StatusCode::OK,
+        "{}",
+        copy.text().await.unwrap()
+    );
+    let db = state.store.db();
+    let copied = crate::store::object::get_latest(db, "bucket", "Team_%/copy")
+        .await
+        .unwrap();
+    assert_eq!(
+        crate::store::pinning::tags::list_object_tags(db, &copied.id)
+            .await
+            .unwrap(),
+        vec![crate::pinning::tags::ObjectTag::new("owner", "team")]
+    );
 
     let body = b"<Delete><Object><Key>team_%/private</Key></Object><Object><Key>Team_%/owned</Key></Object></Delete>";
     let mut headers = HeaderMap::new();

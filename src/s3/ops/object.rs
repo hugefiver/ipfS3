@@ -11,7 +11,7 @@ use s3s::{S3Request, S3Response, S3Result};
 use crate::crypto::EncryptionMode;
 use crate::crypto::chunker::{EncryptedRange, decrypt_chunk_stream};
 use crate::error::{AppError, AppResult};
-use crate::iam::{Action, Context, Resource, Scope};
+use crate::iam::{Action, Context, Decision, Resource, Scope};
 use crate::pinning::decision::{DecisionEffect, DecisionOrigin, ExtensionDecision, WarningCode};
 use crate::pinning::policy::{PublicationContext, PublicationPolicy};
 use crate::pinning::tags::{ObjectTag, PinControl};
@@ -734,17 +734,18 @@ fn check_object_policy(
     request_tags: Option<&[ObjectTag]>,
     existing_tags: Option<&[ObjectTag]>,
 ) -> AppResult<()> {
-    if scope.is_unrestricted() {
-        return Ok(());
-    }
     if !scope.allows(&Context {
         request_tags,
         existing_tags,
         ..*context
     }) {
-        return Err(AppError::AccessDenied("Access Denied".to_owned()));
+        return Err(object_policy_denied());
     }
     Ok(())
+}
+
+fn object_policy_denied() -> AppError {
+    AppError::AccessDenied("Access Denied".to_owned())
 }
 
 struct SelectedS3Object {
@@ -766,10 +767,11 @@ async fn select_s3_object(
     copy_source_tags: bool,
 ) -> S3Result<SelectedS3Object> {
     let context = object_access_context(action, key, version_id);
-    let needs_existing_tags = scope.needs_existing_tags(&context);
-    if !needs_existing_tags {
-        check_object_policy(&scope, &context, None, None)?;
-    }
+    let needs_existing_tags = match scope.decision(&context) {
+        Decision::Allow => false,
+        Decision::Deny => return Err(object_policy_denied().into()),
+        Decision::NeedsExistingTags => true,
+    };
     let selector = match version_id {
         Some(version_id) => VersionSelector::Exact(PublicVersionId::parse_s3(version_id)?),
         None => VersionSelector::Current,
@@ -1191,25 +1193,35 @@ pub async fn head_object(
 }
 
 async fn delete_object_item(
-    state: &AppState,
-    principal: &str,
-    bucket: &str,
-    key: &str,
+    db: &sea_orm::DatabaseConnection,
+    scope: &Scope<'_>,
+    (bucket, key): (&str, &str),
     version_id: Option<&str>,
+    bucket_prechecked: bool,
 ) -> AppResult<crate::store::object_version::DeleteVersionResult> {
     let selector = match version_id {
         Some(version_id) => VersionSelector::Exact(PublicVersionId::parse_s3(version_id)?),
         None => VersionSelector::Current,
     };
-    let scope = state.credentials.policies.scope(principal, Some(bucket));
     let context = object_access_context(Action::DeleteObject, key, version_id);
-    crate::store::pinning::publication::delete_version_authorized(
-        state.store.db(),
+    let authorize_tags = match scope.decision(&context) {
+        Decision::Allow => None,
+        Decision::Deny => {
+            if !bucket_prechecked && !crate::store::bucket::exists(db, bucket).await? {
+                return Err(AppError::NoSuchBucket(bucket.to_owned()));
+            }
+            return Err(object_policy_denied());
+        }
+        Decision::NeedsExistingTags => {
+            Some(|tags: &[ObjectTag]| check_object_policy(scope, &context, None, Some(tags)))
+        }
+    };
+    crate::store::pinning::publication::delete_version_with_admission(
+        db,
         bucket,
         key,
         selector,
-        scope.needs_existing_tags(&context),
-        |tags| check_object_policy(&scope, &context, None, tags),
+        authorize_tags,
         chrono::Utc::now(),
     )
     .await
@@ -1219,12 +1231,20 @@ pub async fn delete_object(
     state: &Arc<AppState>,
     req: S3Request<DeleteObjectInput>,
 ) -> S3Result<S3Response<DeleteObjectOutput>> {
+    let principal = principal_id(state, &req)?;
+    let DeleteObjectInput {
+        bucket,
+        key,
+        version_id,
+        ..
+    } = &req.input;
+    let scope = state.credentials.policies.scope(&principal, Some(bucket));
     let result = delete_object_item(
-        state,
-        &principal_id(state, &req)?,
-        &req.input.bucket,
-        &req.input.key,
-        req.input.version_id.as_deref(),
+        state.store.db(),
+        &scope,
+        (bucket, key),
+        version_id.as_deref(),
+        false,
     )
     .await?;
     Ok(S3Response::new(DeleteObjectOutput {
@@ -1283,6 +1303,7 @@ pub async fn delete_objects(
         return Err(s3s::s3_error!(NoSuchBucket, "bucket not found: {}", bucket));
     }
 
+    let scope = state.credentials.policies.scope(&principal, Some(bucket));
     let quiet = delete.quiet.unwrap_or(false);
     let mut deleted = Vec::new();
     let mut errors = Vec::new();
@@ -1291,11 +1312,11 @@ pub async fn delete_objects(
         let key = &object.key;
         let incoming_version_id = &object.version_id;
         match delete_object_item(
-            state,
-            &principal,
-            bucket,
-            key,
+            db,
+            &scope,
+            (bucket, key),
             incoming_version_id.as_deref(),
+            true,
         )
         .await
         {

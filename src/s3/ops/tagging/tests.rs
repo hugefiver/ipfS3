@@ -922,7 +922,7 @@ async fn get_tagging_reads_exact_historical_owner() {
 
 #[tokio::test]
 async fn put_and_delete_tagging_mutate_only_exact_internal_owner() {
-    let versions = versioned_fixture().await;
+    let mut versions = versioned_fixture().await;
     seed_tags_for_owner(
         &versions.fixture,
         &versions.historical_object_id,
@@ -968,6 +968,13 @@ async fn put_and_delete_tagging_mutate_only_exact_internal_owner() {
     );
     assert_eq!(tag_pairs(&current.tag_set), vec![("current", "kept")]);
 
+    let statements = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed = statements.clone();
+    let mut db = versions.fixture.state.store.db().clone();
+    db.set_metric_callback(move |info| {
+        observed.lock().unwrap().push(info.statement.sql.clone());
+    });
+    Arc::get_mut(&mut versions.fixture.state).unwrap().store = Store::new(db);
     let deleted = delete_object_tagging_at(
         &versions.fixture.state,
         delete_version_request(KEY, Some(&versions.historical_version_id)),
@@ -980,6 +987,15 @@ async fn put_and_delete_tagging_mutate_only_exact_internal_owner() {
         deleted.version_id.as_deref(),
         Some(versions.historical_version_id.as_str())
     );
+    {
+        let statements = statements.lock().unwrap();
+        assert!(
+            !statements
+                .iter()
+                .any(|sql| sql.starts_with("SELECT") && sql.contains("object_tags")),
+            "{statements:#?}"
+        );
+    }
     let historical = get_object_tagging(
         &versions.fixture.state,
         get_version_request(KEY, Some(&versions.historical_version_id)),

@@ -310,7 +310,7 @@ async fn replace_tag_set(
             replacement.as_deref(),
         )
         .await?;
-        let replacement = replacement.as_deref().unwrap_or_default();
+        let replacement = replacement.unwrap_or_default();
         let owner =
             selected_content_owner(&selected, matches!(selector, VersionSelector::Current))?;
         let version_id = response_version_id(&txn, &bucket, &selected).await?;
@@ -319,7 +319,7 @@ async fn replace_tag_set(
         let decision = capture_tag_decision(
             state,
             (&bucket, &key),
-            replacement,
+            &replacement,
             &current_tags,
             previous.as_ref(),
             manual.is_some(),
@@ -329,7 +329,7 @@ async fn replace_tag_set(
             &bucket,
             &key,
             manual.as_ref(),
-            replacement,
+            &replacement,
             now,
         ) {
             Ok(mutation) => mutation,
@@ -342,9 +342,15 @@ async fn replace_tag_set(
             Err(error) => return Err(error.into()),
         };
         resources::replace_manual(&txn, &owner.id, &mutation, now).await?;
-        tags::replace_object_tags(&txn, &owner.id, replacement).await?;
-        decision::replace_for_version_in_transaction(&txn, &selected.id, &owner.id, &decision)
-            .await?;
+        tags::replace_object_tags(&txn, &owner.id, &replacement).await?;
+        decision::replace_for_version_with_tags_in_transaction(
+            &txn,
+            &selected.id,
+            &owner.id,
+            &decision,
+            replacement,
+        )
+        .await?;
         Ok((version_id, decision.warning))
     }
     .await;
