@@ -29,3 +29,9 @@
 
 - S3 Select and tag-based search. Search can be eventually consistent and is separate from authorization.
 - Static website hosting via IPFS Gateway and DNSLink.
+- Client CID preflight on `PUT` and `decompress-zip`: allow clients to supply candidate CIDs on `PUT` and reuse content directly when already retrievable on the primary Kubo or IPFS network; for `decompress-zip`, allow preflighting the full file manifest so clients upload only files whose CIDs are missing, then either skip storing the archive ZIP or reconstruct it on the backend.
+
+### Storage and lifecycle
+
+- Per-bucket primary Kubo GC/unpin policies to unpin CIDs from the primary Kubo node once their lifecycle has ended and no active database references remain.
+- Versioned UnixFS directory root (`rootfs`) pin options allowing clients to choose between retaining only the latest version or keeping multiple versions, defaulting to latest-only (regenerating a root CID for the same directory updates the existing database record in place and unpins the previous root).
