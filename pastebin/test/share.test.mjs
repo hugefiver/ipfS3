@@ -103,7 +103,7 @@ test("encrypted shares round-trip key-in-URL and manual-key modes without leakin
   const withKey = {
     kind: "encrypted",
     backend: "ipfs",
-    url: "https://apac.orbitor.dev/ipfs/bafyencrypted",
+    url: "https://ipfs.example.com/ipfs/bafyencrypted",
     kdf: "raw",
     secret: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
   };
@@ -140,9 +140,9 @@ test("encrypted share validation rejects mismatched secrets and unsupported back
   assert.throws(() => normalizeSelection({
     kind: "encrypted",
     backend: "ipfs",
-    url: "https://apac.orbitor.dev/ipfs/bafyencrypted",
+    url: "https://ipfs.example.com/ipfs/bafyencrypted",
     kdf: "scrypt",
   }), /key mode/);
-  assert.throws(() => decodeShare("#share?kind=encrypted&backend=ipfs&url=https%3A%2F%2Fapac.orbitor.dev%2Fipfs%2Fbafy&kdf=raw&p=secret"), /does not match/);
-  assert.throws(() => decodeShare("#share?kind=encrypted&backend=ipfs&url=https%3A%2F%2Fapac.orbitor.dev%2Fipfs%2Fbafy&kdf=raw&k=abc&p=def"), /both key and passphrase/);
+  assert.throws(() => decodeShare("#share?kind=encrypted&backend=ipfs&url=https%3A%2F%2Fipfs.example.com%2Fipfs%2Fbafy&kdf=raw&p=secret"), /does not match/);
+  assert.throws(() => decodeShare("#share?kind=encrypted&backend=ipfs&url=https%3A%2F%2Fipfs.example.com%2Fipfs%2Fbafy&kdf=raw&k=abc&p=def"), /both key and passphrase/);
 });
