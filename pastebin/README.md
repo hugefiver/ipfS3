@@ -136,8 +136,7 @@ aws --endpoint-url https://s3.example.com s3api put-bucket-cors `
   --bucket pastebin --cors-configuration file://pastebin/deploy/cors.example.json
 ```
 
-[`deploy/cors.example.json`](deploy/cors.example.json) permits signed `PUT`,
-anonymous `HEAD`/`GET`, `authorization`, `content-type`, `x-amz-*` (including
+[`deploy/cors.example.json`](deploy/cors.example.json) permits signed/anonymous `PUT`, `POST`, `DELETE`, `HEAD`, `GET` (including multipart uploads for files over 6 MiB), `authorization`, `content-type`, `x-amz-*` (including
 `x-amz-tagging` and session tokens) and `x-ipfs3-download-gateway`. It exposes `ETag`,
 `x-amz-meta-ipfs-cid`, `x-ipfs-s3-zip-root-cid` and
 `x-ipfs-s3-zip-root-status`. CORS permits browser access; it does not change

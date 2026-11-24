@@ -3,7 +3,7 @@
     {
       "ID": "static-pastebin-publisher",
       "AllowedOrigins": ["https://pastebin.example.com"],
-      "AllowedMethods": ["PUT", "HEAD", "GET"],
+      "AllowedMethods": ["PUT", "POST", "DELETE", "HEAD", "GET"],
       "AllowedHeaders": ["authorization", "content-type", "x-amz-*", "x-ipfs3-download-gateway"],
       "ExposeHeaders": [
         "ETag",

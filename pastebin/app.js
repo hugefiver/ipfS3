@@ -1,7 +1,7 @@
 import { deploymentDefaults } from "./config.js";
 import { decryptEnvelope, encryptEnvelope, estimateEncryptedSize } from "./crypto.js";
 import { publish } from "./publish.mjs";
-import { persistSettings, readSettings, validateSettings } from "./settings.js";
+import { normalizeGateway, persistSettings, readSettings, validateSettings } from "./settings.js";
 import {
   decodeShare,
   directoryListUrl,
@@ -10,6 +10,7 @@ import {
   ipfsUrl,
   objectUrlFromList,
   probePublicUrl,
+  safeHttpUrl,
 } from "./share.js";
 
 const $ = (id) => document.getElementById(id);
@@ -424,6 +425,53 @@ function encryptedSelectionFor(result, backend, url) {
   return selection;
 }
 
+function extractIpfsCid(rawUrl) {
+  try {
+    const parsed = new URL(rawUrl);
+    const match = /\/ipfs\/([A-Za-z0-9]{1,128})(?:\/|$)/.exec(parsed.pathname);
+    return match ? match[1] : null;
+  } catch {
+    return null;
+  }
+}
+
+function selectedEncryptedSource() {
+  const checked = document.querySelector('input[name="encryptedSource"]:checked');
+  return checked ? checked.value : "ipfs";
+}
+
+function setEncryptedSourceRadio(value) {
+  const target = document.querySelector(`input[name="encryptedSource"][value="${value}"]`);
+  if (target) target.checked = true;
+  $("share-custom-gateway").hidden = value !== "custom";
+}
+
+function applyEncryptedSourceSelection(triggerButton = null) {
+  if (!currentResult?.encrypted) return;
+  const source = selectedEncryptedSource();
+  $("share-custom-gateway").hidden = source !== "custom";
+  try {
+    let backend = "ipfs";
+    let targetUrl;
+    if (source === "s3") {
+      backend = "s3";
+      targetUrl = currentResult.url;
+    } else if (source === "custom") {
+      const customGateway = normalizeGateway($("share-custom-gateway").value);
+      targetUrl = ipfsUrl(customGateway, currentResult.cid);
+    } else {
+      targetUrl = ipfsUrl(settings.ipfsGateway, currentResult.cid);
+    }
+    showShare(encryptedSelectionFor(currentResult, backend, targetUrl), triggerButton);
+  } catch (error) {
+    currentSelection = undefined;
+    $("share-url").value = "";
+    $("open-share").hidden = true;
+    $("copy-share").disabled = true;
+    setStatus($("copy-status"), error.message, "error");
+  }
+}
+
 function showShare(selection, triggerButton = null) {
   if (activeShareButton) activeShareButton.setAttribute("aria-pressed", "false");
   activeShareButton = triggerButton;
@@ -431,9 +479,21 @@ function showShare(selection, triggerButton = null) {
 
   currentSelection = selection;
   if (selection.kind === "encrypted") {
-    $("share-url").value = buildEncryptedShareUrl(selection);
-    $("share-selection-label").textContent = `${selection.backend} · ${selection.secret ? "encrypted (key in URL)" : "encrypted (manual key)"}`;
+    const shareHref = buildEncryptedShareUrl(selection);
+    $("share-url").value = shareHref;
+    const openShare = $("open-share");
+    openShare.href = shareHref;
+    openShare.hidden = false;
+    const host = new URL(selection.url).host;
+    $("share-selection-label").textContent = `${selection.backend} · ${host} · ${selection.secret ? "key in URL" : "manual key"}`;
     $("copy-share").disabled = false;
+    if (triggerButton) {
+      if (selection.backend === "s3") {
+        setEncryptedSourceRadio("s3");
+      } else if (selection.url === ipfsUrl(settings.ipfsGateway, currentResult.cid)) {
+        setEncryptedSourceRadio("ipfs");
+      }
+    }
     setStatus(
       $("copy-status"),
       selection.secret
@@ -444,6 +504,7 @@ function showShare(selection, triggerButton = null) {
     return;
   }
 
+  $("open-share").hidden = true;
   const direct = selection.backend !== "s3" || (selection.kind === "file" && selection.mode === "preview");
   const url = new URL(window.location.origin + window.location.pathname);
   url.hash = direct ? "" : encodeShare(selection);
@@ -620,7 +681,12 @@ function renderResult(result) {
   $("partial-notice").textContent = "This directory is partial. Failed entries are listed below; the root still contains only successful outputs.";
   $("share-url").value = "";
   $("share-selection-label").textContent = "";
+  $("open-share").hidden = true;
   $("copy-share").disabled = true;
+  $("share-source-panel").hidden = !isEncrypted;
+  if (isEncrypted) {
+    setEncryptedSourceRadio("ipfs");
+  }
   setStatus($("copy-status"), "");
   setStatus($("public-status"), "Not checked. No anonymous request has been sent.");
   $("s3-links").replaceChildren();
@@ -698,6 +764,13 @@ function renderResult(result) {
   renderFailures(result.failures);
 }
 
+for (const radio of document.querySelectorAll('input[name="encryptedSource"]')) {
+  radio.addEventListener("change", () => applyEncryptedSourceSelection());
+}
+$("share-custom-gateway").addEventListener("input", () => {
+  if (selectedEncryptedSource() === "custom") applyEncryptedSourceSelection();
+});
+
 $("share-include-secret").addEventListener("change", () => {
   if (!currentResult?.encrypted) return;
   currentResult.encrypted.includeSecretInUrl = $("share-include-secret").checked;
@@ -711,6 +784,8 @@ $("share-include-secret").addEventListener("change", () => {
       encryptedSelectionFor(currentResult, currentSelection.backend, currentSelection.url),
       activeShareButton,
     );
+  } else {
+    applyEncryptedSourceSelection();
   }
 });
 
@@ -747,6 +822,19 @@ publishForm.addEventListener("submit", async (event) => {
     const creds = credentials();
     const name = validatePlainName($("content-name").value.trim());
 
+    const reportProgress = (progress) => {
+      if (progress.phase === "init") {
+        setStatus(publishStatus, `Starting multipart upload (${progress.totalParts} parts)…`);
+      } else if (progress.phase === "uploading") {
+        setStatus(
+          publishStatus,
+          `Uploading parts ${progress.completedParts}/${progress.totalParts} (${formatBytes(progress.uploadedBytes)} / ${formatBytes(progress.totalBytes)}, ${progress.concurrency}×)…`,
+        );
+      } else if (progress.phase === "completing") {
+        setStatus(publishStatus, "Finalizing upload…");
+      }
+    };
+
     let result;
     if (isEncryptionEnabled()) {
       const kdf = selectedKdf();
@@ -782,6 +870,7 @@ publishForm.addEventListener("submit", async (event) => {
           body: new Blob([encrypted.payload], { type: "application/octet-stream" }),
           name: "encrypted.bin",
           credentials: creds,
+          onProgress: reportProgress,
         },
         settings,
       );
@@ -796,7 +885,7 @@ publishForm.addEventListener("submit", async (event) => {
       };
     } else {
       result = await publish(
-        { ...body, name, credentials: creds },
+        { ...body, name, credentials: creds, onProgress: reportProgress },
         settings,
       );
     }
@@ -1099,31 +1188,64 @@ function renderDecryptedItem(plain) {
   $("decrypted-output").hidden = false;
 }
 
-async function fetchEncryptedPayload(selection) {
-  if (cachedCiphertext?.url === selection.url) {
+function currentDecryptTargetUrl(selection) {
+  const input = $("decrypt-source-url").value.trim();
+  if (!input) return selection.url;
+  const safe = safeHttpUrl(input);
+  if (!safe) throw new Error("Enter a valid HTTP(S) ciphertext URL.");
+  return safe;
+}
+
+async function fetchEncryptedPayload(selection, targetUrl = selection.url) {
+  if (cachedCiphertext?.url === targetUrl) {
     return cachedCiphertext.bytes;
   }
+  const useS3Proxy =
+    (selection.backend === "s3" && targetUrl === selection.url) ||
+    (settings && new URL(targetUrl).origin === settings.endpoint);
   const options = {
     credentials: "omit",
     cache: "no-store",
     referrerPolicy: "no-referrer",
-    redirect: selection.backend === "s3" ? "error" : "follow",
+    redirect: useS3Proxy ? "error" : "follow",
   };
-  if (selection.backend === "s3") {
+  if (useS3Proxy) {
     options.headers = { "X-IPFS3-Download-Gateway": "proxy" };
   }
-  let response;
-  try {
-    response = await fetch(selection.url, options);
-  } catch {
-    throw new Error("Could not fetch the encrypted payload. Check gateway availability or CORS settings.");
+
+  let lastError;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const response = await fetch(targetUrl, options);
+      if (!response.ok) {
+        const retryable = response.status === 408 || response.status === 429 || response.status >= 500;
+        const err = new Error(`Fetching encrypted payload returned HTTP ${response.status}.`);
+        if (retryable && attempt === 0) {
+          lastError = err;
+          await new Promise((resolve) => setTimeout(resolve, 400));
+          continue;
+        }
+        throw err;
+      }
+      const bytes = new Uint8Array(await response.arrayBuffer());
+      cachedCiphertext = { url: targetUrl, bytes };
+      return bytes;
+    } catch (error) {
+      lastError = error;
+      if (attempt === 0 && error instanceof TypeError) {
+        await new Promise((resolve) => setTimeout(resolve, 400));
+        continue;
+      }
+      break;
+    }
   }
-  if (!response.ok) {
-    throw new Error(`Fetching encrypted payload returned HTTP ${response.status}.`);
+
+  if (lastError instanceof TypeError) {
+    throw new Error(
+      `Could not download the complete encrypted payload (${lastError.message}). Retry or switch fetch source below.`,
+    );
   }
-  const bytes = new Uint8Array(await response.arrayBuffer());
-  cachedCiphertext = { url: selection.url, bytes };
-  return bytes;
+  throw lastError;
 }
 
 async function decryptActiveSelection() {
@@ -1142,16 +1264,26 @@ async function decryptActiveSelection() {
     return;
   }
 
+  let targetUrl;
+  try {
+    targetUrl = currentDecryptTargetUrl(selection);
+  } catch (error) {
+    setStatus($("shared-status"), error.message, "error");
+    return;
+  }
+
   const runId = ++decryptRunId;
   const button = $("decrypt-button");
   button.disabled = true;
   button.setAttribute("aria-busy", "true");
   clearDecryptedState();
+  let fetched = false;
   try {
-    if (cachedCiphertext?.url !== selection.url) {
+    if (cachedCiphertext?.url !== targetUrl) {
       setStatus($("shared-status"), "Fetching encrypted payload…");
     }
-    const bytes = await fetchEncryptedPayload(selection);
+    const bytes = await fetchEncryptedPayload(selection, targetUrl);
+    fetched = true;
     if (runId !== decryptRunId) return;
     setStatus(
       $("shared-status"),
@@ -1163,6 +1295,11 @@ async function decryptActiveSelection() {
     setStatus($("shared-status"), "Decrypted locally in your browser.", "success");
   } catch (error) {
     if (runId !== decryptRunId) return;
+    if (!fetched) {
+      const panel = $("decrypt-source-panel");
+      panel.hidden = false;
+      panel.open = true;
+    }
     setStatus($("shared-status"), error.message, "error");
   } finally {
     if (runId === decryptRunId) {
@@ -1171,6 +1308,22 @@ async function decryptActiveSelection() {
     }
   }
 }
+
+$("decrypt-use-ipfs-io").addEventListener("click", () => {
+  const cid = extractIpfsCid($("decrypt-source-url").value || activeSharedSelection?.url);
+  if (!cid) return;
+  $("decrypt-source-url").value = ipfsUrl("https://ipfs.io/ipfs/", cid);
+  cachedCiphertext = null;
+  if ($("decrypt-secret").value) void decryptActiveSelection();
+});
+
+$("decrypt-use-default-gw").addEventListener("click", () => {
+  const cid = extractIpfsCid($("decrypt-source-url").value || activeSharedSelection?.url);
+  if (!cid || !settings) return;
+  $("decrypt-source-url").value = ipfsUrl(settings.ipfsGateway, cid);
+  cachedCiphertext = null;
+  if ($("decrypt-secret").value) void decryptActiveSelection();
+});
 
 $("decrypt-form").addEventListener("submit", (event) => {
   event.preventDefault();
@@ -1248,6 +1401,13 @@ function renderSharedSelection(selection) {
     $("decrypt-secret-label").textContent = isPassphrase ? "Passphrase" : "Decryption key";
     $("decrypt-secret").placeholder = isPassphrase ? "Enter passphrase" : "Enter decryption key";
     $("decrypt-secret").value = selection.secret ?? "";
+    const sourcePanel = $("decrypt-source-panel");
+    sourcePanel.hidden = false;
+    sourcePanel.open = false;
+    $("decrypt-source-url").value = selection.url;
+    const cid = extractIpfsCid(selection.url);
+    $("decrypt-use-ipfs-io").hidden = !cid;
+    $("decrypt-use-default-gw").hidden = !cid || !settings || selection.url.startsWith(settings.ipfsGateway);
     setSecretVisibility($("decrypt-secret"), $("toggle-decrypt-secret"), false);
     if (selection.secret) {
       void decryptActiveSelection();

@@ -4,8 +4,8 @@ import { once } from 'node:events';
 import { createServer } from 'node:http';
 import { buffer } from 'node:stream/consumers';
 import { test } from 'node:test';
-import { publish } from '../publish.mjs';
-import { encodeS3Component, signPut } from '../sigv4.mjs';
+import { MULTIPART_THRESHOLD_BYTES, planMultipartUpload, publish } from '../publish.mjs';
+import { canonicalQuery, encodeS3Component, signPut } from '../sigv4.mjs';
 
 const fileCid = 'bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku';
 const rootCid = 'bafybeib4r26s6xrk5uqyy6k5lkwxmrsfecmfxluvlz44b2qnt3rottiw3u';
@@ -178,6 +178,162 @@ test('supports anonymous unsigned file PUT and maps AccessDenied clearly', async
   status = 403;
   body = '<?xml version="1.0"?><Error><Code>AccessDenied</Code></Error>';
   await assert.rejects(publish({ ...file, credentials: undefined }, config), /credentials may be required.*HTTP 403/);
+});
+
+test('planMultipartUpload uses single PUT up to 6 MiB and scales part size and concurrency above 6 MiB', () => {
+  const mib = 1024 * 1024;
+  assert.equal(planMultipartUpload(0), null);
+  assert.equal(planMultipartUpload(MULTIPART_THRESHOLD_BYTES), null);
+
+  const small = planMultipartUpload(7 * mib);
+  assert.equal(small.partSize, 5 * mib);
+  assert.equal(small.partCount, 2);
+  assert.ok(small.initialConcurrency >= 2 && small.maxConcurrency >= small.initialConcurrency);
+
+  const medium = planMultipartUpload(64 * mib);
+  assert.equal(medium.partSize, 8 * mib);
+  assert.equal(medium.partCount, 8);
+  assert.ok(medium.initialConcurrency >= 2);
+
+  const large = planMultipartUpload(256 * mib);
+  assert.equal(large.partSize, 16 * mib);
+  assert.equal(large.partCount, 16);
+
+  const huge = planMultipartUpload(1024 * mib);
+  assert.equal(huge.partSize, 32 * mib);
+  assert.equal(huge.partCount, 32);
+});
+
+test('uploads files over threshold concurrently via multipart upload with adaptive retry and complete XML', async t => {
+  const payload = new Uint8Array(640);
+  for (let i = 0; i < payload.length; i += 1) payload[i] = i & 0xff;
+
+  let activeParts = 0;
+  let peakActiveParts = 0;
+  let failedOnce = false;
+  const uploadedParts = new Map();
+  const requests = [];
+
+  const server = createServer(async (req, res) => {
+    const bytes = await buffer(req);
+    const parsed = new URL(req.url, `http://${req.headers.host}`);
+    requests.push({ method: req.method, url: req.url, headers: req.headers, bytes });
+
+    if (req.method === 'POST' && parsed.searchParams.has('uploads')) {
+      res.writeHead(200, { 'content-type': 'application/xml' }).end(
+        '<InitiateMultipartUploadResult><UploadId>mpu-test-1</UploadId></InitiateMultipartUploadResult>',
+      );
+      return;
+    }
+    if (req.method === 'PUT' && parsed.searchParams.has('partNumber')) {
+      const partNumber = Number(parsed.searchParams.get('partNumber'));
+      assert.equal(parsed.searchParams.get('uploadId'), 'mpu-test-1');
+      activeParts += 1;
+      peakActiveParts = Math.max(peakActiveParts, activeParts);
+      await new Promise(resolve => setTimeout(resolve, 25));
+      activeParts -= 1;
+      if (partNumber === 2 && !failedOnce) {
+        failedOnce = true;
+        res.writeHead(503, { 'content-type': 'application/xml' }).end('<Error><Code>SlowDown</Code></Error>');
+        return;
+      }
+      uploadedParts.set(partNumber, bytes);
+      res.writeHead(200, { etag: `"bafypart${partNumber}"` }).end();
+      return;
+    }
+    if (req.method === 'POST' && parsed.searchParams.get('uploadId') === 'mpu-test-1') {
+      const bodyText = bytes.toString('utf8');
+      assert.ok(bodyText.includes('<PartNumber>1</PartNumber><ETag>"bafypart1"</ETag>'));
+      assert.ok(bodyText.includes('<PartNumber>5</PartNumber><ETag>"bafypart5"</ETag>'));
+      res.writeHead(200, { 'content-type': 'application/xml' }).end(
+        `<CompleteMultipartUploadResult><ETag>"${fileCid}"</ETag></CompleteMultipartUploadResult>`,
+      );
+      return;
+    }
+    res.writeHead(400).end('unexpected request');
+  });
+  server.listen(0, '127.0.0.1');
+  t.after(() => new Promise(resolve => server.close(resolve)));
+  await once(server, 'listening');
+  const endpoint = `http://127.0.0.1:${server.address().port}`;
+
+  const progressEvents = [];
+  const result = await publish(
+    {
+      mode: 'file',
+      name: 'chunked.bin',
+      body: new Blob([payload], { type: 'application/octet-stream' }),
+      credentials: undefined,
+      onProgress: (p) => progressEvents.push(p),
+    },
+    {
+      ...commonConfig,
+      endpoint,
+      maxUploadBytes: 4096,
+      multipart: { thresholdBytes: 200, partSize: 128, initialConcurrency: 2, maxConcurrency: 4, retryDelaysMs: [10, 20] },
+    },
+  );
+
+  assert.equal(result.cid, fileCid);
+  assert.equal(uploadedParts.size, 5);
+  assert.ok(peakActiveParts >= 2, `expected concurrent part uploads, got peak=${peakActiveParts}`);
+  assert.equal(requests.every(r => r.headers.authorization === undefined), true);
+  assert.equal(progressEvents[0].phase, 'init');
+  assert.equal(progressEvents.at(-1).phase, 'completing');
+
+  const reassembled = Buffer.concat([1, 2, 3, 4, 5].map(n => uploadedParts.get(n)));
+  assert.deepEqual(new Uint8Array(reassembled), payload);
+});
+
+test('signs multipart upload requests with canonical query strings and aborts on fatal part error', async t => {
+  const payload = new Uint8Array(300);
+  let aborted = false;
+
+  const { config, requests } = await serve(t, (request) => {
+    const parsed = new URL(request.url, `http://${request.headers.host}`);
+    if (request.method === 'POST' && parsed.searchParams.has('uploads')) {
+      assert.equal(canonicalQuery(parsed), 'uploads=');
+      assert.ok(request.headers.authorization?.startsWith('AWS4-HMAC-SHA256 '));
+      return {
+        headers: { 'content-type': 'application/xml' },
+        body: '<InitiateMultipartUploadResult><UploadId>mpu-abort-1</UploadId></InitiateMultipartUploadResult>',
+      };
+    }
+    if (request.method === 'PUT' && parsed.searchParams.has('partNumber')) {
+      assert.match(canonicalQuery(parsed), /^partNumber=\d+&uploadId=mpu-abort-1$/);
+      assert.ok(request.headers.authorization?.startsWith('AWS4-HMAC-SHA256 '));
+      return {
+        status: 403,
+        headers: { 'content-type': 'application/xml' },
+        body: '<Error><Code>AccessDenied</Code></Error>',
+      };
+    }
+    if (request.method === 'DELETE' && parsed.searchParams.get('uploadId') === 'mpu-abort-1') {
+      assert.ok(request.headers.authorization?.startsWith('AWS4-HMAC-SHA256 '));
+      aborted = true;
+      return { status: 204 };
+    }
+    return { status: 400 };
+  });
+
+  await assert.rejects(
+    publish(
+      {
+        mode: 'file',
+        name: 'denied.bin',
+        body: new Blob([payload], { type: 'application/octet-stream' }),
+        credentials,
+      },
+      {
+        ...config,
+        multipart: { thresholdBytes: 100, partSize: 128, initialConcurrency: 2, maxConcurrency: 2, retryDelaysMs: [5] },
+      },
+    ),
+    /denied this upload/,
+  );
+
+  assert.equal(aborted, true);
+  assert.ok(requests.some(r => r.method === 'DELETE'));
 });
 
 const liveEndpoint = process.env.PASTEBIN_TEST_ENDPOINT;

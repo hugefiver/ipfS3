@@ -50,6 +50,17 @@
             <button id="decrypt-button" class="button primary" type="submit">Decrypt</button>
           </div>
         </div>
+        <details id="decrypt-source-panel" class="decrypt-source-panel" hidden>
+          <summary>Switch fetch source</summary>
+          <div class="decrypt-source-body">
+            <label for="decrypt-source-url">Ciphertext URL</label>
+            <div class="secret-input-row">
+              <input id="decrypt-source-url" type="url" spellcheck="false">
+              <button id="decrypt-use-ipfs-io" class="button secondary compact" type="button" hidden>ipfs.io</button>
+              <button id="decrypt-use-default-gw" class="button secondary compact" type="button" hidden>Default gateway</button>
+            </div>
+          </div>
+        </details>
       </form>
       <p id="shared-status" role="status" aria-live="polite"></p>
       <div id="decrypted-output" class="decrypted-output" hidden>
@@ -231,8 +242,18 @@
       </div>
       <div class="share-field">
         <label for="share-url">Share link <span id="share-selection-label" class="optional"></span></label>
-        <div>
+        <div id="share-source-panel" class="share-source-panel" hidden>
+          <span class="share-source-label">Source</span>
+          <div class="mode-picker share-source-picker" role="radiogroup" aria-label="Encrypted share source">
+            <label><input type="radio" name="encryptedSource" value="ipfs" checked><span>IPFS gateway</span></label>
+            <label><input type="radio" name="encryptedSource" value="s3"><span>S3 direct</span></label>
+            <label><input type="radio" name="encryptedSource" value="custom"><span>Custom gateway</span></label>
+          </div>
+          <input id="share-custom-gateway" type="url" value="https://ipfs.io/ipfs/" placeholder="https://ipfs.io/ipfs/" spellcheck="false" hidden>
+        </div>
+        <div class="share-url-row">
           <input id="share-url" readonly placeholder="Select a link below">
+          <a id="open-share" class="button secondary" target="_blank" rel="noopener noreferrer" hidden>Open</a>
           <button id="copy-share" class="button primary" type="button" disabled>Copy link</button>
         </div>
         <p id="copy-status" role="status" aria-live="polite"></p>
