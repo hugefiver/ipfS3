@@ -183,8 +183,8 @@
             <div class="field"><label for="bucket">Bucket</label><input id="bucket" required spellcheck="false"></div>
             <div class="field"><label for="region">Region</label><input id="region" required spellcheck="false"></div>
             <div class="field">
-              <label for="max-upload">Max bytes <span id="max-upload-readable" class="optional"></span></label>
-              <input id="max-upload" type="number" min="1" step="1" required>
+              <label for="max-upload">Max size (MiB) <span id="max-upload-readable" class="optional"></span></label>
+              <input id="max-upload" type="number" min="0" step="any" required>
             </div>
             <div class="field"><label for="ipfs-gateway">IPFS gateway</label><input id="ipfs-gateway" type="url" required spellcheck="false"></div>
           </div>

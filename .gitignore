@@ -10,3 +10,4 @@ largefile.bin
 # the sanitized receipts (*.md) in this directory are tracked.
 tests/results/postgres-lifecycle-validation/*.log
 tests/results/postgres-lifecycle-validation/*.json
+pastebin/dist/

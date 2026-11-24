@@ -121,18 +121,30 @@ function isDefaultSettings(current) {
   );
 }
 
+const BYTES_PER_MIB = 1024 * 1024;
+
+function bytesToMiBValue(bytes) {
+  return String(Number((bytes / BYTES_PER_MIB).toFixed(6)));
+}
+
+function mibInputToBytes(raw) {
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value <= 0) return NaN;
+  return Math.round(value * BYTES_PER_MIB);
+}
+
 function updateMaxUploadReadable() {
-  const value = Number($("max-upload").value);
+  const bytes = mibInputToBytes($("max-upload").value);
   $("max-upload-readable").textContent =
-    Number.isSafeInteger(value) && value > 0 ? `(${formatBytes(value)})` : "";
+    Number.isSafeInteger(bytes) && bytes > 0 ? `(${formatBytes(bytes)})` : "";
 }
 
 function fillSettings() {
   $("endpoint").value = settings.endpoint;
   $("bucket").value = settings.bucket;
   $("region").value = settings.region;
-  $("max-upload").value = settings.maxUploadBytes;
-  $("max-upload").max = deploymentDefaults.maxUploadBytes;
+  $("max-upload").value = bytesToMiBValue(settings.maxUploadBytes);
+  $("max-upload").removeAttribute("max");
   $("ipfs-gateway").value = settings.ipfsGateway;
   const host = new URL(settings.endpoint).host;
   $("instance-summary").textContent = `${host} / ${settings.bucket}`;
@@ -150,14 +162,14 @@ function readSettingsForm() {
     endpoint: $("endpoint").value,
     bucket: $("bucket").value,
     region: $("region").value,
-    maxUploadBytes: Number($("max-upload").value),
+    maxUploadBytes: mibInputToBytes($("max-upload").value),
     ipfsGateway: $("ipfs-gateway").value,
     inbrowserGateway: settings.inbrowserGateway,
   };
 }
 
 function saveSettings(next) {
-  const valid = persistSettings(window.localStorage, next, deploymentDefaults);
+  const valid = persistSettings(window.localStorage, next);
   if (valid.endpoint !== settings.endpoint) clearCredentials();
   settings = valid;
   fillSettings();
@@ -168,7 +180,7 @@ function saveSettings(next) {
 try {
   settings = readSettings(window.localStorage, deploymentDefaults);
 } catch (error) {
-  settings = validateSettings(deploymentDefaults, deploymentDefaults.maxUploadBytes);
+  settings = validateSettings(deploymentDefaults);
   $("page-alert").hidden = false;
   $("page-alert").textContent = `Saved settings were not loaded: ${error.message}`;
 }

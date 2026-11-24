@@ -53,26 +53,28 @@ test("gateway normalization retains a path prefix and adds a trailing slash", ()
   assert.throws(() => normalizeGateway("https://ipfs.example.com/ipfs/?url=https://evil.test"));
 });
 
-test("the effective upload limit cannot exceed the deployment ceiling", () => {
-  assert.equal(validateSettings(defaults, 1024).maxUploadBytes, 1024);
-  assert.equal(validateSettings({ ...defaults, maxUploadBytes: 512 }, 1024).maxUploadBytes, 512);
-  assert.throws(() => validateSettings({ ...defaults, maxUploadBytes: 1025 }, 1024), /between 1 and 1024/);
-  assert.throws(() => validateSettings({ ...defaults, maxUploadBytes: 1.5 }, 1024));
+test("upload limit allows any positive integer without a hard deployment ceiling", () => {
+  assert.equal(validateSettings(defaults).maxUploadBytes, 1024);
+  assert.equal(validateSettings({ ...defaults, maxUploadBytes: 512 }).maxUploadBytes, 512);
+  assert.equal(validateSettings({ ...defaults, maxUploadBytes: 256 * 1024 * 1024 }).maxUploadBytes, 256 * 1024 * 1024);
+  assert.throws(() => validateSettings({ ...defaults, maxUploadBytes: 0 }));
+  assert.throws(() => validateSettings({ ...defaults, maxUploadBytes: -1 }));
+  assert.throws(() => validateSettings({ ...defaults, maxUploadBytes: 1.5 }));
 });
 
 test("only validated non-secret settings are persisted", () => {
   const store = storage();
-  persistSettings(store, { ...defaults, secretAccessKey: "do-not-store" }, defaults);
+  persistSettings(store, { ...defaults, secretAccessKey: "do-not-store" });
   const serialized = store.values.get(SETTINGS_KEY);
   assert.equal(serialized.includes("do-not-store"), false);
   assert.equal(serialized.includes("secretAccessKey"), false);
   assert.deepEqual(readSettings(store, defaults), defaults);
 });
 
-test("saved settings remain subject to a changed deployment ceiling", () => {
+test("saved settings higher than deployment default remain valid", () => {
   const store = storage();
-  persistSettings(store, defaults, defaults);
-  assert.throws(() => readSettings(store, { ...defaults, maxUploadBytes: 512 }), /between 1 and 512/);
+  persistSettings(store, { ...defaults, maxUploadBytes: 2048 });
+  assert.equal(readSettings(store, { ...defaults, maxUploadBytes: 512 }).maxUploadBytes, 2048);
 });
 
 test("bucket validation uses the publisher's S3 name boundary", () => {

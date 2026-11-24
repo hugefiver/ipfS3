@@ -46,8 +46,8 @@ region, effective byte limit and public IPFS gateway are saved in local storage.
 Changing the S3 endpoint clears all credential fields. **Reset defaults** also
 clears them. A share fragment never updates instance settings.
 
-The deployment's `maxUploadBytes` is an upper bound. A user can lower the limit
-for the current browser, but cannot raise it above the deployment value. The
+The deployment's `maxUploadBytes` is a default limit (64 MiB). A user can freely
+change the limit in MiB for the current browser without a hard client ceiling. The
 publisher checks the Blob size before reading bytes for signing.
 
 ## Sharing and previews
@@ -85,14 +85,26 @@ directory share.
 
 ## Deployment
 
-Edit [`config.js`](config.js) before deploying the directory. The checked-in
-values describe a loopback gateway at `http://127.0.0.1:9000`, bucket `pastebin`,
-region `us-east-1`, a 16 MiB ceiling and these gateways:
+The checked-in [`config.js`](config.js) keeps generic local defaults (`http://127.0.0.1:9000`,
+bucket `pastebin`, region `us-east-1`, a 64 MiB default limit, `https://ipfs.io/ipfs/`,
+and `https://inbrowser.link/ipfs/`).
 
-```text
-https://ipfs.io/ipfs/
-https://inbrowser.link/ipfs/
+To keep deployment-specific endpoints out of Git, run [`build.mjs`](build.mjs) with
+`PASTEBIN_*` environment variables (in Cloudflare Pages build settings or GitHub Actions
+repository variables):
+
+```bash
+PASTEBIN_ENDPOINT=https://s3.example.com \
+PASTEBIN_BUCKET=pastebin \
+PASTEBIN_MAX_UPLOAD_MIB=64 \
+PASTEBIN_IPFS_GATEWAY=https://ipfs.example.com/ipfs/ \
+node pastebin/build.mjs pastebin/dist
 ```
+
+`build.mjs` stages only the runtime static assets into `pastebin/dist` and generates
+a validated `config.js`. Supported variables: `PASTEBIN_ENDPOINT`, `PASTEBIN_BUCKET`,
+`PASTEBIN_REGION`, `PASTEBIN_MAX_UPLOAD_MIB`, `PASTEBIN_MAX_UPLOAD_BYTES`,
+`PASTEBIN_IPFS_GATEWAY`, `PASTEBIN_INBROWSER_GATEWAY`.
 
 The S3 endpoint is an HTTP(S) origin only: no path, query, fragment or userinfo.
 HTTPS is required except for literal `localhost`, `127.0.0.1` and `[::1]` during
@@ -135,7 +147,7 @@ bucket ACL or SigV4 authorization.
 
 Keep all three boundaries aligned:
 
-1. `config.js`: `maxUploadBytes = 16 * 1024 * 1024`.
+1. `config.js`: `maxUploadBytes = 64 * 1024 * 1024`.
 2. [`deploy/nginx.conf.example`](deploy/nginx.conf.example):
    `client_max_body_size 16m` on a dedicated path-style S3 virtual host, whose
    `location /` covers both bucket-root operations and object keys.

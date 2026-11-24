@@ -56,13 +56,10 @@ export function instanceTarget({ endpoint, bucket, region }) {
   return { endpoint: normalizeEndpoint(endpoint), bucket: normalizeBucket(bucket), region };
 }
 
-export function validateSettings(settings, deploymentMaxBytes) {
+export function validateSettings(settings) {
   const maxUploadBytes = settings.maxUploadBytes;
-  if (!Number.isSafeInteger(deploymentMaxBytes) || deploymentMaxBytes < 1) {
-    throw new Error("The deployment upload limit is invalid.");
-  }
-  if (!Number.isSafeInteger(maxUploadBytes) || maxUploadBytes < 1 || maxUploadBytes > deploymentMaxBytes) {
-    throw new Error(`Upload limit must be between 1 and ${deploymentMaxBytes} bytes.`);
+  if (!Number.isSafeInteger(maxUploadBytes) || maxUploadBytes < 1) {
+    throw new Error("Upload limit must be a positive size.");
   }
   return {
     ...instanceTarget(settings),
@@ -75,12 +72,12 @@ export function validateSettings(settings, deploymentMaxBytes) {
 export function readSettings(storage, defaults) {
   const saved = storage.getItem(SETTINGS_KEY);
   return saved === null
-    ? validateSettings(defaults, defaults.maxUploadBytes)
-    : validateSettings(JSON.parse(saved), defaults.maxUploadBytes);
+    ? validateSettings(defaults)
+    : validateSettings(JSON.parse(saved));
 }
 
-export function persistSettings(storage, settings, defaults) {
-  const valid = validateSettings(settings, defaults.maxUploadBytes);
+export function persistSettings(storage, settings) {
+  const valid = validateSettings(settings);
   storage.setItem(SETTINGS_KEY, JSON.stringify(valid));
   return valid;
 }

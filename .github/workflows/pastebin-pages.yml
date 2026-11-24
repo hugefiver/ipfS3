@@ -1,0 +1,47 @@
+name: Deploy Pastebin to Cloudflare Pages
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - "pastebin/**"
+      - ".github/workflows/pastebin-pages.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Run pastebin tests
+        run: node --test pastebin/test/*.test.mjs
+
+      - name: Build pastebin static bundle
+        env:
+          PASTEBIN_ENDPOINT: ${{ vars.PASTEBIN_ENDPOINT }}
+          PASTEBIN_BUCKET: ${{ vars.PASTEBIN_BUCKET }}
+          PASTEBIN_REGION: ${{ vars.PASTEBIN_REGION }}
+          PASTEBIN_MAX_UPLOAD_MIB: ${{ vars.PASTEBIN_MAX_UPLOAD_MIB }}
+          PASTEBIN_MAX_UPLOAD_BYTES: ${{ vars.PASTEBIN_MAX_UPLOAD_BYTES }}
+          PASTEBIN_IPFS_GATEWAY: ${{ vars.PASTEBIN_IPFS_GATEWAY }}
+          PASTEBIN_INBROWSER_GATEWAY: ${{ vars.PASTEBIN_INBROWSER_GATEWAY }}
+        run: node pastebin/build.mjs pastebin/dist
+
+      - name: Deploy to Cloudflare Pages
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID }}
+          command: pages deploy pastebin/dist --project-name=${{ vars.PASTEBIN_PAGES_PROJECT }} --branch=master
