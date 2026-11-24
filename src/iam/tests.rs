@@ -297,6 +297,59 @@ fn canned_grants_distinguish_signature_and_ordinary_writes_without_legacy_fallba
 }
 
 #[test]
+fn anonymous_only_deny_restricts_unsigned_requests_without_blocking_signed_callers() {
+    let policies = compile(
+        r#"
+        [[policy]]
+        effect = "deny"
+        bucket = "pastebin"
+        anonymous = true
+        actions = ["ListObjects", "ListObjectsV2", "ListObjectVersions"]
+    "#,
+    )
+    .unwrap();
+
+    assert!(!policies.has_scope("owner", Some("pastebin")));
+    assert!(!policies.has_scope("reader", Some("pastebin")));
+
+    let list = context(Action::ListObjectsV2, Resource::Prefix(""));
+    let get = context(Action::GetObject, Resource::Object("pastebin/id/file.txt"));
+    let public = |user| {
+        policies.bucket_scope(user, "pastebin", Some("owner"), Some("public-read-write"))
+    };
+
+    assert!(!public(None).allows(&list));
+    assert!(public(None).allows(&get));
+
+    assert!(public(Some("owner")).is_unrestricted());
+    assert!(public(Some("owner")).allows(&list));
+    assert!(public(Some("reader")).allows(&list));
+
+    // Legacy bucket (no ACL) stays unrestricted for signed callers.
+    let legacy = policies.bucket_scope(Some("reader"), "pastebin", None, None);
+    assert!(legacy.is_unrestricted());
+    assert!(legacy.allows(&list));
+
+    // `anonymous = false` applies only to authenticated callers.
+    let auth_only = compile(
+        r#"
+        [[policy]]
+        effect = "deny"
+        bucket = "pastebin"
+        anonymous = false
+        actions = ["ListObjectsV2"]
+    "#,
+    )
+    .unwrap();
+    let auth_scope = |user| {
+        auth_only.bucket_scope(user, "pastebin", Some("owner"), Some("public-read"))
+    };
+    assert!(auth_scope(None).allows(&list));
+    assert!(!auth_scope(Some("owner")).allows(&list));
+    assert!(!auth_scope(Some("reader")).allows(&list));
+}
+
+#[test]
 fn invalid_scope_and_unbindable_conditions_are_rejected_at_startup() {
     for config in [
         r#"actions = ["GetObject"]"#,
@@ -312,10 +365,17 @@ fn invalid_scope_and_unbindable_conditions_are_rejected_at_startup() {
         "user = 'reader'\nactions = ['PutObject']\nrequest_tags = {}",
         "user = 'reader'\nactions = ['GetObject']\nexisting_tags = { '' = 'team' }",
         "user = 'reader'\nactions = ['GetDecompressZipStatus']\nrequest_tags = { owner = 'team' }",
+        "bucket = 'pastebin'\nanonymous = true\nactions = ['GetObject']",
     ] {
         assert!(
             compile(&format!("[[policy]]\neffect = 'allow'\n{config}")).is_err(),
             "{config}"
         );
     }
+    assert!(
+        compile(
+            "[[policy]]\neffect = 'deny'\nuser = 'reader'\nbucket = 'pastebin'\nanonymous = true\nactions = ['ListObjectsV2']"
+        )
+        .is_err()
+    );
 }

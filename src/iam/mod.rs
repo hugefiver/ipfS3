@@ -15,6 +15,7 @@ pub struct Rule {
     effect: Effect,
     user: Option<String>,
     bucket: Option<String>,
+    anonymous: Option<bool>,
     actions: Vec<Action>,
     prefix: Option<String>,
     version: Option<String>,
@@ -113,7 +114,11 @@ impl Policies {
 
     pub fn has_scope(&self, user: &str, bucket: Option<&str>) -> bool {
         self.users.contains_key(user)
-            || bucket.is_some_and(|bucket| self.buckets.contains_key(bucket))
+            || bucket.is_some_and(|bucket| {
+                self.buckets
+                    .get(bucket)
+                    .is_some_and(|rules| rules.iter().any(|rule| rule.anonymous != Some(true)))
+            })
     }
 
     pub fn scope(&self, user: &str, bucket: Option<&str>) -> Scope<'_> {
@@ -168,10 +173,18 @@ impl Scope<'_> {
         self
     }
 
+    fn has_applicable_bucket_rules(&self) -> bool {
+        self.bucket.is_some_and(|rules| {
+            rules
+                .iter()
+                .any(|rule| rule.anonymous.is_none_or(|expected| self.anonymous == expected))
+        })
+    }
+
     pub fn is_unrestricted(&self) -> bool {
         matches!(self.grant, BucketGrant::Legacy | BucketGrant::Owner)
             && self.user.is_none()
-            && self.bucket.is_none()
+            && !self.has_applicable_bucket_rules()
     }
 
     pub fn needs_existing_tags(&self, context: &Context<'_>) -> bool {
@@ -227,6 +240,9 @@ impl Scope<'_> {
         let mut pending_deny = false;
         for rule in rules.filter(|rule| {
             (!self.anonymous || matches!(rule.effect, Effect::Deny))
+                && rule
+                    .anonymous
+                    .is_none_or(|expected| self.anonymous == expected)
                 && rule.matches_request(context)
         }) {
             match (
@@ -274,6 +290,14 @@ impl Rule {
                 .as_ref()
                 .is_none_or(|bucket| !bucket.trim().is_empty()),
             "bucket cannot be empty"
+        );
+        ensure!(
+            self.anonymous != Some(true) || self.user.is_none(),
+            "anonymous = true cannot be combined with user"
+        );
+        ensure!(
+            self.anonymous != Some(true) || matches!(self.effect, Effect::Deny),
+            "anonymous = true is only supported on deny rules"
         );
         ensure!(!self.actions.is_empty(), "actions cannot be empty");
         ensure!(

@@ -48,7 +48,7 @@ aws --endpoint-url http://localhost:9000 s3api get-bucket-acl --bucket media
 
 ## Scope and precedence
 
-Bucket defaults and directory rules are separate. An explicit matching `deny` wins, even for the owner. Otherwise either the bucket default or a matching policy `allow` can grant the operation. A rule with both `user` and `bucket` applies only to that combination. Bucket-only allow rules share with authenticated gateway users, not anonymous callers. Bucket-only denies also restrict anonymous requests on public buckets. Only the owner can manage the bucket ACL.
+Bucket defaults and directory rules are separate. An explicit matching `deny` wins, even for the owner. Otherwise either the bucket default or a matching policy `allow` can grant the operation. A rule with both `user` and `bucket` applies only to that combination. Bucket-only allow rules share with authenticated gateway users, not anonymous callers. Bucket-only denies restrict both signed and anonymous requests on public buckets unless `anonymous = true` (matches unsigned requests only, valid on bucket-scoped `deny` rules without `user`) or `anonymous = false` (matches signed requests only) is set. Only the owner can manage the bucket ACL.
 
 Buckets upgraded without an ACL retain their earlier signed-access policy until the recorded owner sets a category. They do not acquire anonymous access. `GetBucketAcl` returns `InvalidBucketState` to the owner until the first `PutBucketAcl`. A legacy bucket with no recorded owner is not automatically assigned to a user.
 
