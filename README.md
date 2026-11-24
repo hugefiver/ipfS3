@@ -1,5 +1,7 @@
 # ipfS3
 
+**English** · [简体中文](README.zh-CN.md) · [Esperanto](README.eo.md)
+
 An S3-compatible object storage gateway backed by IPFS (Kubo). Upload and manage files with standard S3 tools (`aws cli`, SDKs, rclone), and read plaintext objects directly over IPFS by CID.
 
 [![CI](https://github.com/hugefiver/ipfS3/actions/workflows/ci.yml/badge.svg)](https://github.com/hugefiver/ipfS3/actions/workflows/ci.yml)
