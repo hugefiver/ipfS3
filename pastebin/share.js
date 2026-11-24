@@ -1,5 +1,7 @@
 const SHARE_PREFIX = "#share?";
 const BACKENDS = new Set(["inbrowser", "ipfs", "s3"]);
+const ENCRYPTED_BACKENDS = new Set(["ipfs", "s3"]);
+const KDFS = new Set(["raw", "passphrase"]);
 
 function text(value, label) {
   if (typeof value !== "string" || value.length === 0 || value.length > 4096) {
@@ -26,13 +28,29 @@ export function normalizeSelection(selection) {
   if (!selection || typeof selection !== "object") throw new Error("Invalid shared selection.");
   const kind = selection.kind;
   const backend = selection.backend;
+  const url = safeHttpUrl(selection.url);
+  if (!url) throw new Error("Invalid shared target URL.");
+
+  if (kind === "encrypted") {
+    if (!ENCRYPTED_BACKENDS.has(backend)) {
+      throw new Error("Invalid encrypted share backend.");
+    }
+    const kdf = selection.kdf;
+    if (!KDFS.has(kdf)) {
+      throw new Error("Invalid encrypted share key mode.");
+    }
+    const normalized = { kind, backend, url, kdf };
+    if (selection.secret !== undefined && selection.secret !== null && selection.secret !== "") {
+      normalized.secret = text(selection.secret, "decryption secret");
+    }
+    return normalized;
+  }
+
   const mode = selection.mode;
   if (kind !== "file" && kind !== "directory") throw new Error("Invalid shared item kind.");
   if (!BACKENDS.has(backend) || (mode !== "preview" && mode !== "raw")) {
     throw new Error("Invalid shared link selection.");
   }
-  const url = safeHttpUrl(selection.url);
-  if (!url) throw new Error("Invalid shared target URL.");
   const normalized = {
     kind,
     name: text(selection.name, "name"),
@@ -51,14 +69,45 @@ export function normalizeSelection(selection) {
 
 export function encodeShare(selection) {
   const normalized = normalizeSelection(selection);
+  if (normalized.kind === "encrypted") {
+    const params = new URLSearchParams({
+      kind: normalized.kind,
+      backend: normalized.backend,
+      url: normalized.url,
+      kdf: normalized.kdf,
+    });
+    if (normalized.secret) {
+      params.set(normalized.kdf === "passphrase" ? "p" : "k", normalized.secret);
+    }
+    return SHARE_PREFIX + params;
+  }
   return SHARE_PREFIX + new URLSearchParams(normalized);
 }
 
 export function decodeShare(hash) {
   if (!hash.startsWith(SHARE_PREFIX)) throw new Error("This link does not contain a shared item.");
   const parameters = new URLSearchParams(hash.slice(SHARE_PREFIX.length));
+  const kind = parameters.get("kind");
+  if (kind === "encrypted") {
+    const kdf = parameters.get("kdf");
+    const k = parameters.get("k");
+    const p = parameters.get("p");
+    if (k !== null && p !== null) {
+      throw new Error("Encrypted share link cannot contain both key and passphrase.");
+    }
+    if ((k !== null && kdf !== "raw") || (p !== null && kdf !== "passphrase")) {
+      throw new Error("Encrypted share link key does not match its key mode.");
+    }
+    return normalizeSelection({
+      kind,
+      backend: parameters.get("backend"),
+      url: parameters.get("url"),
+      kdf,
+      secret: kdf === "passphrase" ? p : k,
+    });
+  }
   return normalizeSelection({
-    kind: parameters.get("kind"),
+    kind,
     name: parameters.get("name"),
     backend: parameters.get("backend"),
     mode: parameters.get("mode"),

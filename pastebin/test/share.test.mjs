@@ -98,3 +98,51 @@ test("byte formatting covers exact and fractional binary units", () => {
   assert.equal(formatBytes(1024), "1.00 KiB");
   assert.equal(formatBytes(16 * 1024 * 1024), "16.0 MiB");
 });
+
+test("encrypted shares round-trip key-in-URL and manual-key modes without leaking filenames", () => {
+  const withKey = {
+    kind: "encrypted",
+    backend: "ipfs",
+    url: "https://apac.orbitor.dev/ipfs/bafyencrypted",
+    kdf: "raw",
+    secret: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+  };
+  const encodedKey = encodeShare(withKey);
+  assert.match(encodedKey, /^#share\?/);
+  assert.equal(encodedKey.includes("k=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"), true);
+  assert.equal(encodedKey.includes("name="), false);
+  assert.deepEqual(decodeShare(encodedKey), withKey);
+
+  const manualPassphrase = {
+    kind: "encrypted",
+    backend: "s3",
+    url: "https://s3.example.com/pastebin/pastebin/id/encrypted.bin",
+    kdf: "passphrase",
+  };
+  const encodedManual = encodeShare(manualPassphrase);
+  assert.equal(encodedManual.includes("p="), false);
+  assert.equal(encodedManual.includes("k="), false);
+  assert.deepEqual(decodeShare(encodedManual), manualPassphrase);
+
+  const withPassphrase = { ...manualPassphrase, secret: "my passphrase & 密码" };
+  const encodedPassphrase = encodeShare(withPassphrase);
+  assert.equal(encodedPassphrase.includes("p="), true);
+  assert.deepEqual(decodeShare(encodedPassphrase), withPassphrase);
+});
+
+test("encrypted share validation rejects mismatched secrets and unsupported backends", () => {
+  assert.throws(() => normalizeSelection({
+    kind: "encrypted",
+    backend: "inbrowser",
+    url: "https://inbrowser.link/ipfs/bafyencrypted",
+    kdf: "raw",
+  }), /backend/);
+  assert.throws(() => normalizeSelection({
+    kind: "encrypted",
+    backend: "ipfs",
+    url: "https://apac.orbitor.dev/ipfs/bafyencrypted",
+    kdf: "scrypt",
+  }), /key mode/);
+  assert.throws(() => decodeShare("#share?kind=encrypted&backend=ipfs&url=https%3A%2F%2Fapac.orbitor.dev%2Fipfs%2Fbafy&kdf=raw&p=secret"), /does not match/);
+  assert.throws(() => decodeShare("#share?kind=encrypted&backend=ipfs&url=https%3A%2F%2Fapac.orbitor.dev%2Fipfs%2Fbafy&kdf=raw&k=abc&p=def"), /both key and passphrase/);
+});

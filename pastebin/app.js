@@ -1,4 +1,5 @@
 import { deploymentDefaults } from "./config.js";
+import { decryptEnvelope, encryptEnvelope, estimateEncryptedSize } from "./crypto.js";
 import { publish } from "./publish.mjs";
 import { persistSettings, readSettings, validateSettings } from "./settings.js";
 import {
@@ -13,6 +14,18 @@ import {
 
 const $ = (id) => document.getElementById(id);
 const utf8Encoder = new TextEncoder();
+const utf8FatalDecoder = new TextDecoder("utf-8", { fatal: true });
+const MAX_TEXT_PREVIEW_BYTES = 2 * 1024 * 1024;
+const SAFE_IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
+const TEXT_MIME_TYPES = new Set([
+  "application/json",
+  "application/xml",
+  "application/javascript",
+  "application/ecmascript",
+  "application/x-yaml",
+  "application/yaml",
+  "application/toml",
+]);
 
 const publishSection = $("publish");
 const publishForm = $("publish-form");
@@ -26,6 +39,8 @@ const credentialsDetails = $("credentials-details");
 const authBadge = $("auth-badge");
 const fileDropzone = $("file-dropzone");
 const fileInput = $("file-content");
+const encryptToggle = $("encrypt-toggle");
+const encryptBadge = $("encrypt-badge");
 
 let settings;
 let currentResult;
@@ -34,11 +49,59 @@ let activeShareButton;
 let activeSharedSelection;
 let droppedFile = null;
 let nameAuto = true;
+let cachedCiphertext = null;
+let decryptedItem = null;
+let decryptRunId = 0;
 
 function setStatus(element, message, state = "") {
   element.textContent = message;
   if (state) element.dataset.state = state;
   else delete element.dataset.state;
+}
+
+function setSecretVisibility(input, button, visible) {
+  input.type = visible ? "text" : "password";
+  button.textContent = visible ? "Hide" : "Show";
+  button.setAttribute("aria-pressed", visible ? "true" : "false");
+}
+
+function bindSecretVisibility(input, button) {
+  button.addEventListener("click", () => {
+    setSecretVisibility(input, button, input.type === "password");
+  });
+}
+
+bindSecretVisibility($("encrypt-passphrase"), $("toggle-encrypt-passphrase"));
+bindSecretVisibility($("result-secret"), $("toggle-result-secret"));
+bindSecretVisibility($("decrypt-secret"), $("toggle-decrypt-secret"));
+
+function isEncryptionEnabled() {
+  return publishForm.elements.mode.value !== "directory" && encryptToggle.checked;
+}
+
+function selectedKdf() {
+  return publishForm.elements.keySource.value === "passphrase" ? "passphrase" : "raw";
+}
+
+function updateEncryptionUi() {
+  const isZip = publishForm.elements.mode.value === "directory";
+  encryptToggle.disabled = isZip;
+  const enabled = !isZip && encryptToggle.checked;
+  $("public-warning").hidden = enabled;
+  $("encrypt-zip-note").hidden = !isZip;
+  $("encryption-options").hidden = !enabled;
+  $("passphrase-field").hidden = !enabled || selectedKdf() !== "passphrase";
+  if (isZip) {
+    encryptBadge.textContent = "Unavailable for ZIP";
+    delete encryptBadge.dataset.state;
+  } else if (enabled) {
+    encryptBadge.textContent = "Encrypted";
+    encryptBadge.dataset.state = "signed";
+  } else {
+    encryptBadge.textContent = "Plaintext";
+    delete encryptBadge.dataset.state;
+  }
+  updateSizeMeter();
 }
 
 function clearCredentials() {
@@ -166,15 +229,29 @@ function updateSizeMeter() {
   if (!settings) return;
   const mode = publishForm.elements.mode.value;
   let bytes = 0;
+  let type = "application/octet-stream";
+  let kind = "file";
   if (mode === "text") {
     bytes = utf8Encoder.encode($("text-content").value).byteLength;
+    type = "text/plain;charset=utf-8";
+    kind = "text";
   } else {
-    bytes = currentFile()?.size ?? 0;
+    const file = currentFile();
+    bytes = file?.size ?? 0;
+    type = file?.type || "application/octet-stream";
   }
-  const over = bytes > settings.maxUploadBytes;
+  const uploadBytes = isEncryptionEnabled()
+    ? estimateEncryptedSize(bytes, {
+        name: $("content-name").value.trim() || "paste.txt",
+        type,
+        kind,
+        kdf: selectedKdf(),
+      })
+    : bytes;
+  const over = uploadBytes > settings.maxUploadBytes;
   setStatus(
     $("size-meter"),
-    `${formatBytes(bytes)} / ${formatBytes(settings.maxUploadBytes)}`,
+    `${formatBytes(uploadBytes)} / ${formatBytes(settings.maxUploadBytes)}`,
     over ? "error" : "",
   );
 }
@@ -208,15 +285,26 @@ function updateMode() {
     credentialsDetails.open = true;
   }
   updateAuthBadge();
-  updateSizeMeter();
+  updateEncryptionUi();
 }
 
 for (const input of publishForm.elements.mode) {
   input.addEventListener("change", updateMode);
 }
 
+encryptToggle.addEventListener("change", updateEncryptionUi);
+for (const input of publishForm.elements.keySource) {
+  input.addEventListener("change", () => {
+    updateEncryptionUi();
+    if (selectedKdf() === "passphrase" && isEncryptionEnabled()) {
+      $("encrypt-passphrase").focus();
+    }
+  });
+}
+
 $("content-name").addEventListener("input", () => {
   nameAuto = false;
+  updateSizeMeter();
 });
 
 $("text-content").addEventListener("input", updateSizeMeter);
@@ -305,12 +393,45 @@ function credentials() {
   return value;
 }
 
+function buildEncryptedShareUrl(selection) {
+  const url = new URL(window.location.origin + window.location.pathname);
+  url.hash = encodeShare(selection);
+  return url.href;
+}
+
+function encryptedSelectionFor(result, backend, url) {
+  const selection = {
+    kind: "encrypted",
+    backend,
+    url,
+    kdf: result.encrypted.kdf,
+  };
+  if (result.encrypted.includeSecretInUrl) {
+    selection.secret = result.encrypted.secret;
+  }
+  return selection;
+}
+
 function showShare(selection, triggerButton = null) {
   if (activeShareButton) activeShareButton.setAttribute("aria-pressed", "false");
   activeShareButton = triggerButton;
   if (activeShareButton) activeShareButton.setAttribute("aria-pressed", "true");
 
   currentSelection = selection;
+  if (selection.kind === "encrypted") {
+    $("share-url").value = buildEncryptedShareUrl(selection);
+    $("share-selection-label").textContent = `${selection.backend} · ${selection.secret ? "encrypted (key in URL)" : "encrypted (manual key)"}`;
+    $("copy-share").disabled = false;
+    setStatus(
+      $("copy-status"),
+      selection.secret
+        ? "Encrypted share link ready (key stays in #fragment only, never sent to the server)."
+        : "Encrypted share link ready (key omitted from URL; send the key separately).",
+      "success",
+    );
+    return;
+  }
+
   const direct = selection.backend !== "s3" || (selection.kind === "file" && selection.mode === "preview");
   const url = new URL(window.location.origin + window.location.pathname);
   url.hash = direct ? "" : encodeShare(selection);
@@ -322,6 +443,29 @@ function showShare(selection, triggerButton = null) {
     direct ? "Direct link ready to copy." : "Share fragment ready; contains only this selected target.",
     "success",
   );
+}
+
+function addEncryptedShareAction(container, result, backend, url, label, { selectDefault = false } = {}) {
+  const wrapper = document.createElement("div");
+  wrapper.className = "link-actions";
+  const open = document.createElement("a");
+  open.dataset.encryptedBackend = backend;
+  open.dataset.encryptedTarget = url;
+  open.href = buildEncryptedShareUrl(encryptedSelectionFor(result, backend, url));
+  open.target = "_blank";
+  open.rel = "noopener noreferrer";
+  open.textContent = label;
+  const share = document.createElement("button");
+  share.type = "button";
+  share.className = "button secondary";
+  share.textContent = "Share";
+  share.setAttribute("aria-pressed", "false");
+  share.addEventListener("click", () => {
+    showShare(encryptedSelectionFor(result, backend, url), share);
+  });
+  wrapper.append(open, share);
+  container.append(wrapper);
+  if (selectDefault) showShare(encryptedSelectionFor(result, backend, url), share);
 }
 
 async function downloadObject(url, name, status) {
@@ -447,8 +591,16 @@ function renderResult(result) {
   currentSelection = undefined;
   activeShareButton = null;
   resultSection.hidden = false;
-  $("result-kind").textContent = result.kind === "directory" ? "ZIP directory" : "File";
-  $("result-name").textContent = result.name;
+  const isEncrypted = Boolean(result.encrypted);
+  const kindBadge = $("result-kind");
+  if (isEncrypted) {
+    kindBadge.textContent = "Encrypted";
+    kindBadge.dataset.state = "signed";
+  } else {
+    kindBadge.textContent = result.kind === "directory" ? "ZIP directory" : "File";
+    delete kindBadge.dataset.state;
+  }
+  $("result-name").textContent = isEncrypted ? result.encrypted.originalName : result.name;
   $("result-key").textContent = result.key;
   $("result-cid").textContent = result.cid;
   $("copy-cid").textContent = "Copy CID";
@@ -463,10 +615,56 @@ function renderResult(result) {
   $("check-public").disabled = false;
   $("gateway-label").textContent = settings.ipfsGateway;
 
+  const secretPanel = $("result-secret-panel");
+  if (isEncrypted) {
+    secretPanel.hidden = false;
+    const isPassphrase = result.encrypted.kdf === "passphrase";
+    $("result-secret-label").textContent = isPassphrase ? "Passphrase" : "Decryption key";
+    $("copy-secret").textContent = isPassphrase ? "Copy passphrase" : "Copy key";
+    $("result-secret").value = result.encrypted.secret;
+    setSecretVisibility($("result-secret"), $("toggle-result-secret"), false);
+    $("share-include-secret").checked = result.encrypted.includeSecretInUrl;
+    setStatus($("secret-status"), "");
+  } else {
+    secretPanel.hidden = true;
+    $("result-secret").value = "";
+    setStatus($("secret-status"), "");
+  }
+
   const inbrowserLinks = $("inbrowser-links");
   const gatewayLinks = $("gateway-links");
   inbrowserLinks.replaceChildren();
   gatewayLinks.replaceChildren();
+
+  if (isEncrypted) {
+    const gatewayFetchUrl = ipfsUrl(settings.ipfsGateway, result.cid);
+    addEncryptedShareAction(
+      gatewayLinks,
+      result,
+      "ipfs",
+      gatewayFetchUrl,
+      "Open decoder",
+      { selectDefault: true },
+    );
+    const gatewayRaw = ipfsUrl(settings.ipfsGateway, result.cid, { name: "encrypted.bin", download: true });
+    addLink(
+      gatewayLinks,
+      resultLinkOptions(result, "ipfs", "raw", gatewayRaw, "Download ciphertext (.bin)", "encrypted.bin"),
+    );
+    const inbrowserRaw = ipfsUrl(settings.inbrowserGateway, result.cid, { name: "encrypted.bin", download: true });
+    addLink(
+      inbrowserLinks,
+      resultLinkOptions(result, "inbrowser", "raw", inbrowserRaw, "Download ciphertext (.bin)", "encrypted.bin"),
+    );
+    const note = document.createElement("p");
+    note.className = "hint";
+    note.textContent = "inbrowser.link serves raw ciphertext only.";
+    inbrowserLinks.append(note);
+    renderEntries({ entries: [] });
+    renderFailures([]);
+    return;
+  }
+
   const directory = result.kind === "directory";
   const inbrowser = ipfsUrl(settings.inbrowserGateway, result.cid, { name: result.name, directory });
   addLink(inbrowserLinks, resultLinkOptions(result, "inbrowser", "preview", inbrowser, directory ? "Open directory" : "Open preview"));
@@ -488,22 +686,115 @@ function renderResult(result) {
   renderFailures(result.failures);
 }
 
+$("share-include-secret").addEventListener("change", () => {
+  if (!currentResult?.encrypted) return;
+  currentResult.encrypted.includeSecretInUrl = $("share-include-secret").checked;
+  for (const link of resultSection.querySelectorAll("a[data-encrypted-target]")) {
+    const backend = link.dataset.encryptedBackend;
+    const target = link.dataset.encryptedTarget;
+    link.href = buildEncryptedShareUrl(encryptedSelectionFor(currentResult, backend, target));
+  }
+  if (currentSelection?.kind === "encrypted") {
+    showShare(
+      encryptedSelectionFor(currentResult, currentSelection.backend, currentSelection.url),
+      activeShareButton,
+    );
+  }
+});
+
+$("copy-secret").addEventListener("click", async () => {
+  const secret = currentResult?.encrypted?.secret;
+  if (!secret) return;
+  const label = currentResult.encrypted.kdf === "passphrase" ? "Passphrase" : "Decryption key";
+  try {
+    await navigator.clipboard.writeText(secret);
+    setStatus($("secret-status"), `${label} copied to clipboard.`, "success");
+  } catch {
+    setSecretVisibility($("result-secret"), $("toggle-result-secret"), true);
+    $("result-secret").focus();
+    $("result-secret").select();
+    setStatus($("secret-status"), "Clipboard access was denied; the secret is selected for manual copying.", "error");
+  }
+});
+
+function validatePlainName(name) {
+  if (!name || /^\.{1,2}$/.test(name) || /[\/\\\x00-\x1f\x7f\uD800-\uDFFF]/u.test(name)) {
+    throw new Error("Use a file name without path separators or control characters.");
+  }
+  return name;
+}
+
 publishForm.addEventListener("submit", async (event) => {
   event.preventDefault();
   publishButton.disabled = true;
   publishForm.setAttribute("aria-busy", "true");
   setStatus(publishStatus, "Publishing…");
   try {
+    const uiMode = publishForm.elements.mode.value;
     const body = selectedBody();
     const creds = credentials();
-    const result = await publish(
-      { ...body, name: $("content-name").value.trim(), credentials: creds },
-      settings,
-    );
+    const name = validatePlainName($("content-name").value.trim());
+
+    let result;
+    if (isEncryptionEnabled()) {
+      const kdf = selectedKdf();
+      const passphrase = $("encrypt-passphrase").value;
+      if (kdf === "passphrase" && !passphrase) {
+        $("encrypt-passphrase").focus();
+        throw new Error("Enter a passphrase to encrypt this item.");
+      }
+      const originalKind = uiMode === "text" ? "text" : "file";
+      const originalType = body.body.type || "application/octet-stream";
+      const estimated = estimateEncryptedSize(body.body.size, {
+        name,
+        type: originalType,
+        kind: originalKind,
+        kdf,
+      });
+      if (estimated > settings.maxUploadBytes) {
+        throw new Error("This encrypted upload exceeds the site size limit.");
+      }
+      setStatus(publishStatus, kdf === "passphrase" ? "Deriving key and encrypting…" : "Encrypting…");
+      const plainBytes = await body.body.arrayBuffer();
+      const encrypted = await encryptEnvelope(plainBytes, {
+        name,
+        type: originalType,
+        kind: originalKind,
+        kdf,
+        passphrase,
+      });
+      setStatus(publishStatus, "Publishing encrypted payload…");
+      result = await publish(
+        {
+          mode: "file",
+          body: new Blob([encrypted.payload], { type: "application/octet-stream" }),
+          name: "encrypted.bin",
+          credentials: creds,
+        },
+        settings,
+      );
+      result.encrypted = {
+        kdf: encrypted.kdf,
+        secret: encrypted.secret,
+        includeSecretInUrl: publishForm.elements.keyDelivery.value === "url",
+        originalName: name,
+        originalType,
+        originalKind,
+        originalSize: plainBytes.byteLength,
+      };
+    } else {
+      result = await publish(
+        { ...body, name, credentials: creds },
+        settings,
+      );
+    }
+
     renderResult(result);
     setStatus(
       publishStatus,
-      creds ? "Published with signed credentials." : "Published anonymously.",
+      result.encrypted
+        ? (creds ? "Encrypted and published with signed credentials." : "Encrypted and published anonymously.")
+        : (creds ? "Published with signed credentials." : "Published anonymously."),
       "success",
     );
     resultSection.scrollIntoView({ behavior: "smooth", block: "nearest" });
@@ -586,6 +877,14 @@ async function listPublicDirectory(listUrl, singlePage = false) {
 
 function addPublicS3Links(result) {
   const container = $("s3-links");
+  if (result.encrypted) {
+    addEncryptedShareAction(container, result, "s3", result.url, "Open decoder");
+    addLink(
+      container,
+      resultLinkOptions(result, "s3", "raw", result.url, "Download ciphertext (.bin)", "encrypted.bin"),
+    );
+    return;
+  }
   if (result.kind === "file") {
     addLink(container, resultLinkOptions(result, "s3", "preview", result.url, "Preview object"));
   }
@@ -722,8 +1021,179 @@ $("shared-list").addEventListener("click", async () => {
   }
 });
 
+function clearDecryptedState() {
+  if (decryptedItem?.imageUrl) {
+    URL.revokeObjectURL(decryptedItem.imageUrl);
+  }
+  decryptedItem = null;
+  $("decrypted-output").hidden = true;
+  $("decrypted-meta").textContent = "";
+  $("decrypted-text").hidden = true;
+  $("decrypted-text").textContent = "";
+  $("decrypted-copy").hidden = true;
+  $("decrypted-image-wrap").hidden = true;
+  $("decrypted-image").removeAttribute("src");
+  $("decrypted-binary-note").hidden = true;
+  $("decrypted-binary-note").textContent = "";
+}
+
+function isPreviewableTextType(type) {
+  const normalized = (type || "").split(";")[0].trim().toLowerCase();
+  return normalized.startsWith("text/") || TEXT_MIME_TYPES.has(normalized);
+}
+
+function renderDecryptedItem(plain) {
+  clearDecryptedState();
+  const mime = (plain.type || "application/octet-stream").split(";")[0].trim().toLowerCase();
+  const state = {
+    bytes: plain.bytes,
+    name: plain.name,
+    type: plain.type,
+    kind: plain.kind,
+    text: null,
+    imageUrl: null,
+  };
+
+  $("shared-title").textContent = plain.name;
+  $("decrypted-meta").textContent = `${plain.name} · ${plain.type} · ${formatBytes(plain.bytes.byteLength)}`;
+
+  let previewRendered = false;
+  if ((plain.kind === "text" || isPreviewableTextType(plain.type)) && plain.bytes.byteLength <= MAX_TEXT_PREVIEW_BYTES) {
+    try {
+      const decodedText = utf8FatalDecoder.decode(plain.bytes);
+      state.text = decodedText;
+      $("decrypted-text").textContent = decodedText;
+      $("decrypted-text").hidden = false;
+      $("decrypted-copy").hidden = false;
+      previewRendered = true;
+    } catch {
+      // Fall through to binary download if declared text is not valid UTF-8.
+    }
+  } else if (SAFE_IMAGE_TYPES.has(mime)) {
+    const imageUrl = URL.createObjectURL(new Blob([plain.bytes], { type: mime }));
+    state.imageUrl = imageUrl;
+    $("decrypted-image").src = imageUrl;
+    $("decrypted-image-wrap").hidden = false;
+    previewRendered = true;
+  }
+
+  if (!previewRendered) {
+    $("decrypted-binary-note").textContent =
+      "Inline preview is disabled for this file type or size. Use Download to save the decrypted file.";
+    $("decrypted-binary-note").hidden = false;
+  }
+
+  decryptedItem = state;
+  $("decrypted-output").hidden = false;
+}
+
+async function fetchEncryptedPayload(selection) {
+  if (cachedCiphertext?.url === selection.url) {
+    return cachedCiphertext.bytes;
+  }
+  const options = {
+    credentials: "omit",
+    cache: "no-store",
+    referrerPolicy: "no-referrer",
+    redirect: selection.backend === "s3" ? "error" : "follow",
+  };
+  if (selection.backend === "s3") {
+    options.headers = { "X-IPFS3-Download-Gateway": "proxy" };
+  }
+  let response;
+  try {
+    response = await fetch(selection.url, options);
+  } catch {
+    throw new Error("Could not fetch the encrypted payload. Check gateway availability or CORS settings.");
+  }
+  if (!response.ok) {
+    throw new Error(`Fetching encrypted payload returned HTTP ${response.status}.`);
+  }
+  const bytes = new Uint8Array(await response.arrayBuffer());
+  cachedCiphertext = { url: selection.url, bytes };
+  return bytes;
+}
+
+async function decryptActiveSelection() {
+  const selection = activeSharedSelection;
+  if (!selection || selection.kind !== "encrypted") return;
+  const secret = $("decrypt-secret").value;
+  if (!secret) {
+    setStatus(
+      $("shared-status"),
+      selection.kdf === "passphrase"
+        ? "Enter the passphrase to decrypt this item."
+        : "Enter the decryption key to decrypt this item.",
+      "error",
+    );
+    $("decrypt-secret").focus();
+    return;
+  }
+
+  const runId = ++decryptRunId;
+  const button = $("decrypt-button");
+  button.disabled = true;
+  button.setAttribute("aria-busy", "true");
+  clearDecryptedState();
+  try {
+    if (cachedCiphertext?.url !== selection.url) {
+      setStatus($("shared-status"), "Fetching encrypted payload…");
+    }
+    const bytes = await fetchEncryptedPayload(selection);
+    if (runId !== decryptRunId) return;
+    setStatus(
+      $("shared-status"),
+      selection.kdf === "passphrase" ? "Deriving key and decrypting…" : "Decrypting…",
+    );
+    const plain = await decryptEnvelope(bytes, { secret });
+    if (runId !== decryptRunId) return;
+    renderDecryptedItem(plain);
+    setStatus($("shared-status"), "Decrypted locally in your browser.", "success");
+  } catch (error) {
+    if (runId !== decryptRunId) return;
+    setStatus($("shared-status"), error.message, "error");
+  } finally {
+    if (runId === decryptRunId) {
+      button.disabled = false;
+      button.removeAttribute("aria-busy");
+    }
+  }
+}
+
+$("decrypt-form").addEventListener("submit", (event) => {
+  event.preventDefault();
+  void decryptActiveSelection();
+});
+
+$("decrypted-download").addEventListener("click", () => {
+  if (!decryptedItem) return;
+  const objectUrl = URL.createObjectURL(
+    new Blob([decryptedItem.bytes], { type: "application/octet-stream" }),
+  );
+  const link = document.createElement("a");
+  link.href = objectUrl;
+  link.download = decryptedItem.name;
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
+});
+
+$("decrypted-copy").addEventListener("click", async () => {
+  if (decryptedItem?.text == null) return;
+  try {
+    await navigator.clipboard.writeText(decryptedItem.text);
+    setStatus($("shared-status"), "Decrypted text copied to clipboard.", "success");
+  } catch {
+    setStatus($("shared-status"), "Clipboard access was denied; copy text directly from the preview.", "error");
+  }
+});
+
 function showWorkbench() {
+  decryptRunId += 1;
   activeSharedSelection = null;
+  cachedCiphertext = null;
+  clearDecryptedState();
+  $("decrypt-form").hidden = true;
+  $("decrypt-secret").value = "";
   $("shared-selection").hidden = true;
   $("shared-entries").hidden = true;
   $("shared-entry-rows").replaceChildren();
@@ -738,23 +1208,59 @@ $("shared-exit").addEventListener("click", () => {
 });
 
 function renderSharedSelection(selection) {
+  decryptRunId += 1;
   activeSharedSelection = selection;
+  cachedCiphertext = null;
+  clearDecryptedState();
   workbench.hidden = true;
   resultSection.hidden = true;
   $("shared-selection").hidden = false;
   $("shared-entries").hidden = true;
   $("shared-entry-rows").replaceChildren();
   setStatus($("shared-status"), "");
+
+  const open = $("shared-open");
+  const download = $("shared-download");
+  const listButton = $("shared-list");
+  const decryptForm = $("decrypt-form");
+
+  if (selection.kind === "encrypted") {
+    const isPassphrase = selection.kdf === "passphrase";
+    $("shared-title").textContent = "Encrypted item";
+    $("shared-description").textContent = `Encrypted · ${selection.backend} · AES-256-GCM (${isPassphrase ? "passphrase" : "random key"})`;
+    $("shared-partial").hidden = true;
+    open.hidden = true;
+    download.hidden = true;
+    listButton.hidden = true;
+    decryptForm.hidden = false;
+    $("decrypt-secret-label").textContent = isPassphrase ? "Passphrase" : "Decryption key";
+    $("decrypt-secret").placeholder = isPassphrase ? "Enter passphrase" : "Enter decryption key";
+    $("decrypt-secret").value = selection.secret ?? "";
+    setSecretVisibility($("decrypt-secret"), $("toggle-decrypt-secret"), false);
+    if (selection.secret) {
+      void decryptActiveSelection();
+    } else {
+      setStatus(
+        $("shared-status"),
+        isPassphrase
+          ? "Enter the passphrase to decrypt this item."
+          : "Enter the decryption key to decrypt this item.",
+      );
+      $("decrypt-secret").focus();
+    }
+    return;
+  }
+
+  decryptForm.hidden = true;
+  $("decrypt-secret").value = "";
   $("shared-title").textContent = selection.name;
   $("shared-description").textContent = `${selection.kind === "directory" ? "ZIP directory" : "File"} · ${selection.backend} · ${selection.mode}`;
   $("shared-partial").hidden = selection.rootStatus !== "partial";
-  const open = $("shared-open");
-  const download = $("shared-download");
   const isDirectoryListing = selection.kind === "directory" && selection.backend === "s3" && selection.mode === "preview";
   const isS3Raw = selection.backend === "s3" && selection.mode === "raw";
   open.hidden = isDirectoryListing || isS3Raw;
   download.hidden = !isS3Raw;
-  $("shared-list").hidden = !isDirectoryListing;
+  listButton.hidden = !isDirectoryListing;
   if (!isS3Raw && !isDirectoryListing) {
     if (new URL(selection.url).origin === window.location.origin) {
       open.removeAttribute("href");

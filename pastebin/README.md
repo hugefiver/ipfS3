@@ -14,9 +14,32 @@ uv run --no-project python -m http.server 8000 --bind 127.0.0.1 --directory past
 ```
 
 Open `http://127.0.0.1:8000/`, configure the S3 endpoint, bucket and region, then
-enter publishing credentials. Text is uploaded as a `text/plain;charset=utf-8`
-Blob. File mode stores the original bytes; ZIP directory mode uses the signed
-`decompress-zip` extension and displays complete or partial extraction results.
+enter publishing credentials (or publish anonymously on a public-read-write bucket).
+Text is uploaded as a `text/plain;charset=utf-8` Blob. File mode stores the original
+bytes; ZIP directory mode uses the signed `decompress-zip` extension and displays
+complete or partial extraction results.
+
+## Client-side encryption (E2EE)
+
+Unencrypted publishing is selected by default and displays a warning banner because
+plaintext content may become permanently accessible on the public IPFS network.
+
+In Text or File mode, enable **Encrypt before upload** to encrypt the content and
+original filename locally with WebCrypto AES-256-GCM before uploading an opaque
+`encrypted.bin` payload:
+
+- **Key source**: generate a random 256-bit key (`base64url`) or derive a key from a
+  user passphrase with PBKDF2-SHA256 (600,000 iterations, random 16-byte salt).
+- **Key delivery**: include the key or passphrase in the share URL `#fragment`
+  (never sent to the server) for automatic decryption, or omit it from the URL so
+  recipients enter it manually on the Pastebin decode view.
+- **Decoding**: encrypted share links open inside Pastebin, fetch ciphertext from the
+  selected IPFS gateway or public S3 URL, and decrypt locally. Text previews render
+  as inert text (`textContent`), safe raster images (`png`/`jpeg`/`webp`/`gif`)
+  preview via Blob URLs, and all other files download directly.
+
+ZIP directory mode runs extraction on the gateway and cannot decrypt client-side
+ciphertext; use File mode to share an encrypted ZIP archive.
 
 Credentials exist only in the current page's fields. Only the endpoint, bucket,
 region, effective byte limit and public IPFS gateway are saved in local storage.

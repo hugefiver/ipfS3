@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="description" content="Static IPFS pastebin for ipfS3.">
   <meta name="referrer" content="no-referrer">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; connect-src https: http://localhost:* http://127.0.0.1:* http://[::1]:*; img-src 'self' https://img.shields.io; base-uri 'none'; form-action 'self'; object-src 'none'">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; connect-src https: http://localhost:* http://127.0.0.1:* http://[::1]:*; img-src 'self' blob: https://img.shields.io; base-uri 'none'; form-action 'self'; object-src 'none'">
   <title>ipfS3 Pastebin</title>
   <link rel="stylesheet" href="./styles.css">
   <script type="module" src="./app.js"></script>
@@ -41,7 +41,31 @@
         <button id="shared-download" class="button primary" type="button" hidden>Download raw</button>
         <button id="shared-list" class="button primary" type="button" hidden>List directory</button>
       </div>
+      <form id="decrypt-form" class="decrypt-form" hidden novalidate>
+        <div class="field">
+          <label id="decrypt-secret-label" for="decrypt-secret">Decryption key</label>
+          <div class="secret-input-row">
+            <input id="decrypt-secret" type="password" autocomplete="off" spellcheck="false" required>
+            <button id="toggle-decrypt-secret" class="button secondary" type="button" aria-pressed="false">Show</button>
+            <button id="decrypt-button" class="button primary" type="submit">Decrypt</button>
+          </div>
+        </div>
+      </form>
       <p id="shared-status" role="status" aria-live="polite"></p>
+      <div id="decrypted-output" class="decrypted-output" hidden>
+        <div class="decrypted-toolbar">
+          <span id="decrypted-meta" class="meta"></span>
+          <div class="decrypted-actions">
+            <button id="decrypted-copy" class="button secondary" type="button" hidden>Copy text</button>
+            <button id="decrypted-download" class="button primary" type="button">Download</button>
+          </div>
+        </div>
+        <pre id="decrypted-text" class="decrypted-preview" hidden></pre>
+        <div id="decrypted-image-wrap" class="decrypted-image-wrap" hidden>
+          <img id="decrypted-image" alt="Decrypted image preview">
+        </div>
+        <p id="decrypted-binary-note" class="hint" hidden></p>
+      </div>
       <div id="shared-entries" class="table-wrap" hidden>
         <table><thead><tr><th scope="col">Name</th><th scope="col">Size</th><th scope="col">Public S3</th></tr></thead><tbody id="shared-entry-rows"></tbody></table>
       </div>
@@ -57,6 +81,10 @@
               <label><input type="radio" name="mode" value="directory"><span>ZIP</span></label>
             </fieldset>
             <span id="size-meter" class="meta" role="status" aria-live="polite"></span>
+          </div>
+
+          <div id="public-warning" class="notice warning" role="note">
+            Unencrypted content is stored as plaintext and will be publicly accessible on the IPFS network.
           </div>
 
           <div class="field name-field">
@@ -76,6 +104,42 @@
               <p id="file-selected" class="dropzone-meta">Drop a file here or browse.</p>
             </div>
           </div>
+
+          <section class="encryption-section" aria-label="Client-side encryption">
+            <div class="encryption-header">
+              <label class="checkbox-label">
+                <input id="encrypt-toggle" type="checkbox">
+                <span>Encrypt before upload</span>
+              </label>
+              <span id="encrypt-badge" class="badge">Plaintext</span>
+            </div>
+            <p id="encrypt-zip-note" class="hint" hidden>ZIP extraction runs on the gateway and cannot decrypt client-side ciphertext. Use File mode to share an encrypted ZIP.</p>
+            <div id="encryption-options" class="encryption-options" hidden>
+              <div class="encryption-row">
+                <span class="option-label">Key source</span>
+                <fieldset class="mode-picker" aria-label="Key source">
+                  <label><input type="radio" name="keySource" value="random" checked><span>Random key</span></label>
+                  <label><input type="radio" name="keySource" value="passphrase"><span>Passphrase</span></label>
+                </fieldset>
+              </div>
+              <div id="passphrase-field" class="field" hidden>
+                <label for="encrypt-passphrase">Passphrase</label>
+                <div class="secret-input-row">
+                  <input id="encrypt-passphrase" type="password" autocomplete="new-password" spellcheck="false" placeholder="Enter passphrase to derive AES-256 key">
+                  <button id="toggle-encrypt-passphrase" class="button secondary" type="button" aria-pressed="false">Show</button>
+                </div>
+                <p class="hint">Derived locally with PBKDF2-SHA256. Never sent to the server.</p>
+              </div>
+              <div class="encryption-row">
+                <span class="option-label">Key delivery</span>
+                <fieldset class="mode-picker" aria-label="Key delivery">
+                  <label><input type="radio" name="keyDelivery" value="url" checked><span>Include in URL (#fragment)</span></label>
+                  <label><input type="radio" name="keyDelivery" value="manual"><span>Enter on page</span></label>
+                </fieldset>
+              </div>
+              <p class="hint">Zero-knowledge AES-256-GCM: content and filename are encrypted in your browser before upload.</p>
+            </div>
+          </section>
 
           <details id="credentials-details" class="credentials">
             <summary>
@@ -150,6 +214,21 @@
           </dd>
         </div>
       </dl>
+      <div id="result-secret-panel" class="secret-panel" hidden>
+        <div class="secret-panel-header">
+          <label id="result-secret-label" for="result-secret">Decryption key</label>
+          <label class="checkbox-label compact-checkbox">
+            <input id="share-include-secret" type="checkbox">
+            <span>Include key in share URL (#fragment)</span>
+          </label>
+        </div>
+        <div class="secret-input-row">
+          <input id="result-secret" type="password" readonly autocomplete="off" spellcheck="false">
+          <button id="toggle-result-secret" class="button secondary" type="button" aria-pressed="false">Show</button>
+          <button id="copy-secret" class="button secondary" type="button">Copy key</button>
+        </div>
+        <p id="secret-status" role="status" aria-live="polite"></p>
+      </div>
       <div class="share-field">
         <label for="share-url">Share link <span id="share-selection-label" class="optional"></span></label>
         <div>
