@@ -71,6 +71,8 @@ function fillSettings() {
   $("max-upload").value = settings.maxUploadBytes;
   $("max-upload").max = deploymentDefaults.maxUploadBytes;
   $("ipfs-gateway").value = settings.ipfsGateway;
+  const host = new URL(settings.endpoint).host;
+  $("instance-summary").textContent = `${host} / ${settings.bucket}`;
   const custom = !isDefaultSettings(settings);
   const badge = $("instance-badge");
   badge.textContent = custom ? "Custom" : "Default";
@@ -96,7 +98,7 @@ function saveSettings(next) {
   if (valid.endpoint !== settings.endpoint) clearCredentials();
   settings = valid;
   fillSettings();
-  setStatus(settingsStatus, "Instance saved. Credentials are never persisted.", "success");
+  setStatus(settingsStatus, "Saved.", "success");
   if (currentResult) renderResult(currentResult);
 }
 
@@ -124,7 +126,7 @@ $("reset-settings").addEventListener("click", () => {
   try {
     clearCredentials();
     saveSettings(deploymentDefaults);
-    setStatus(settingsStatus, "Deployment defaults restored; credentials cleared.", "success");
+    setStatus(settingsStatus, "Defaults restored.", "success");
   } catch (error) {
     setStatus(settingsStatus, error.message, "error");
   }
@@ -197,12 +199,6 @@ function updateMode() {
   $("text-panel").hidden = !isText;
   $("file-panel").hidden = isText;
   fileInput.accept = selected === "directory" ? ".zip,application/zip" : "";
-  $("name-hint").textContent = selected === "directory"
-    ? "ZIP uploads preserve safe entry names under a unique prefix."
-    : "Stored under a unique random key prefix.";
-  $("file-hint").textContent = selected === "directory"
-    ? "The ZIP is extracted on the server (requires S3 credentials). Partial results list failed entries."
-    : "The selected file stays local until you publish.";
   if (isText && nameAuto) {
     $("content-name").value = "paste.txt";
   } else if (!isText && currentFile() && nameAuto) {
