@@ -11,6 +11,10 @@ env:
   REGISTRY: ghcr.io
   IMAGE_PREFIX: ${{ github.repository }}
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+
 jobs:
   build-gateway:
     runs-on: ubuntu-latest
@@ -42,6 +46,10 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=sha,prefix=sha-
 
+      - name: Set cache ref
+        id: cache
+        run: echo "ref=${REGISTRY}/$(printf '%s' "${IMAGE_PREFIX}" | tr '[:upper:]' '[:lower:]'):buildcache" >> "$GITHUB_OUTPUT"
+
       - name: Build and push gateway image
         uses: docker/build-push-action@v7
         with:
@@ -50,8 +58,8 @@ jobs:
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=registry,ref=${{ steps.cache.outputs.ref }}
+          cache-to: ${{ github.event_name != 'pull_request' && format('type=registry,ref={0},mode=max,image-manifest=true,oci-mediatypes=true,compression=zstd,ignore-error=true', steps.cache.outputs.ref) || '' }}
 
   build-kubo:
     runs-on: ubuntu-latest
@@ -91,5 +99,3 @@ jobs:
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max

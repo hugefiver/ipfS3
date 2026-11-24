@@ -1,5 +1,6 @@
-FROM rust:latest AS chef
-RUN cargo install cargo-chef --locked
+FROM rust:1.92-trixie AS chef
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    cargo install cargo-chef --locked
 WORKDIR /app
 
 FROM chef AS planner
@@ -14,19 +15,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-RUN cargo install sccache --locked
-ENV RUSTC_WRAPPER=sccache
-ENV SCCACHE_DIR=/sccache
-
 COPY --from=planner /app/recipe.json recipe.json
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
-    --mount=type=cache,target=/sccache,sharing=locked \
     cargo chef cook --release --recipe-path recipe.json
 
 COPY src/ src/
 COPY Cargo.toml Cargo.lock ./
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
-    --mount=type=cache,target=/sccache,sharing=locked \
     cargo build --release --bin ipfs-s3-gateway
 
 FROM debian:trixie-slim
