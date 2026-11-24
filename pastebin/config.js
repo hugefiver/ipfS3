@@ -4,6 +4,6 @@ export const deploymentDefaults = Object.freeze({
   bucket: "pastebin",
   region: "us-east-1",
   maxUploadBytes: 16 * 1024 * 1024,
-  ipfsGateway: "https://ipfs.io/ipfs/",
+  ipfsGateway: "https://apac.orbitor.dev/ipfs/",
   inbrowserGateway: "https://inbrowser.link/ipfs/",
 });
