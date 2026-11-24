@@ -12,6 +12,9 @@ import {
 } from "./share.js";
 
 const $ = (id) => document.getElementById(id);
+const utf8Encoder = new TextEncoder();
+
+const publishSection = $("publish");
 const publishForm = $("publish-form");
 const publishButton = $("publish-button");
 const publishStatus = $("publish-status");
@@ -19,9 +22,18 @@ const settingsForm = $("settings-form");
 const settingsStatus = $("settings-status");
 const resultSection = $("result");
 const workbench = document.querySelector(".workbench");
+const credentialsDetails = $("credentials-details");
+const authBadge = $("auth-badge");
+const fileDropzone = $("file-dropzone");
+const fileInput = $("file-content");
+
 let settings;
 let currentResult;
 let currentSelection;
+let activeShareButton;
+let activeSharedSelection;
+let droppedFile = null;
+let nameAuto = true;
 
 function setStatus(element, message, state = "") {
   element.textContent = message;
@@ -33,6 +45,23 @@ function clearCredentials() {
   $("access-key").value = "";
   $("secret-key").value = "";
   $("session-token").value = "";
+  updateAuthBadge();
+}
+
+function isDefaultSettings(current) {
+  return (
+    current.endpoint === deploymentDefaults.endpoint &&
+    current.bucket === deploymentDefaults.bucket &&
+    current.region === deploymentDefaults.region &&
+    current.maxUploadBytes === deploymentDefaults.maxUploadBytes &&
+    current.ipfsGateway === deploymentDefaults.ipfsGateway
+  );
+}
+
+function updateMaxUploadReadable() {
+  const value = Number($("max-upload").value);
+  $("max-upload-readable").textContent =
+    Number.isSafeInteger(value) && value > 0 ? `(${formatBytes(value)})` : "";
 }
 
 function fillSettings() {
@@ -42,7 +71,13 @@ function fillSettings() {
   $("max-upload").value = settings.maxUploadBytes;
   $("max-upload").max = deploymentDefaults.maxUploadBytes;
   $("ipfs-gateway").value = settings.ipfsGateway;
-  $("limit-label").textContent = `Up to ${formatBytes(settings.maxUploadBytes)}`;
+  const custom = !isDefaultSettings(settings);
+  const badge = $("instance-badge");
+  badge.textContent = custom ? "Custom" : "Default";
+  if (custom) badge.dataset.state = "custom";
+  else delete badge.dataset.state;
+  updateMaxUploadReadable();
+  updateSizeMeter();
 }
 
 function readSettingsForm() {
@@ -61,7 +96,7 @@ function saveSettings(next) {
   if (valid.endpoint !== settings.endpoint) clearCredentials();
   settings = valid;
   fillSettings();
-  setStatus(settingsStatus, "Instance saved. Credentials were not persisted.", "success");
+  setStatus(settingsStatus, "Instance saved. Credentials are never persisted.", "success");
   if (currentResult) renderResult(currentResult);
 }
 
@@ -73,6 +108,8 @@ try {
   $("page-alert").textContent = `Saved settings were not loaded: ${error.message}`;
 }
 fillSettings();
+
+$("max-upload").addEventListener("input", updateMaxUploadReadable);
 
 settingsForm.addEventListener("submit", (event) => {
   event.preventDefault();
@@ -93,8 +130,65 @@ $("reset-settings").addEventListener("click", () => {
   }
 });
 
-for (const input of publishForm.elements.mode) {
-  input.addEventListener("change", updateMode);
+function currentFile() {
+  return droppedFile ?? fileInput.files[0] ?? null;
+}
+
+function updateAuthBadge() {
+  const mode = publishForm.elements.mode.value;
+  const ak = $("access-key").value;
+  const sk = $("secret-key").value;
+  const st = $("session-token").value;
+  const hasAny = Boolean(ak || sk || st);
+  const hasPair = Boolean(ak && sk);
+  if (hasPair) {
+    authBadge.textContent = "Signed";
+    authBadge.dataset.state = "signed";
+  } else if (hasAny) {
+    authBadge.textContent = "Incomplete";
+    authBadge.dataset.state = "required";
+  } else if (mode === "directory") {
+    authBadge.textContent = "Required for ZIP";
+    authBadge.dataset.state = "required";
+  } else {
+    authBadge.textContent = "Anonymous";
+    delete authBadge.dataset.state;
+  }
+}
+
+for (const id of ["access-key", "secret-key", "session-token"]) {
+  $(id).addEventListener("input", updateAuthBadge);
+}
+
+function updateSizeMeter() {
+  if (!settings) return;
+  const mode = publishForm.elements.mode.value;
+  let bytes = 0;
+  if (mode === "text") {
+    bytes = utf8Encoder.encode($("text-content").value).byteLength;
+  } else {
+    bytes = currentFile()?.size ?? 0;
+  }
+  const over = bytes > settings.maxUploadBytes;
+  setStatus(
+    $("size-meter"),
+    `${formatBytes(bytes)} / ${formatBytes(settings.maxUploadBytes)}`,
+    over ? "error" : "",
+  );
+}
+
+function setSelectedFile(file) {
+  droppedFile = file;
+  if (file) {
+    $("file-selected").textContent = `${file.name} (${formatBytes(file.size)})`;
+    if (nameAuto || !$("content-name").value.trim()) {
+      $("content-name").value = file.name;
+      nameAuto = true;
+    }
+  } else {
+    $("file-selected").textContent = "Drop a file here or click to browse.";
+  }
+  updateSizeMeter();
 }
 
 function updateMode() {
@@ -102,16 +196,97 @@ function updateMode() {
   const isText = selected === "text";
   $("text-panel").hidden = !isText;
   $("file-panel").hidden = isText;
-  $("file-content").accept = selected === "directory" ? ".zip,application/zip" : "";
+  fileInput.accept = selected === "directory" ? ".zip,application/zip" : "";
+  $("name-hint").textContent = selected === "directory"
+    ? "ZIP uploads preserve safe entry names under a unique prefix."
+    : "Stored under a unique random key prefix.";
   $("file-hint").textContent = selected === "directory"
-    ? "The ZIP is extracted on the server. Partial results identify every failed entry."
+    ? "The ZIP is extracted on the server (requires S3 credentials). Partial results list failed entries."
     : "The selected file stays local until you publish.";
+  if (isText && nameAuto) {
+    $("content-name").value = "paste.txt";
+  } else if (!isText && currentFile() && nameAuto) {
+    $("content-name").value = currentFile().name;
+  }
+  if (selected === "directory" && !($("access-key").value && $("secret-key").value)) {
+    credentialsDetails.open = true;
+  }
+  updateAuthBadge();
+  updateSizeMeter();
 }
 
-$("file-content").addEventListener("change", () => {
-  const file = $("file-content").files[0];
-  if (file) $("content-name").value = file.name;
+for (const input of publishForm.elements.mode) {
+  input.addEventListener("change", updateMode);
+}
+
+$("content-name").addEventListener("input", () => {
+  nameAuto = false;
 });
+
+$("text-content").addEventListener("input", updateSizeMeter);
+$("text-content").addEventListener("keydown", (event) => {
+  if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
+    event.preventDefault();
+    publishForm.requestSubmit();
+  }
+});
+
+fileInput.addEventListener("change", () => {
+  const file = fileInput.files[0] ?? null;
+  droppedFile = null;
+  if (file) {
+    $("file-selected").textContent = `${file.name} (${formatBytes(file.size)})`;
+    if (nameAuto || !$("content-name").value.trim()) {
+      $("content-name").value = file.name;
+      nameAuto = true;
+    }
+  } else {
+    $("file-selected").textContent = "Drop a file here or click to browse.";
+  }
+  updateSizeMeter();
+});
+
+function setupDragDrop() {
+  let depth = 0;
+  const activeTarget = () => ($("file-panel").hidden ? publishSection : fileDropzone);
+  const clearHighlight = () => {
+    publishSection.classList.remove("drag-over");
+    fileDropzone.classList.remove("drag-over");
+  };
+  publishSection.addEventListener("dragenter", (event) => {
+    if (!event.dataTransfer?.types?.includes("Files")) return;
+    event.preventDefault();
+    depth += 1;
+    clearHighlight();
+    activeTarget().classList.add("drag-over");
+  });
+  publishSection.addEventListener("dragover", (event) => {
+    if (!event.dataTransfer?.types?.includes("Files")) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = "copy";
+  });
+  publishSection.addEventListener("dragleave", () => {
+    depth = Math.max(0, depth - 1);
+    if (depth === 0) clearHighlight();
+  });
+  publishSection.addEventListener("drop", (event) => {
+    event.preventDefault();
+    depth = 0;
+    clearHighlight();
+    const file = event.dataTransfer?.files?.[0];
+    if (!file) return;
+    if (publishForm.elements.mode.value === "text") {
+      publishForm.elements.mode.value = "file";
+    }
+    fileInput.value = "";
+    nameAuto = true;
+    setSelectedFile(file);
+    updateMode();
+  });
+}
+
+setupDragDrop();
+updateMode();
 
 function selectedBody() {
   const mode = publishForm.elements.mode.value;
@@ -119,22 +294,26 @@ function selectedBody() {
     const value = $("text-content").value;
     return { mode: "file", body: new Blob([value], { type: "text/plain;charset=utf-8" }) };
   }
-  const file = $("file-content").files[0];
+  const file = currentFile();
   if (!file) throw new Error(mode === "directory" ? "Choose a ZIP file." : "Choose a file.");
   return { mode, body: file };
 }
 
 function credentials() {
-  const value = {
-    accessKeyId: $("access-key").value,
-    secretAccessKey: $("secret-key").value,
-  };
+  const accessKeyId = $("access-key").value;
+  const secretAccessKey = $("secret-key").value;
   const sessionToken = $("session-token").value;
+  if (!accessKeyId && !secretAccessKey && !sessionToken) return undefined;
+  const value = { accessKeyId, secretAccessKey };
   if (sessionToken) value.sessionToken = sessionToken;
   return value;
 }
 
-function showShare(selection) {
+function showShare(selection, triggerButton = null) {
+  if (activeShareButton) activeShareButton.setAttribute("aria-pressed", "false");
+  activeShareButton = triggerButton;
+  if (activeShareButton) activeShareButton.setAttribute("aria-pressed", "true");
+
   currentSelection = selection;
   const direct = selection.backend !== "s3" || (selection.kind === "file" && selection.mode === "preview");
   const url = new URL(window.location.origin + window.location.pathname);
@@ -142,7 +321,11 @@ function showShare(selection) {
   $("share-url").value = direct ? selection.url : url.href;
   $("share-selection-label").textContent = `${selection.backend} · ${selection.mode}`;
   $("copy-share").disabled = false;
-  setStatus($("copy-status"), direct ? "Direct object link ready." : "Download/listing link ready; it contains only this selected target.", "success");
+  setStatus(
+    $("copy-status"),
+    direct ? "Direct link ready to copy." : "Share fragment ready; contains only this selected target.",
+    "success",
+  );
 }
 
 async function downloadObject(url, name, status) {
@@ -160,14 +343,14 @@ async function downloadObject(url, name, status) {
     download.href = objectUrl;
     download.download = name;
     download.click();
-    URL.revokeObjectURL(objectUrl);
-    setStatus(status, "Download ready.", "success");
+    setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
+    setStatus(status, "Download started.", "success");
   } catch (error) {
     setStatus(status, `Raw download failed: ${error.message}`, "error");
   }
 }
 
-function addLink(container, { url, label, name, backend, mode, kind, rootStatus }) {
+function addLink(container, { url, label, name, backend, mode, kind, rootStatus }, { selectDefault = false } = {}) {
   if (!(mode === "raw" && backend === "s3") && new URL(url).origin === window.location.origin) {
     const warning = document.createElement("p");
     warning.className = "hint";
@@ -202,9 +385,12 @@ function addLink(container, { url, label, name, backend, mode, kind, rootStatus 
   share.type = "button";
   share.className = "button secondary";
   share.textContent = "Share";
-  share.addEventListener("click", () => showShare({ kind, name, backend, mode, url, rootStatus }));
+  share.setAttribute("aria-pressed", "false");
+  const selection = { kind, name, backend, mode, url, rootStatus };
+  share.addEventListener("click", () => showShare(selection, share));
   wrapper.append(share, status);
   container.append(wrapper);
+  if (selectDefault) showShare(selection, share);
 }
 
 function resultLinkOptions(result, backend, mode, url, label, name = result.name) {
@@ -224,6 +410,10 @@ function renderFailures(failures) {
     rows.append(row);
   }
   $("failures-section").hidden = !failures?.length;
+}
+
+function directoryPrefixFor(key) {
+  return key.slice(0, key.lastIndexOf("/") + 1) + "files/";
 }
 
 function renderEntries(result) {
@@ -246,7 +436,7 @@ function renderEntries(result) {
     const s3Cell = document.createElement("td");
     const check = document.createElement("button");
     check.type = "button";
-    check.className = "button secondary";
+    check.className = "button secondary compact";
     check.textContent = "Check";
     check.addEventListener("click", () => checkPublicEntry(result, entry, s3Cell, check));
     s3Cell.append(check);
@@ -256,18 +446,16 @@ function renderEntries(result) {
   $("entries-section").hidden = !result.entries?.length;
 }
 
-function directoryPrefixFor(key) {
-  return key.slice(0, key.lastIndexOf("/") + 1) + "files/";
-}
-
 function renderResult(result) {
   currentResult = result;
   currentSelection = undefined;
+  activeShareButton = null;
   resultSection.hidden = false;
   $("result-kind").textContent = result.kind === "directory" ? "ZIP directory" : "File";
   $("result-name").textContent = result.name;
   $("result-key").textContent = result.key;
   $("result-cid").textContent = result.cid;
+  $("copy-cid").textContent = "Copy CID";
   $("partial-notice").hidden = result.rootStatus !== "partial";
   $("partial-notice").textContent = "This directory is partial. Failed entries are listed below; the root still contains only successful outputs.";
   $("share-url").value = "";
@@ -287,7 +475,11 @@ function renderResult(result) {
   const inbrowser = ipfsUrl(settings.inbrowserGateway, result.cid, { name: result.name, directory });
   addLink(inbrowserLinks, resultLinkOptions(result, "inbrowser", "preview", inbrowser, directory ? "Open directory" : "Open preview"));
   const preview = ipfsUrl(settings.ipfsGateway, result.cid, { name: result.name, directory });
-  addLink(gatewayLinks, resultLinkOptions(result, "ipfs", "preview", preview, directory ? "Preview directory" : "Preview file"));
+  addLink(
+    gatewayLinks,
+    resultLinkOptions(result, "ipfs", "preview", preview, directory ? "Preview directory" : "Preview file"),
+    { selectDefault: true },
+  );
   if (!directory || result.archiveCid) {
     const rawCid = directory ? result.archiveCid : result.cid;
     const label = directory ? "Download original ZIP" : "Download raw file";
@@ -307,14 +499,24 @@ publishForm.addEventListener("submit", async (event) => {
   setStatus(publishStatus, "Publishing…");
   try {
     const body = selectedBody();
+    const creds = credentials();
     const result = await publish(
-      { ...body, name: $("content-name").value, credentials: credentials() },
+      { ...body, name: $("content-name").value.trim(), credentials: creds },
       settings,
     );
     renderResult(result);
-    setStatus(publishStatus, "Published. Choose Share beside the exact link you want to send.", "success");
+    setStatus(
+      publishStatus,
+      creds ? "Published with signed credentials." : "Published anonymously.",
+      "success",
+    );
+    resultSection.scrollIntoView({ behavior: "smooth", block: "nearest" });
   } catch (error) {
     setStatus(publishStatus, error.message, "error");
+    if (/credentials|Access key/i.test(error.message)) {
+      credentialsDetails.open = true;
+      ($("access-key").value ? $("secret-key") : $("access-key")).focus();
+    }
   } finally {
     publishButton.disabled = false;
     publishForm.removeAttribute("aria-busy");
@@ -326,11 +528,26 @@ $("copy-share").addEventListener("click", async () => {
   const field = $("share-url");
   try {
     await navigator.clipboard.writeText(field.value);
-    setStatus($("copy-status"), "Share link copied.", "success");
+    setStatus($("copy-status"), "Share link copied to clipboard.", "success");
   } catch {
     field.focus();
     field.select();
     setStatus($("copy-status"), "Clipboard access was denied; the link is selected for manual copying.", "error");
+  }
+});
+
+$("copy-cid").addEventListener("click", async () => {
+  const cid = currentResult?.cid;
+  if (!cid) return;
+  const button = $("copy-cid");
+  try {
+    await navigator.clipboard.writeText(cid);
+    button.textContent = "Copied";
+    setTimeout(() => {
+      if (currentResult?.cid === cid) button.textContent = "Copy CID";
+    }, 1500);
+  } catch {
+    setStatus($("copy-status"), "Clipboard access was denied; copy the CID directly from the metadata field.", "error");
   }
 });
 
@@ -345,6 +562,9 @@ async function listPublicDirectory(listUrl, singlePage = false) {
       cache: "no-store",
       referrerPolicy: "no-referrer",
     });
+    if (response.status === 403) {
+      throw new Error("Directory listing is disabled or private (HTTP 403); use IPFS or inbrowser.link for directory preview.");
+    }
     if (!response.ok) throw new Error(`Anonymous ListObjectsV2 returned HTTP ${response.status}.`);
     const documentXml = new DOMParser().parseFromString(await response.text(), "application/xml");
     if (documentXml.querySelector("parsererror")) throw new Error("The S3 listing was not valid XML.");
@@ -373,7 +593,10 @@ function addPublicS3Links(result) {
   if (result.kind === "file") {
     addLink(container, resultLinkOptions(result, "s3", "preview", result.url, "Preview object"));
   }
-  addLink(container, resultLinkOptions(result, "s3", "raw", result.url, result.kind === "directory" ? "Download original ZIP" : "Download raw object"));
+  addLink(
+    container,
+    resultLinkOptions(result, "s3", "raw", result.url, result.kind === "directory" ? "Download original ZIP" : "Download raw object"),
+  );
 }
 
 async function checkPublicEntry(result, entry, cell, button) {
@@ -396,7 +619,12 @@ async function checkPublicAccess() {
   if (!result) return;
   $("check-public").disabled = true;
   $("s3-links").replaceChildren();
-  setStatus($("public-status"), "Checking the original object and directory listing…");
+  setStatus(
+    $("public-status"),
+    result.kind === "directory"
+      ? "Checking the original archive and directory listing…"
+      : "Checking anonymous object access…",
+  );
   try {
     const source = await probePublicUrl(result.url);
     if (currentResult !== result) return;
@@ -413,15 +641,23 @@ async function checkPublicAccess() {
         share.type = "button";
         share.className = "button secondary";
         share.textContent = "Share public directory listing";
-        share.addEventListener("click", () => showShare({ kind: "directory", name: result.name, backend: "s3", mode: "preview", url: listUrl, rootStatus: result.rootStatus }));
+        share.setAttribute("aria-pressed", "false");
+        share.addEventListener("click", () =>
+          showShare(
+            { kind: "directory", name: result.name, backend: "s3", mode: "preview", url: listUrl, rootStatus: result.rootStatus },
+            share,
+          ),
+        );
         $("s3-links").append(share);
       } catch (error) {
         listError = error.message;
       }
     }
     const message = [
-      `Original object: ${source.message}`,
-      result.kind === "directory" ? (listError ?? "Directory listing is anonymously readable. Check individual entries only when needed.") : "",
+      `Object: ${source.message}`,
+      result.kind === "directory"
+        ? (listError ?? "Directory listing is anonymously readable. Check individual entries only when needed.")
+        : "",
     ].filter(Boolean).join(" ");
     setStatus($("public-status"), message, source.state === "public" && !listError ? "public" : "unknown");
   } finally {
@@ -452,7 +688,7 @@ function renderSharedEntries(entries, listUrl) {
     }
     const raw = document.createElement("button");
     raw.type = "button";
-    raw.className = "button secondary";
+    raw.className = "button secondary compact";
     raw.textContent = "Raw";
     raw.addEventListener("click", async () => {
       await downloadObject(url, entry.key.slice(entry.key.lastIndexOf("/") + 1), $("shared-status"));
@@ -464,10 +700,55 @@ function renderSharedEntries(entries, listUrl) {
   $("shared-entries").hidden = false;
 }
 
+$("shared-download").addEventListener("click", async () => {
+  if (!activeSharedSelection) return;
+  const download = $("shared-download");
+  if (download.getAttribute("aria-busy") === "true") return;
+  download.setAttribute("aria-busy", "true");
+  setStatus($("shared-status"), "Fetching raw object…");
+  await downloadObject(activeSharedSelection.url, activeSharedSelection.name, $("shared-status"));
+  download.removeAttribute("aria-busy");
+});
+
+$("shared-list").addEventListener("click", async () => {
+  if (!activeSharedSelection) return;
+  const button = $("shared-list");
+  button.disabled = true;
+  setStatus($("shared-status"), "Listing public entries…");
+  try {
+    const entries = await listPublicDirectory(activeSharedSelection.url);
+    renderSharedEntries(entries, activeSharedSelection.url);
+    setStatus($("shared-status"), `${entries.length} public entries.`, "public");
+  } catch (error) {
+    setStatus($("shared-status"), error.message, "error");
+  } finally {
+    button.disabled = false;
+  }
+});
+
+function showWorkbench() {
+  activeSharedSelection = null;
+  $("shared-selection").hidden = true;
+  $("shared-entries").hidden = true;
+  $("shared-entry-rows").replaceChildren();
+  setStatus($("shared-status"), "");
+  workbench.hidden = false;
+  resultSection.hidden = !currentResult;
+}
+
+$("shared-exit").addEventListener("click", () => {
+  history.replaceState(null, "", window.location.pathname + window.location.search);
+  showWorkbench();
+});
+
 function renderSharedSelection(selection) {
+  activeSharedSelection = selection;
   workbench.hidden = true;
   resultSection.hidden = true;
   $("shared-selection").hidden = false;
+  $("shared-entries").hidden = true;
+  $("shared-entry-rows").replaceChildren();
+  setStatus($("shared-status"), "");
   $("shared-title").textContent = selection.name;
   $("shared-description").textContent = `${selection.kind === "directory" ? "ZIP directory" : "File"} · ${selection.backend} · ${selection.mode}`;
   $("shared-partial").hidden = selection.rootStatus !== "partial";
@@ -478,13 +759,7 @@ function renderSharedSelection(selection) {
   open.hidden = isDirectoryListing || isS3Raw;
   download.hidden = !isS3Raw;
   $("shared-list").hidden = !isDirectoryListing;
-  if (isS3Raw) {
-    download.addEventListener("click", async () => {
-      download.setAttribute("aria-busy", "true");
-      await downloadObject(selection.url, selection.name, $("shared-status"));
-      download.removeAttribute("aria-busy");
-    });
-  } else if (!isDirectoryListing) {
+  if (!isS3Raw && !isDirectoryListing) {
     if (new URL(selection.url).origin === window.location.origin) {
       open.removeAttribute("href");
       open.hidden = true;
@@ -494,27 +769,22 @@ function renderSharedSelection(selection) {
       open.textContent = selection.mode === "raw" ? "Download raw object" : "Open preview";
     }
   }
-  $("shared-list").addEventListener("click", async () => {
-    const button = $("shared-list");
-    button.disabled = true;
-    setStatus($("shared-status"), "Listing public entries…");
-    try {
-      const entries = await listPublicDirectory(selection.url);
-      renderSharedEntries(entries, selection.url);
-      setStatus($("shared-status"), `${entries.length} public entries.`, "public");
-    } catch (error) {
-      setStatus($("shared-status"), error.message, "error");
-    } finally {
-      button.disabled = false;
-    }
-  });
 }
 
-if (window.location.hash.startsWith("#share?")) {
-  try {
-    renderSharedSelection(decodeShare(window.location.hash));
-  } catch (error) {
-    $("page-alert").hidden = false;
-    $("page-alert").textContent = `The share link could not be opened: ${error.message}`;
+function syncViewFromHash() {
+  $("page-alert").hidden = true;
+  if (window.location.hash.startsWith("#share?")) {
+    try {
+      renderSharedSelection(decodeShare(window.location.hash));
+    } catch (error) {
+      showWorkbench();
+      $("page-alert").hidden = false;
+      $("page-alert").textContent = `The share link could not be opened: ${error.message}`;
+    }
+  } else {
+    showWorkbench();
   }
 }
+
+window.addEventListener("hashchange", syncViewFromHash);
+syncViewFromHash();

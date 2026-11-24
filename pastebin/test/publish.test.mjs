@@ -148,6 +148,36 @@ test('rejects oversize bodies and ambiguous endpoint or name inputs before readi
   for (const name of ['..', '../file', 'alt\\file', 'line\nbreak', '\uD800']) {
     await assert.rejects(publish({ ...file, body, name }, config), /file name/);
   }
+  for (const partial of [
+    { accessKeyId: 'only-key', secretAccessKey: '' },
+    { accessKeyId: '', secretAccessKey: 'only-secret' },
+    { accessKeyId: '', secretAccessKey: '', sessionToken: 'only-token' },
+  ]) {
+    await assert.rejects(publish({ ...file, body, credentials: partial }, config), /Access key ID and Secret access key/);
+  }
+  await assert.rejects(publish({ ...directory, body, credentials: undefined }, config), /ZIP directory publishing requires S3 credentials/);
+});
+
+test('supports anonymous unsigned file PUT and maps AccessDenied clearly', async t => {
+  let status = 200;
+  let body;
+  const { config, endpoint, requests } = await serve(t, () => ({
+    status,
+    headers: status === 200 ? { etag: `"${fileCid}"` } : { 'content-type': 'application/xml' },
+    body,
+  }));
+  const result = await publish({ ...file, credentials: undefined }, config);
+  const [request] = requests;
+  assert.equal(request.method, 'PUT');
+  assert.equal(request.headers.authorization, undefined);
+  assert.equal(request.headers['x-amz-date'], undefined);
+  assert.equal(request.headers['x-amz-content-sha256'], undefined);
+  assert.equal(request.bytes.toString(), '你好\n<hello>');
+  assert.deepEqual(result, { key: result.key, url: endpoint + request.url, cid: fileCid, name: file.name, kind: 'file' });
+
+  status = 403;
+  body = '<?xml version="1.0"?><Error><Code>AccessDenied</Code></Error>';
+  await assert.rejects(publish({ ...file, credentials: undefined }, config), /credentials may be required.*HTTP 403/);
 });
 
 const liveEndpoint = process.env.PASTEBIN_TEST_ENDPOINT;

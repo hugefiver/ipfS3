@@ -7,6 +7,7 @@ function readCid(value) {
 }
 
 const s3ErrorMessages = new Map([
+  ['AccessDenied', 'The bucket denied this upload; publishing credentials may be required'],
   ['QuotaExceeded', 'The S3 bucket is full'],
   ['EntityTooLarge', 'The upload exceeds the gateway size limit'],
   ['NoSuchBucket', 'The configured S3 bucket does not exist'],
@@ -14,6 +15,28 @@ const s3ErrorMessages = new Map([
   ['SignatureDoesNotMatch', 'The gateway could not verify the upload signature'],
   ['ExpiredToken', 'The S3 session has expired'],
 ]);
+
+function normalizeCredentials(credentials, mode) {
+  const accessKeyId = credentials?.accessKeyId ?? '';
+  const secretAccessKey = credentials?.secretAccessKey ?? '';
+  const sessionToken = credentials?.sessionToken ?? '';
+  const hasAny = Boolean(accessKeyId || secretAccessKey || sessionToken);
+  if (!hasAny) {
+    if (mode === 'directory') {
+      throw new Error('ZIP directory publishing requires S3 credentials.');
+    }
+    return null;
+  }
+  if (!accessKeyId || !secretAccessKey) {
+    throw new Error('Enter both Access key ID and Secret access key, or leave all credential fields empty for anonymous publishing.');
+  }
+  if (/[^!-~]|[/,]/.test(accessKeyId) || (sessionToken && /[^!-~]/.test(sessionToken))) {
+    throw new Error('Enter valid S3 credentials.');
+  }
+  return sessionToken
+    ? { accessKeyId, secretAccessKey, sessionToken }
+    : { accessKeyId, secretAccessKey };
+}
 
 async function uploadError(response) {
   const xml = await response.text().catch(() => '');
@@ -28,20 +51,17 @@ async function uploadError(response) {
 
 export async function publish({ mode, body, name, credentials }, config) {
   const { maxUploadBytes } = config;
-  if (globalThis.isSecureContext === false || !globalThis.crypto?.subtle) {
-    throw new Error('Publishing requires a secure browser context with WebCrypto.');
-  }
   if (mode !== 'file' && mode !== 'directory') throw new Error('Choose file or directory publishing.');
+  const signedCredentials = normalizeCredentials(credentials, mode);
+  if (signedCredentials && (globalThis.isSecureContext === false || !globalThis.crypto?.subtle)) {
+    throw new Error('Publishing with credentials requires a secure browser context with WebCrypto.');
+  }
   if (!Number.isSafeInteger(maxUploadBytes) || maxUploadBytes < 1) throw new Error('Set a valid upload size limit.');
   if (body.size > maxUploadBytes) throw new Error('This upload exceeds the site size limit.');
   if (!name || /^\.{1,2}$/.test(name) || /[\/\\\x00-\x1f\x7f\uD800-\uDFFF]/u.test(name)) {
     throw new Error('Use a file name without path separators or control characters.');
   }
   const { endpoint: origin, bucket, region } = instanceTarget(config);
-  if (!credentials?.accessKeyId || /[^!-~]|[/,]/.test(credentials.accessKeyId) ||
-      !credentials.secretAccessKey || (credentials.sessionToken && /[^!-~]/.test(credentials.sessionToken))) {
-    throw new Error('Enter valid S3 credentials.');
-  }
 
   const baseKey = `pastebin/${crypto.randomUUID()}/`;
   const key = `${baseKey}${name}`;
@@ -55,10 +75,19 @@ export async function publish({ mode, body, name, credentials }, config) {
   }
 
   const bytes = await body.arrayBuffer();
-  await signPut(uploadUrl, bytes, headers, region, credentials);
+  if (signedCredentials) {
+    await signPut(uploadUrl, bytes, headers, region, signedCredentials);
+  }
   let response;
   try {
-    response = await fetch(uploadUrl, { method: 'PUT', headers, body: bytes, redirect: 'error', credentials: 'omit' });
+    response = await fetch(uploadUrl, {
+      method: 'PUT',
+      headers,
+      body: bytes,
+      redirect: 'error',
+      credentials: 'omit',
+      referrerPolicy: 'no-referrer',
+    });
   } catch {
     throw new Error('Upload outcome could not be confirmed. The object may already be stored. Check the endpoint and CORS settings before retrying.');
   }
