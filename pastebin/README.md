@@ -63,7 +63,7 @@ credentials, the complete ZIP entry list or failure names.
 - **Public IPFS gateway** uses the configured gateway. Directory preview uses
   the UnixFS root CID; raw directory download uses the original archive CID.
 - **Public S3** appears only after an explicit anonymous check. Object access is
-  proved with unsigned `HEAD` using `credentials: omit` and `redirect: error`.
+  proved with unsigned `HEAD` using `credentials: omit` and `redirect: follow`.
   Directory preview probes one `ListObjectsV2` page with `max-keys=1`; recipients
   can explicitly list the paginated extraction prefix. Individual entries are
   checked only when their own **Check** action is activated.

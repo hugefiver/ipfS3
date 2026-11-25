@@ -165,7 +165,7 @@ export async function probePublicUrl(value, fetchImpl = fetch) {
     const response = await fetchImpl(url, {
       method: "HEAD",
       credentials: "omit",
-      redirect: "error",
+      redirect: "follow",
       cache: "no-store",
       referrerPolicy: "no-referrer",
     });

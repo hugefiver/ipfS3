@@ -78,7 +78,7 @@ test("path-style directory listing accepts RFC3986-encoded source names", () => 
   );
 });
 
-test("anonymous HEAD uses no credentials and never follows redirects", async () => {
+test("anonymous HEAD uses no credentials and follows redirects", async () => {
   let invocation;
   const publicResult = await probePublicUrl("https://s3.example.com/bucket/key", async (url, options) => {
     invocation = { url, options };
@@ -87,7 +87,7 @@ test("anonymous HEAD uses no credentials and never follows redirects", async () 
   assert.equal(publicResult.state, "public");
   assert.equal(invocation.options.method, "HEAD");
   assert.equal(invocation.options.credentials, "omit");
-  assert.equal(invocation.options.redirect, "error");
+  assert.equal(invocation.options.redirect, "follow");
   assert.equal(invocation.options.referrerPolicy, "no-referrer");
   assert.equal((await probePublicUrl(file.url, async () => ({ ok: false, status: 403 }))).state, "unavailable");
   assert.equal((await probePublicUrl(file.url, async () => { throw new TypeError("CORS"); })).state, "unknown");
