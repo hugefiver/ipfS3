@@ -86,6 +86,28 @@ S3 端口自带健康检查接口：
 - **主密钥需保持不变** — 只要存在加密对象，就不要修改 `IPFS_S3_MASTER_KEY`（目前不支持主密钥轮换）。
 - **分片合并重写入** — Multipart Upload 完成时，网关按顺序拼接各分片并作为单个 UnixFS 文件重新写入，以获得统一的根 CID。
 
+## 性能基准
+
+在同一宿主机 Docker 桥接网络下，使用 `minio/warp 1.3.1` 串行独占测得（明文 HTTP、SigV4 鉴权、全场景 0 错误），对比 **ipfS3**（[`docker-compose.postgres.yml`](docker-compose.postgres.yml)：PostgreSQL 18.7 + Kubo 0.43.2）与单节点 **MinIO**（`RELEASE.2026-11-23`）、**RustFS**（`1.0.7`）。
+
+![S3 性能基准对比：ipfS3 vs MinIO vs RustFS](docs/assets/benchmark-comparison.svg)
+
+| 测试场景 | ipfS3 (PG18 + Kubo) | MinIO | RustFS | ipfS3 相对 MinIO / RustFS |
+| --- | --- | --- | --- | --- |
+| PUT 64 KiB（`C=16`） | 51.3 obj/s · 3.2 MiB/s（P50 325.2 ms） | 1,180.4 obj/s · 73.8 MiB/s（P50 12.6 ms） | 597.5 obj/s · 37.3 MiB/s（P50 25.6 ms） | 0.04× / 0.09× |
+| GET 64 KiB（`C=16`） | 766.3 obj/s · 47.9 MiB/s（P50 8.2 ms） | 6,939.6 obj/s · 433.7 MiB/s（P50 2.0 ms） | 9,291.7 obj/s · 580.7 MiB/s（P50 1.6 ms） | 0.11× / 0.08× |
+| PUT 4 MiB（`C=8`） | 42.4 obj/s · 169.6 MiB/s（P50 188.0 ms） | 94.7 obj/s · 378.7 MiB/s（P50 123.1 ms） | 59.4 obj/s · 237.7 MiB/s（P50 154.9 ms） | 0.45× / 0.71× |
+| GET 4 MiB（`C=8`） | 123.2 obj/s · 492.8 MiB/s（P50 57.7 ms） | 701.3 obj/s · 2,805.4 MiB/s（P50 11.3 ms） | 208.7 obj/s · 834.8 MiB/s（P50 37.2 ms） | 0.18× / 0.59× |
+| Multipart 20 MiB（`4×5 MiB, C=8`） | 23.3 parts/s · 116.4 MiB/s（P50 95.6 ms） | 67.9 parts/s · 339.3 MiB/s（P50 66.2 ms） | 42.9 parts/s · 214.5 MiB/s（P50 113.1 ms） | 0.34× / 0.54× |
+| Mixed 256 KiB（`45G/30S/15P/10D, C=16`） | 214.6 obj/s · 32.1 MiB/s | 2,183.2 obj/s · 327.5 MiB/s | 589.7 obj/s · 88.4 MiB/s | 0.10× / 0.36× |
+| STAT 1K 对象（`C=16`） | 1,489.5 obj/s（P50 10.4 ms） | 9,116.6 obj/s（P50 1.5 ms） | 9,969.5 obj/s（P50 1.4 ms） | 0.16× / 0.15× |
+| LIST 1K 对象（`C=8`） | 42,797 obj/s（P50 23.0 ms） | 32,655 obj/s（P50 29.8 ms） | 52,871 obj/s（P50 18.8 ms） | **1.31×** / 0.81× |
+
+关键结论：
+- **中大对象流式吞吐与低内存** — 4 MiB 场景下，ipfS3 写入达到 RustFS 的 71%（`169.6 MiB/s`）、读取达到 59%（`492.8 MiB/s`），网关进程常驻内存仅约 `46.5 MiB`。开启 SSE-S3（`AES-256-GCM`）后，4 MiB 读取为 `414.8 MiB/s`（-15.8%），写入为 `93.2 MiB/s`（-45.0%）。
+- **数据库索引加速 `LIST`** — 依托 PostgreSQL 18 B-Tree 索引，`LIST 1K` 达到 `42,797 obj/s`，反超 MinIO 31%。
+- **小对象写入开销** — 每次 `PUT` 需经过 Kubo UnixFS 分块哈希（`add`）、同步 `pin/add` 落盘及 PostgreSQL 事务，因此高频小对象写入显著低于直写本地磁盘的 MinIO 与 RustFS。
+
 ## 相关文档
 
 - [完整配置参考](config.example.toml) — 带注释的完整 TOML 示例（重定向、限流、Pinning、生命周期、ZIP、导入）

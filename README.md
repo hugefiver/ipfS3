@@ -86,6 +86,28 @@ CLI helpers: `--config-explain` prints the effective non-secret config; `--ready
 - **Fixed master key** — Keep `IPFS_S3_MASTER_KEY` unchanged for the lifetime of any encrypted objects; key rotation is not implemented.
 - **Multipart completion** — Parts are concatenated and re-added as one UnixFS file on completion so the final object gets a single root CID.
 
+## Benchmarks
+
+Measured sequentially on a single-host Docker bridge network with `minio/warp 1.3.1` (plaintext HTTP, SigV4, 0 errors across all runs), comparing **ipfS3** ([`docker-compose.postgres.yml`](docker-compose.postgres.yml): PostgreSQL 18.7 + Kubo 0.43.2) against single-node **MinIO** (`RELEASE.2026-11-23`) and **RustFS** (`1.0.7`).
+
+![S3 Benchmark Comparison: ipfS3 vs MinIO vs RustFS](docs/assets/benchmark-comparison.svg)
+
+| Scenario | ipfS3 (PG18 + Kubo) | MinIO | RustFS | ipfS3 vs MinIO / RustFS |
+| --- | --- | --- | --- | --- |
+| PUT 64 KiB (`C=16`) | 51.3 obj/s · 3.2 MiB/s (P50 325.2 ms) | 1,180.4 obj/s · 73.8 MiB/s (P50 12.6 ms) | 597.5 obj/s · 37.3 MiB/s (P50 25.6 ms) | 0.04× / 0.09× |
+| GET 64 KiB (`C=16`) | 766.3 obj/s · 47.9 MiB/s (P50 8.2 ms) | 6,939.6 obj/s · 433.7 MiB/s (P50 2.0 ms) | 9,291.7 obj/s · 580.7 MiB/s (P50 1.6 ms) | 0.11× / 0.08× |
+| PUT 4 MiB (`C=8`) | 42.4 obj/s · 169.6 MiB/s (P50 188.0 ms) | 94.7 obj/s · 378.7 MiB/s (P50 123.1 ms) | 59.4 obj/s · 237.7 MiB/s (P50 154.9 ms) | 0.45× / 0.71× |
+| GET 4 MiB (`C=8`) | 123.2 obj/s · 492.8 MiB/s (P50 57.7 ms) | 701.3 obj/s · 2,805.4 MiB/s (P50 11.3 ms) | 208.7 obj/s · 834.8 MiB/s (P50 37.2 ms) | 0.18× / 0.59× |
+| Multipart 20 MiB (`4×5 MiB, C=8`) | 23.3 parts/s · 116.4 MiB/s (P50 95.6 ms) | 67.9 parts/s · 339.3 MiB/s (P50 66.2 ms) | 42.9 parts/s · 214.5 MiB/s (P50 113.1 ms) | 0.34× / 0.54× |
+| Mixed 256 KiB (`45G/30S/15P/10D, C=16`) | 214.6 obj/s · 32.1 MiB/s | 2,183.2 obj/s · 327.5 MiB/s | 589.7 obj/s · 88.4 MiB/s | 0.10× / 0.36× |
+| STAT 1K objects (`C=16`) | 1,489.5 obj/s (P50 10.4 ms) | 9,116.6 obj/s (P50 1.5 ms) | 9,969.5 obj/s (P50 1.4 ms) | 0.16× / 0.15× |
+| LIST 1K objects (`C=8`) | 42,797 obj/s (P50 23.0 ms) | 32,655 obj/s (P50 29.8 ms) | 52,871 obj/s (P50 18.8 ms) | **1.31×** / 0.81× |
+
+Takeaways:
+- **Streaming throughput & footprint** — At 4 MiB, ipfS3 reaches 71% of RustFS on PUT (`169.6 MiB/s`) and 59% on GET (`492.8 MiB/s`) while the gateway process stays around `46.5 MiB` RSS. Enabling SSE-S3 (`AES-256-GCM`) yields `414.8 MiB/s` on 4 MiB GET (-15.8%) and `93.2 MiB/s` on PUT (-45.0%).
+- **Fast indexed `LIST`** — PostgreSQL 18 B-tree indexing puts `LIST 1K` at `42,797 obj/s`, outperforming MinIO by 31%.
+- **Small-object write overhead** — Each `PUT` runs Kubo UnixFS chunking/hashing (`add`), synchronous `pin/add`, and PostgreSQL transactions, making small-object write IOPS much lower than direct-disk object stores.
+
 ## Documentation
 
 - [Configuration reference](config.example.toml) — full annotated TOML config (redirects, rate limits, pinning, lifecycle, ZIP, imports)
